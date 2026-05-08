@@ -1083,7 +1083,7 @@ impl Config {
         }
         if let Some(model) = self.default_text_model.as_deref()
             && !model.trim().eq_ignore_ascii_case("auto")
-            && !matches!(self.api_provider(), ApiProvider::Ollama)
+            && !provider_supports_arbitrary_model_ids(self.api_provider())
             && normalize_model_name(model).is_none()
         {
             anyhow::bail!(
@@ -2184,10 +2184,24 @@ fn normalize_model_config(config: &mut Config) {
 }
 
 fn normalize_model_for_provider(provider: ApiProvider, model: &str) -> Option<String> {
-    if matches!(provider, ApiProvider::Ollama) {
-        return None;
+    if provider_supports_arbitrary_model_ids(provider) {
+        let trimmed = model.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        return normalize_model_name(trimmed).map_or_else(
+            || Some(trimmed.to_string()),
+            |normalized| Some(model_for_provider(provider, normalized)),
+        );
     }
     normalize_model_name(model).map(|normalized| model_for_provider(provider, normalized))
+}
+
+fn provider_supports_arbitrary_model_ids(provider: ApiProvider) -> bool {
+    matches!(
+        provider,
+        ApiProvider::Sglang | ApiProvider::Vllm | ApiProvider::Ollama
+    )
 }
 
 fn model_for_provider(provider: ApiProvider, normalized: String) -> String {
@@ -3906,6 +3920,29 @@ api_key = "old-openrouter-key"
             normalize_model_name("provider/deepseek-ai/deepseek-v4-pro").as_deref(),
             Some("provider/deepseek-ai/deepseek-v4-pro")
         );
+    }
+
+    #[test]
+    fn vllm_provider_preserves_arbitrary_model_ids() {
+        assert_eq!(
+            normalize_model_for_provider(ApiProvider::Vllm, "MiniMax-M2.7").as_deref(),
+            Some("MiniMax-M2.7")
+        );
+        assert_eq!(
+            normalize_model_for_provider(ApiProvider::Sglang, "claude-sonnet-4-5").as_deref(),
+            Some("claude-sonnet-4-5")
+        );
+    }
+
+    #[test]
+    fn vllm_provider_accepts_arbitrary_default_text_model() {
+        let config = Config {
+            provider: Some("vllm".to_string()),
+            default_text_model: Some("MiniMax-M2.7".to_string()),
+            ..Config::default()
+        };
+
+        assert!(config.validate().is_ok());
     }
 
     #[test]
