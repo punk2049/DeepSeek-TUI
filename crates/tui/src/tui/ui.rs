@@ -1,7 +1,7 @@
 //! TUI event loop and rendering logic for `DeepSeek` CLI.
 
 use std::collections::HashSet;
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -18,9 +18,9 @@ use crossterm::{
 };
 use ratatui::{
     Frame, Terminal,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect, Size},
     prelude::Widget,
-    style::{Color, Style},
+    style::Style,
     text::Span,
     widgets::Block,
 };
@@ -134,6 +134,7 @@ const SIDEBAR_VISIBLE_MIN_WIDTH: u16 = 100;
 const DEFAULT_TERMINAL_PROBE_TIMEOUT_MS: u64 = 500;
 
 type AppTerminal = Terminal<ColorCompatBackend<Stdout>>;
+const TERMINAL_ORIGIN_RESET: &[u8] = b"\x1b[r\x1b[?6l\x1b[H\x1b[2J";
 
 /// Run the interactive TUI event loop.
 ///
@@ -641,6 +642,7 @@ async fn run_event_loop(
     // for terminal-native text selection.
     let mut shift_bypass_active = false;
     let mut terminal_paused_at: Option<Instant> = None;
+    let mut force_terminal_repaint = false;
 
     loop {
         if !drain_web_config_events(&mut web_config_session, app, config, &engine_handle).await {
@@ -753,12 +755,9 @@ async fn run_event_loop(
                         // P2.3: thinking lives in the active cell so it groups
                         // visually with the tool calls that follow until the
                         // next assistant prose chunk flushes the group.
-                        app.reasoning_buffer.clear();
-                        app.reasoning_header = None;
-                        app.thinking_started_at = Some(Instant::now());
-                        app.streaming_state.reset();
-                        app.streaming_state.start_thinking(0, None);
-                        let _ = ensure_streaming_thinking_active_entry(app);
+                        if start_streaming_thinking_block(app) {
+                            transcript_batch_updated = true;
+                        }
                     }
                     EngineEvent::ThinkingDelta { content, .. } => {
                         let sanitized = sanitize_stream_chunk(&content);
@@ -779,19 +778,10 @@ async fn run_event_loop(
                         }
                     }
                     EngineEvent::ThinkingComplete { .. } => {
-                        let duration = app
-                            .thinking_started_at
-                            .take()
-                            .map(|t| t.elapsed().as_secs_f32());
-                        let remaining = app.streaming_state.finalize_block_text(0);
-                        if finalize_streaming_thinking_active_entry(app, duration, &remaining) {
+                        if finalize_current_streaming_thinking(app) {
                             transcript_batch_updated = true;
                         }
-
-                        if !app.reasoning_buffer.is_empty() {
-                            app.last_reasoning = Some(app.reasoning_buffer.clone());
-                        }
-                        app.reasoning_buffer.clear();
+                        stash_reasoning_buffer_into_last_reasoning(app);
                     }
                     EngineEvent::ToolCallStarted { id, name, input } => {
                         app.pending_tool_uses
@@ -882,6 +872,7 @@ async fn run_event_loop(
                         status,
                         error,
                     } => {
+                        force_terminal_repaint = true;
                         // Finalize any in-flight tool group. Cancellation
                         // marks still-running entries as Failed so the user
                         // sees they were interrupted rather than the spinner
@@ -1127,7 +1118,7 @@ async fn run_event_loop(
                             "Capacity memory persist failed ({action}): {error}"
                         ));
                     }
-                    EngineEvent::PauseEvents => {
+                    EngineEvent::PauseEvents { ack } => {
                         if !event_broker.is_paused() {
                             pause_terminal(
                                 terminal,
@@ -1137,6 +1128,9 @@ async fn run_event_loop(
                             )?;
                             event_broker.pause_events();
                             terminal_paused_at = Some(Instant::now());
+                        }
+                        if let Some(ack) = ack {
+                            ack.notify_one();
                         }
                     }
                     EngineEvent::ResumeEvents => {
@@ -1322,7 +1316,8 @@ async fn run_event_loop(
                                     "mode": app.mode.label(),
                                 }),
                             );
-                            app.view_stack.push(ApprovalView::new(request));
+                            app.view_stack
+                                .push(ApprovalView::new_for_locale(request, app.ui_locale));
                             app.status_message = Some(format!(
                                 "Approval required for '{tool_name}': {description}"
                             ));
@@ -1482,6 +1477,7 @@ async fn run_event_loop(
             terminal_paused_at = None;
             app.status_message = Some("Terminal controls restored".to_string());
             app.needs_redraw = true;
+            force_terminal_repaint = true;
         }
 
         let now = Instant::now();
@@ -1522,7 +1518,11 @@ async fn run_event_loop(
             None
         };
         if app.needs_redraw && draw_wait.is_none() {
-            terminal.draw(|f| render(f, app))?; // app is &mut
+            if force_terminal_repaint {
+                reset_terminal_viewport(terminal)?;
+                force_terminal_repaint = false;
+            }
+            draw_app_frame(terminal, app)?;
             frame_rate_limiter.mark_emitted(Instant::now());
             app.needs_redraw = false;
         }
@@ -1641,13 +1641,31 @@ async fn run_event_loop(
                     );
                 }
 
-                terminal.clear()?;
+                reset_terminal_viewport(terminal)?;
                 app.handle_resize(final_w, final_h);
+                // #macos-resize: some terminals (macOS Terminal.app, Windows
+                // ConHost) briefly report stale dimensions via
+                // `terminal::size()` after a resize. ratatui's `draw()` calls
+                // `autoresize()` internally, which queries the backend size;
+                // if it sees the old dimension it shrinks the viewport back,
+                // leaving the newly-expanded area filled with stale content
+                // from the previous frame (duplicate UI panels).
+                //
+                // We force the backend to report the resize-event size for
+                // this single draw so the buffer matches the real viewport.
+                {
+                    let backend = terminal.backend_mut();
+                    backend.force_size(Size::new(final_w, final_h));
+                }
                 // Draw immediately so the cleared screen gets repainted before
                 // any other events can interleave. Without this, the next
                 // iteration's draw can race against fast follow-up input and
                 // leave the user staring at a blank/partial frame.
-                terminal.draw(|f| render(f, app))?;
+                draw_app_frame(terminal, app)?;
+                {
+                    let backend = terminal.backend_mut();
+                    backend.clear_forced_size();
+                }
                 app.needs_redraw = false;
                 continue;
             }
@@ -2544,7 +2562,7 @@ async fn run_event_loop(
                     {
                         app.close_slash_menu();
                     }
-                    if let Some(input) = app.submit_input() {
+                    if let Some(input) = app.handle_composer_enter() {
                         if handle_plan_choice(app, config, &engine_handle, &input).await? {
                             continue;
                         }
@@ -3022,6 +3040,7 @@ pub(crate) fn apply_engine_error_to_app(
     let recoverable = envelope.recoverable;
     let message = envelope.message.clone();
     let severity = envelope.severity;
+    finalize_current_streaming_thinking(app);
     app.streaming_state.reset();
     app.streaming_message_index = None;
     app.streaming_thinking_active_entry = None;
@@ -3312,6 +3331,54 @@ fn append_streaming_thinking(app: &mut App, entry_idx: usize, text: &str) {
     if mutated {
         app.bump_active_cell_revision();
     }
+}
+
+/// Start a new streaming thinking block. If another thinking block is still
+/// active, first drain its pending UI tail so a late block boundary cannot
+/// discard content buffered inside `StreamingState`.
+fn start_streaming_thinking_block(app: &mut App) -> bool {
+    let finalized_previous = if app.streaming_thinking_active_entry.is_some() {
+        let finalized = finalize_current_streaming_thinking(app);
+        stash_reasoning_buffer_into_last_reasoning(app);
+        finalized
+    } else {
+        false
+    };
+
+    app.reasoning_buffer.clear();
+    app.reasoning_header = None;
+    app.thinking_started_at = Some(Instant::now());
+    app.streaming_state.reset();
+    app.streaming_state.start_thinking(0, None);
+    let _ = ensure_streaming_thinking_active_entry(app);
+    finalized_previous
+}
+
+fn finalize_current_streaming_thinking(app: &mut App) -> bool {
+    let duration = app
+        .thinking_started_at
+        .take()
+        .map(|t| t.elapsed().as_secs_f32());
+    let remaining = app.streaming_state.finalize_block_text(0);
+    finalize_streaming_thinking_active_entry(app, duration, &remaining)
+}
+
+fn stash_reasoning_buffer_into_last_reasoning(app: &mut App) {
+    if app.reasoning_buffer.is_empty() {
+        return;
+    }
+
+    if let Some(existing) = app.last_reasoning.as_mut()
+        && !existing.is_empty()
+    {
+        if !existing.ends_with('\n') {
+            existing.push('\n');
+        }
+        existing.push_str(&app.reasoning_buffer);
+    } else {
+        app.last_reasoning = Some(app.reasoning_buffer.clone());
+    }
+    app.reasoning_buffer.clear();
 }
 
 /// Finalize the in-flight thinking entry in `active_cell`: append the
@@ -3884,11 +3951,7 @@ async fn apply_model_picker_choice(
         app.last_effective_model = None;
         app.model = model.clone();
         app.update_model_compaction_budget();
-        app.session.last_prompt_tokens = None;
-        app.session.last_completion_tokens = None;
-        app.session.last_prompt_cache_hit_tokens = None;
-        app.session.last_prompt_cache_miss_tokens = None;
-        app.session.last_reasoning_replay_tokens = None;
+        app.clear_model_scoped_telemetry();
     }
     if effort_changed {
         app.reasoning_effort = effort;
@@ -4006,11 +4069,16 @@ async fn switch_provider(
     }
 
     let new_model = config.default_model();
+    let cache_scope_changed = previous_provider != target || previous_model != new_model;
     app.api_provider = target;
     app.model = new_model.clone();
     app.update_model_compaction_budget();
-    app.session.last_prompt_tokens = None;
-    app.session.last_completion_tokens = None;
+    if cache_scope_changed {
+        app.clear_model_scoped_telemetry();
+    } else {
+        app.session.last_prompt_tokens = None;
+        app.session.last_completion_tokens = None;
+    }
 
     let _ = engine_handle.send(Op::Shutdown).await;
     let engine_config = build_engine_config(app, config);
@@ -5107,8 +5175,8 @@ fn build_pending_input_preview(app: &App) -> PendingInputPreview {
 fn render(f: &mut Frame, app: &mut App) {
     let size = f.area();
 
-    // Clear entire area with terminal default background
-    let background = Block::default().style(Style::default().bg(Color::Reset));
+    // Clear entire area with the configured app background.
+    let background = Block::default().style(Style::default().bg(app.ui_theme.surface_bg));
     f.render_widget(background, size);
 
     // Show onboarding screen if needed
@@ -5179,6 +5247,7 @@ fn render(f: &mut Frame, app: &mut App) {
             crate::config::ApiProvider::Deepseek => None,
             crate::config::ApiProvider::DeepseekCN => None,
             crate::config::ApiProvider::NvidiaNim => Some("NIM"),
+            crate::config::ApiProvider::Openai => Some("OpenAI"),
             crate::config::ApiProvider::Openrouter => Some("OR"),
             crate::config::ApiProvider::Novita => Some("Novita"),
             crate::config::ApiProvider::Fireworks => Some("Fireworks"),
@@ -5212,7 +5281,9 @@ fn render(f: &mut Frame, app: &mut App) {
         // background before any sub-widgets render, so cells that end up
         // uncovered by layout splits (e.g. after file-tree toggle or
         // resize) don't retain stale content from a previous frame.
-        Block::default().render(chunks[1], f.buffer_mut());
+        Block::default()
+            .style(Style::default().bg(app.ui_theme.surface_bg))
+            .render(chunks[1], f.buffer_mut());
 
         let mut sidebar_area = None;
 
@@ -5229,7 +5300,7 @@ fn render(f: &mut Frame, app: &mut App) {
 
                 // Render the file-tree pane.
                 if let Some(ref mut state) = app.file_tree {
-                    super::file_tree::render_file_tree(f, tree_area, state);
+                    super::file_tree::render_file_tree(f, tree_area, state, app.ui_theme.mode);
                 }
 
                 remaining
@@ -5302,6 +5373,12 @@ fn render(f: &mut Frame, app: &mut App) {
         let buf = f.buffer_mut();
         app.view_stack.render(size, buf);
     }
+}
+
+fn draw_app_frame(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
+    terminal.backend_mut().set_palette_mode(app.ui_theme.mode);
+    terminal.draw(|f| render(f, app))?;
+    Ok(())
 }
 
 /// Pull the latest snapshot of cells / revisions / render options into the
@@ -5812,6 +5889,7 @@ async fn apply_provider_picker_api_key(
                 return;
             }
             ApiProvider::NvidiaNim => &mut providers.nvidia_nim,
+            ApiProvider::Openai => &mut providers.openai,
             ApiProvider::Openrouter => &mut providers.openrouter,
             ApiProvider::Novita => &mut providers.novita,
             ApiProvider::Fireworks => &mut providers.fireworks,
@@ -5874,10 +5952,19 @@ fn apply_loaded_session(app: &mut App, session: &SavedSession) -> bool {
     app.workspace.clone_from(&session.metadata.workspace);
     app.session.total_tokens = u32::try_from(session.metadata.total_tokens).unwrap_or(u32::MAX);
     app.session.total_conversation_tokens = app.session.total_tokens;
+    app.session.session_cost = 0.0;
+    app.session.session_cost_cny = 0.0;
+    app.session.subagent_cost = 0.0;
+    app.session.subagent_cost_cny = 0.0;
+    app.session.subagent_cost_event_seqs.clear();
+    app.session.displayed_cost_high_water = 0.0;
+    app.session.displayed_cost_high_water_cny = 0.0;
     app.session.last_prompt_tokens = None;
     app.session.last_completion_tokens = None;
     app.session.last_prompt_cache_hit_tokens = None;
     app.session.last_prompt_cache_miss_tokens = None;
+    app.session.last_reasoning_replay_tokens = None;
+    app.session.turn_cache_history.clear();
     app.current_session_id = Some(session.metadata.id.clone());
     app.workspace_context = None;
     app.workspace_context_refreshed_at = None;
@@ -6138,6 +6225,17 @@ fn resume_terminal(
     if use_bracketed_paste {
         execute!(terminal.backend_mut(), EnableBracketedPaste)?;
     }
+    reset_terminal_viewport(terminal)?;
+    Ok(())
+}
+
+fn reset_terminal_viewport(terminal: &mut AppTerminal) -> Result<()> {
+    // Reset scroll margins and origin mode before clearing. Some interactive
+    // child processes leave DECSTBM/DECOM behind; if ratatui's diff renderer
+    // then writes "row 0", terminals can place it relative to the leaked
+    // scroll region and the whole viewport appears shifted down.
+    terminal.backend_mut().write_all(TERMINAL_ORIGIN_RESET)?;
+    terminal.backend_mut().flush()?;
     terminal.clear()?;
     Ok(())
 }
@@ -7249,8 +7347,17 @@ fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEvent> {
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
+            app.viewport.transcript_scrollbar_dragging = false;
+
             if mouse_hits_rect(mouse, app.viewport.jump_to_latest_button_area) {
                 app.scroll_to_bottom();
+                return Vec::new();
+            }
+
+            if mouse_hits_transcript_scrollbar(app, mouse) {
+                app.viewport.transcript_scrollbar_dragging = true;
+                app.viewport.transcript_selection.clear();
+                scroll_transcript_to_mouse_row(app, mouse.row);
                 return Vec::new();
             }
 
@@ -7273,11 +7380,20 @@ fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEvent> {
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            if app.viewport.transcript_scrollbar_dragging {
+                scroll_transcript_to_mouse_row(app, mouse.row);
+                return Vec::new();
+            }
+
             if app.viewport.transcript_selection.dragging
                 && let Some(point) = selection_point_from_mouse(app, mouse)
             {
                 app.viewport.transcript_selection.head = Some(point);
             }
+        }
+        MouseEventKind::Up(MouseButton::Left) if app.viewport.transcript_scrollbar_dragging => {
+            app.viewport.transcript_scrollbar_dragging = false;
+            app.needs_redraw = true;
         }
         MouseEventKind::Up(MouseButton::Left) if app.viewport.transcript_selection.dragging => {
             app.viewport.transcript_selection.dragging = false;
@@ -7292,6 +7408,57 @@ fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEvent> {
     }
 
     Vec::new()
+}
+
+fn mouse_hits_transcript_scrollbar(app: &App, mouse: MouseEvent) -> bool {
+    let Some(area) = app.viewport.last_transcript_area else {
+        return false;
+    };
+    if area.width <= 1 || app.viewport.last_transcript_total <= app.viewport.last_transcript_visible
+    {
+        return false;
+    }
+
+    let scrollbar_col = area.x.saturating_add(area.width.saturating_sub(1));
+    mouse.column == scrollbar_col
+        && mouse.row >= area.y
+        && mouse.row < area.y.saturating_add(area.height)
+}
+
+fn scroll_transcript_to_mouse_row(app: &mut App, row: u16) -> bool {
+    let Some(area) = app.viewport.last_transcript_area else {
+        return false;
+    };
+    let total = app.viewport.last_transcript_total;
+    let visible = app.viewport.last_transcript_visible;
+    if area.height == 0 || total <= visible {
+        return false;
+    }
+
+    let max_start = total.saturating_sub(visible);
+    if max_start == 0 {
+        app.scroll_to_bottom();
+        return true;
+    }
+
+    let max_row = usize::from(area.height.saturating_sub(1));
+    let relative_row = usize::from(row.saturating_sub(area.y)).min(max_row);
+    let numerator = relative_row
+        .saturating_mul(max_start)
+        .saturating_add(max_row / 2);
+    // Round to the nearest transcript offset so short thumbs still feel
+    // responsive on compact terminals.
+    let top = numerator.checked_div(max_row).unwrap_or(0);
+
+    app.viewport.transcript_scroll = if top >= max_start {
+        TranscriptScroll::to_bottom()
+    } else {
+        TranscriptScroll::at_line(top)
+    };
+    app.viewport.pending_scroll_delta = 0;
+    app.user_scrolled_during_stream = !app.viewport.transcript_scroll.is_at_tail();
+    app.needs_redraw = true;
+    true
 }
 
 fn mouse_hits_rect(mouse: MouseEvent, area: Option<Rect>) -> bool {

@@ -18,7 +18,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::logging;
 
@@ -97,9 +97,9 @@ impl SkillRegistry {
     /// are skipped to avoid descending into VCS / cache trees like
     /// `.git/`. The provided `dir` itself is always honored, even if
     /// hidden — that's what the user explicitly configured.
-    /// Symlinked directories are not followed, which keeps the walk
-    /// finite when a skills layout contains symlinks. The depth is also
-    /// capped at [`Self::MAX_DISCOVERY_DEPTH`].
+    /// Symlinked directories are followed when they resolve to directories,
+    /// with canonical path tracking plus [`Self::MAX_DISCOVERY_DEPTH`] keeping
+    /// the walk finite when a skills layout contains cycles.
     #[must_use]
     pub fn discover(dir: &Path) -> Self {
         let mut registry = Self::default();
@@ -107,12 +107,21 @@ impl SkillRegistry {
             return registry;
         }
 
-        Self::discover_recursive(dir, 0, &mut registry);
+        let mut visited = HashSet::new();
+        Self::discover_recursive(dir, 0, &mut registry, &mut visited);
         registry
     }
 
-    fn discover_recursive(dir: &Path, depth: usize, registry: &mut Self) {
+    fn discover_recursive(
+        dir: &Path,
+        depth: usize,
+        registry: &mut Self,
+        visited: &mut HashSet<PathBuf>,
+    ) {
         if depth > Self::MAX_DISCOVERY_DEPTH {
+            return;
+        }
+        if !Self::mark_discovered_dir(dir, visited) {
             return;
         }
 
@@ -134,14 +143,6 @@ impl SkillRegistry {
         };
 
         for entry in entries.flatten() {
-            // Use `file_type()` (which on Unix returns symlink metadata
-            // without following) so we don't traverse into symlinked
-            // directories — that closes the door on cycles.
-            let Ok(ft) = entry.file_type() else { continue };
-            if !ft.is_dir() {
-                continue;
-            }
-
             let path = entry.path();
             // Skip hidden subdirectories. Common offenders are `.git`,
             // `.cache`, `.Trash`. The provided root itself is exempt:
@@ -159,10 +160,20 @@ impl SkillRegistry {
                 continue;
             }
 
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            if !metadata.is_dir() {
+                continue;
+            }
+
             let skill_path = path.join("SKILL.md");
             match fs::read_to_string(&skill_path) {
                 Ok(content) => match Self::parse_skill(&skill_path, &content) {
                     Ok(mut skill) => {
+                        if !Self::mark_discovered_dir(&path, visited) {
+                            continue;
+                        }
                         skill.path = skill_path.clone();
                         registry.skills.push(skill);
                         // This directory IS a skill. Don't descend further:
@@ -172,6 +183,9 @@ impl SkillRegistry {
                         continue;
                     }
                     Err(reason) => {
+                        if !Self::mark_discovered_dir(&path, visited) {
+                            continue;
+                        }
                         registry.push_warning(format!(
                             "Failed to parse {}: {reason}",
                             skill_path.display()
@@ -183,6 +197,9 @@ impl SkillRegistry {
                     }
                 },
                 Err(err) if skill_path.exists() => {
+                    if !Self::mark_discovered_dir(&path, visited) {
+                        continue;
+                    }
                     registry
                         .push_warning(format!("Failed to read {}: {err}", skill_path.display()));
                     continue;
@@ -193,8 +210,13 @@ impl SkillRegistry {
                 }
             }
 
-            Self::discover_recursive(&path, depth + 1, registry);
+            Self::discover_recursive(&path, depth + 1, registry, visited);
         }
+    }
+
+    fn mark_discovered_dir(dir: &Path, visited: &mut HashSet<PathBuf>) -> bool {
+        let key = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        visited.insert(key)
     }
 
     fn push_warning(&mut self, warning: String) {
@@ -226,7 +248,17 @@ impl SkillRegistry {
                     continue;
                 }
                 if let Some((key, value)) = line.split_once(':') {
-                    metadata.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
+                    let value = value.trim();
+                    let unquoted = if (value.starts_with('"')
+                        && value.ends_with('"')
+                        && value.len() >= 2)
+                        || (value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2)
+                    {
+                        &value[1..value.len() - 1]
+                    } else {
+                        value
+                    };
+                    metadata.insert(key.trim().to_ascii_lowercase(), unquoted.to_string());
                 }
             }
 
@@ -391,6 +423,31 @@ fn existing_skill_dirs(candidates: impl IntoIterator<Item = PathBuf>) -> Vec<Pat
 pub fn discover_in_workspace(workspace: &Path) -> SkillRegistry {
     let mut merged = SkillRegistry::default();
     for dir in skills_directories(workspace) {
+        let registry = SkillRegistry::discover(&dir);
+        for skill in registry.skills {
+            if !merged.skills.iter().any(|s| s.name == skill.name) {
+                merged.skills.push(skill);
+            }
+        }
+        for warning in registry.warnings {
+            merged.warnings.push(warning);
+        }
+    }
+    merged
+}
+
+/// Discover skills from the workspace search set plus the configured install
+/// directory. Workspace/global directories keep their normal precedence; a
+/// custom configured directory is appended when it is outside that set.
+#[must_use]
+pub fn discover_for_workspace_and_dir(workspace: &Path, skills_dir: &Path) -> SkillRegistry {
+    let mut dirs = skills_directories(workspace);
+    if skills_dir.is_dir() && !dirs.iter().any(|p| p == skills_dir) {
+        dirs.push(skills_dir.to_path_buf());
+    }
+
+    let mut merged = SkillRegistry::default();
+    for dir in dirs {
         let registry = SkillRegistry::discover(&dir);
         for skill in registry.skills {
             if !merged.skills.iter().any(|s| s.name == skill.name) {
@@ -716,6 +773,16 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(unix)]
+    fn create_dir_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_dir_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
     #[test]
     fn skills_directories_returns_existing_dirs_in_precedence_order() {
         let tmpdir = TempDir::new().unwrap();
@@ -997,6 +1064,55 @@ mod tests {
             registry.warnings().is_empty(),
             "well-formed nested layout should not warn: {:?}",
             registry.warnings()
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn discover_follows_symlinked_skill_directories() {
+        let tmpdir = TempDir::new().unwrap();
+        let source_root = tmpdir.path().join("claude-skills");
+        let skills_root = tmpdir.path().join(".deepseek").join("skills");
+        write_skill(&source_root, "agent-browser", "browser automation", "body");
+        std::fs::create_dir_all(&skills_root).unwrap();
+        let link_path = skills_root.join("agent-browser");
+
+        if let Err(err) = create_dir_symlink(&source_root.join("agent-browser"), &link_path) {
+            eprintln!("skipping symlink discovery assertion: {err}");
+            return;
+        }
+
+        let registry = super::SkillRegistry::discover(&skills_root);
+        let skill = registry
+            .get("agent-browser")
+            .expect("symlinked skill directory should be discovered");
+        assert_eq!(skill.description, "browser automation");
+        assert_eq!(skill.path, link_path.join("SKILL.md"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn discover_dedupes_symlink_cycles_by_canonical_directory() {
+        let tmpdir = TempDir::new().unwrap();
+        let root = tmpdir.path().join("skills");
+        write_skill(&root, "real-skill", "ok", "body");
+        let loop_parent = root.join("vendor");
+        std::fs::create_dir_all(&loop_parent).unwrap();
+
+        if let Err(err) = create_dir_symlink(&root, &loop_parent.join("loop")) {
+            eprintln!("skipping symlink cycle assertion: {err}");
+            return;
+        }
+
+        let registry = super::SkillRegistry::discover(&root);
+        let matches = registry
+            .list()
+            .iter()
+            .filter(|skill| skill.name == "real-skill")
+            .count();
+        assert_eq!(
+            matches, 1,
+            "symlink cycle should not rediscover the same canonical skill directory"
         );
     }
 

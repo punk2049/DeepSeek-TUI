@@ -371,17 +371,16 @@ pub fn system_prompt_for_mode_with_context_skills_session_and_approval(
     // Load project context from workspace
     let project_context = load_project_context_with_parents(workspace);
 
-    // 1–2. Mode prompt + project context (or fallback automap).
+    // 1–2. Mode prompt + project context.
+    // `load_project_context_with_parents` auto-generates .deepseek/instructions.md
+    // when no context file exists, so the fallback should always be available.
     let mut full_prompt = if let Some(project_block) = project_context.as_system_block() {
         format!("{}\n\n{}", mode_prompt, project_block)
     } else {
-        // Fallback: Generate an automatic project map summary
-        let summary = crate::utils::summarize_project(workspace);
-        let tree = crate::utils::project_tree(workspace, 2); // Shallow tree for prompt
-        format!(
-            "{}\n\n### Project Structure (Automatic Map)\n**Summary:** {}\n\n**Tree:**\n```\n{}\n```",
-            mode_prompt, summary, tree
-        )
+        // Extremely unlikely: context generation failed (e.g. filesystem error).
+        // Use mode prompt alone rather than panic.
+        tracing::warn!("No project context available and auto-generation failed");
+        mode_prompt
     };
 
     // 2.25. Environment block — locale, platform, shell, pwd. All
@@ -619,8 +618,8 @@ mod tests {
     fn package_version_is_current_hotfix_release() {
         assert_eq!(
             env!("CARGO_PKG_VERSION"),
-            "0.8.16",
-            "0.8.16 hotfix branch must report the release version before publishing"
+            "0.8.18",
+            "0.8.18 release branch must report the release version before publishing"
         );
     }
 

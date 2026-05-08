@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::Config;
+use crate::config::{ApiProvider, Config};
 use crate::config_ui::{self, WebConfigSession, WebConfigSessionEvent};
 use crate::core::engine::mock_engine_handle;
 use crate::tui::file_mention::{
@@ -300,6 +300,95 @@ fn jump_to_latest_button_click_scrolls_to_tail() {
     assert!(app.viewport.jump_to_latest_button_area.is_none());
     assert!(!app.user_scrolled_during_stream);
     assert!(!app.viewport.transcript_selection.dragging);
+}
+
+#[test]
+fn transcript_scrollbar_drag_maps_mouse_row_to_scroll_position() {
+    let mut app = create_test_app();
+    app.viewport.last_transcript_area = Some(Rect {
+        x: 2,
+        y: 5,
+        width: 20,
+        height: 10,
+    });
+    app.viewport.last_transcript_visible = 10;
+    app.viewport.last_transcript_total = 110;
+    app.viewport.transcript_scroll = TranscriptScroll::to_bottom();
+
+    let events = handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 21,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(events.is_empty());
+    assert!(app.viewport.transcript_scrollbar_dragging);
+    assert!(!app.viewport.transcript_selection.dragging);
+    assert!(!app.viewport.transcript_scroll.is_at_tail());
+    let (_, top) = app.viewport.transcript_scroll.resolve_top(&[], 100);
+    assert_eq!(top, 0);
+    assert!(app.user_scrolled_during_stream);
+
+    handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 21,
+            row: 14,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(app.viewport.transcript_scroll.is_at_tail());
+    assert!(!app.user_scrolled_during_stream);
+
+    handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 21,
+            row: 14,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(!app.viewport.transcript_scrollbar_dragging);
+}
+
+#[test]
+fn new_left_down_clears_stale_transcript_scrollbar_drag() {
+    let mut app = create_test_app();
+    app.history = vec![HistoryCell::Assistant {
+        content: "alpha beta".to_string(),
+        streaming: false,
+    }];
+    app.resync_history_revisions();
+    app.viewport.last_transcript_area = Some(Rect {
+        x: 2,
+        y: 5,
+        width: 20,
+        height: 10,
+    });
+    app.viewport.last_transcript_visible = 10;
+    app.viewport.last_transcript_total = 110;
+    app.viewport.transcript_scrollbar_dragging = true;
+
+    let events = handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(events.is_empty());
+    assert!(!app.viewport.transcript_scrollbar_dragging);
 }
 
 #[test]
@@ -611,6 +700,52 @@ fn apply_loaded_session_restores_dangling_user_tail_as_retry_draft() {
     );
 }
 
+#[test]
+fn apply_loaded_session_resets_unpersisted_telemetry() {
+    let mut app = create_test_app();
+    app.session.session_cost = 1.25;
+    app.session.session_cost_cny = 9.13;
+    app.session.subagent_cost = 0.75;
+    app.session.subagent_cost_cny = 5.48;
+    app.session.subagent_cost_event_seqs.insert(42);
+    app.session.displayed_cost_high_water = 2.0;
+    app.session.displayed_cost_high_water_cny = 14.61;
+    app.session.last_prompt_tokens = Some(120);
+    app.session.last_completion_tokens = Some(35);
+    app.session.last_prompt_cache_hit_tokens = Some(80);
+    app.session.last_prompt_cache_miss_tokens = Some(40);
+    app.session.last_reasoning_replay_tokens = Some(12);
+    app.push_turn_cache_record(crate::tui::app::TurnCacheRecord {
+        input_tokens: 120,
+        output_tokens: 35,
+        cache_hit_tokens: Some(80),
+        cache_miss_tokens: Some(40),
+        reasoning_replay_tokens: Some(12),
+        recorded_at: Instant::now(),
+    });
+    let mut session = saved_session_with_messages(vec![text_message("assistant", "ready")]);
+    session.metadata.total_tokens = 500;
+
+    let recovered = apply_loaded_session(&mut app, &session);
+
+    assert!(!recovered);
+    assert_eq!(app.session.total_tokens, 500);
+    assert_eq!(app.session.total_conversation_tokens, 500);
+    assert_eq!(app.session.session_cost, 0.0);
+    assert_eq!(app.session.session_cost_cny, 0.0);
+    assert_eq!(app.session.subagent_cost, 0.0);
+    assert_eq!(app.session.subagent_cost_cny, 0.0);
+    assert!(app.session.subagent_cost_event_seqs.is_empty());
+    assert_eq!(app.session.displayed_cost_high_water, 0.0);
+    assert_eq!(app.session.displayed_cost_high_water_cny, 0.0);
+    assert_eq!(app.session.last_prompt_tokens, None);
+    assert_eq!(app.session.last_completion_tokens, None);
+    assert_eq!(app.session.last_prompt_cache_hit_tokens, None);
+    assert_eq!(app.session.last_prompt_cache_miss_tokens, None);
+    assert_eq!(app.session.last_reasoning_replay_tokens, None);
+    assert!(app.session.turn_cache_history.is_empty());
+}
+
 #[tokio::test]
 async fn drain_web_config_events_applies_draft_without_closing_session() {
     let mut app = create_test_app();
@@ -851,6 +986,33 @@ async fn model_change_update_syncs_engine_model_before_compaction() {
         }
         other => panic!("expected SetCompaction, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn provider_switch_clears_turn_cache_history() {
+    let mut app = create_test_app();
+    app.push_turn_cache_record(crate::tui::app::TurnCacheRecord {
+        input_tokens: 100,
+        output_tokens: 25,
+        cache_hit_tokens: Some(70),
+        cache_miss_tokens: Some(30),
+        reasoning_replay_tokens: Some(12),
+        recorded_at: Instant::now(),
+    });
+    let mut engine = mock_engine_handle();
+    let mut config = Config::default();
+
+    switch_provider(
+        &mut app,
+        &mut engine.handle,
+        &mut config,
+        ApiProvider::Ollama,
+        None,
+    )
+    .await;
+
+    assert_eq!(app.api_provider, ApiProvider::Ollama);
+    assert!(app.session.turn_cache_history.is_empty());
 }
 
 #[tokio::test]
@@ -3006,6 +3168,36 @@ fn flush_active_cell_finalizes_unclosed_thinking_block() {
 }
 
 #[test]
+fn engine_error_finalizes_active_thinking_block() {
+    use crate::error_taxonomy::StreamError;
+
+    let mut app = create_test_app();
+    let entry_idx = ensure_streaming_thinking_active_entry(&mut app);
+    app.thinking_started_at = Some(Instant::now());
+    app.streaming_state.start_thinking(0, None);
+    app.streaming_state.push_content(0, "partial reasoning");
+
+    apply_engine_error_to_app(
+        &mut app,
+        StreamError::Stall { timeout_secs: 60 }.into_envelope(),
+    );
+
+    let active = app.active_cell.as_ref().expect("active thinking remains");
+    let HistoryCell::Thinking {
+        content, streaming, ..
+    } = &active.entries()[entry_idx]
+    else {
+        panic!("expected active thinking cell");
+    };
+    assert!(!*streaming, "error path must stop the thinking spinner");
+    assert!(
+        content.contains("partial reasoning"),
+        "error path must drain pending thinking tail"
+    );
+    assert!(app.streaming_thinking_active_entry.is_none());
+}
+
+#[test]
 fn second_thinking_block_appends_new_entry_in_same_active_cell() {
     // Real V4 turns can emit Thinking → Tool → Thinking → Tool before any
     // prose; the second thinking block should land as a fresh entry inside
@@ -3043,6 +3235,47 @@ fn second_thinking_block_appends_new_entry_in_same_active_cell() {
         app.history.is_empty(),
         "the group still hasn't flushed — no prose yet"
     );
+}
+
+#[test]
+fn new_thinking_block_drains_pending_tail_from_previous_block() {
+    let mut app = create_test_app();
+
+    assert!(!start_streaming_thinking_block(&mut app));
+    let first_idx = app
+        .streaming_thinking_active_entry
+        .expect("first thinking entry active");
+    app.reasoning_buffer.push_str("first tail");
+    app.streaming_state.push_content(0, "first tail");
+
+    assert!(start_streaming_thinking_block(&mut app));
+    let second_idx = app
+        .streaming_thinking_active_entry
+        .expect("second thinking entry active");
+
+    let active = app.active_cell.as_ref().expect("active cell exists");
+    assert_ne!(first_idx, second_idx);
+
+    let HistoryCell::Thinking {
+        content, streaming, ..
+    } = &active.entries()[first_idx]
+    else {
+        panic!("expected first thinking cell");
+    };
+    assert!(!*streaming, "previous thinking block should be finalized");
+    assert!(
+        content.contains("first tail"),
+        "pending text must survive a new ThinkingStarted event"
+    );
+
+    assert!(matches!(
+        active.entries()[second_idx],
+        HistoryCell::Thinking {
+            streaming: true,
+            ..
+        }
+    ));
+    assert_eq!(app.last_reasoning.as_deref(), Some("first tail"));
 }
 
 // ---- per-child prompt wiring ----
