@@ -463,6 +463,22 @@ jobs:
           # Match both the canonical `codewhale*` artifacts and the legacy
           # `deepseek*` shim artifacts that ship for the transition release.
           pattern: '*'
+      - name: Generate Windows npm launcher asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/codewhale-windows-launcher
+          {
+            printf '@echo off\r\n'
+            printf 'where wt >nul 2>nul\r\n'
+            printf 'set NO_ANIMATIONS=1\r\n'
+            printf 'if "%%ERRORLEVEL%%"=="0" (\r\n'
+            printf '    wt --title CodeWhale cmd /k "%%~dp0codewhale-windows-x64.exe"\r\n'
+            printf ') else (\r\n'
+            printf '    "%%~dp0codewhale-windows-x64.exe"\r\n'
+            printf ')\r\n'
+            printf '\r\n'
+          } > artifacts/codewhale-windows-launcher/codewhale.bat
       - name: List artifacts
         run: find artifacts -type f
       - name: Generate checksum manifest
