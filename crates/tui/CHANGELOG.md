@@ -20,6 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added exact AtlasCloud provider-hinted model ID pass-through for explicit
   `vendor/model-id` selections, harvested from #2569 without freezing a
   brittle provider catalog.
+- Added Xiaomi MiMo speech/TTS support with a `codewhale speech` CLI command,
+  `tts` tool alias, and config wiring for voice-design and voice-clone models,
+  harvested from #2560.
+- Added a three-zone immutable prefix diagnostic layer (FrozenPrefix Phase 2)
+  that logs cache-prefix drift at debug level without blocking requests,
+  harvested from #2514.
+- Added a Cache Guard CI integration test suite simulating prefix-cache
+  behaviour across nine scenarios, gated behind `CODEWHALE_CACHE_GUARD=1`,
+  harvested from #2503.
+- Added a plan-mode byte-stability invariant test verifying that the tool
+  catalog head remains byte-identical across mode toggles, harvested from
+  #2519.
 
 ### Changed
 
@@ -47,8 +59,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Community
 
 Thanks to **@ZhulongNT** (#2045), **@cyq1017** (#2521, #2536, #2537, #2559,
-#2562, #2563, #2564), **@HUQIANTAO** (#2527), **@lucaszhu-hue** (#2569), and
-**@idling11** (#2573) for the work harvested into this release pass. Thanks
+#2562, #2563, #2564), **@HUQIANTAO** (#2527, #2519, #2503), **@lucaszhu-hue**
+(#2569), **@idling11** (#2573), **@encyc** (#2514), and **@xyuai** (#2560) for
+the work harvested into this release pass. Thanks
 also to issue reporters and verification helpers including **@New2Niu**
 (#2561), **@buko** (#2533, #2369), **@wywsoor** (#2494), **@ctxyao** (#2556),
 **@Dr3259** (#2380), **@caiyilian** (#2567), and **@chinaqy110** (#2571) for
