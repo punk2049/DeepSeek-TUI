@@ -520,6 +520,19 @@ fn non_yolo_mode_retains_default_defer_policy() {
         AppMode::Agent,
         &always_load
     ));
+    // #2605: the fetch/close side of the sub-agent surface must also stay
+    // active so a first `agent_eval`/`agent_close` executes instead of
+    // hydrating its schema and forcing a double-invoke.
+    assert!(!should_default_defer_tool(
+        "agent_eval",
+        AppMode::Agent,
+        &always_load
+    ));
+    assert!(!should_default_defer_tool(
+        "agent_close",
+        AppMode::Agent,
+        &always_load
+    ));
     assert!(!should_default_defer_tool(
         "read_file",
         AppMode::Agent,

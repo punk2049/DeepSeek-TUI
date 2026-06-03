@@ -510,6 +510,43 @@ fn test_parse_spawn_request_rejects_invalid_role() {
 }
 
 #[test]
+fn test_parse_spawn_request_accepts_full_role_vocabulary() {
+    // Regression for #2649: roles that `SubAgentType::from_str` accepts must
+    // also pass the second `normalize_role_alias` validation pass instead of
+    // being rejected with a stale four-value hint.
+    for (role, expected_type, expected_role) in [
+        ("reviewer", SubAgentType::Review, "reviewer"),
+        ("review", SubAgentType::Review, "reviewer"),
+        ("planner", SubAgentType::Plan, "awaiter"),
+        ("implementer", SubAgentType::Implementer, "implementer"),
+        ("builder", SubAgentType::Implementer, "implementer"),
+        ("verifier", SubAgentType::Verifier, "verifier"),
+        ("tester", SubAgentType::Verifier, "verifier"),
+    ] {
+        let input = json!({ "prompt": "do work", "role": role });
+        let parsed = parse_spawn_request(&input)
+            .unwrap_or_else(|e| panic!("role {role:?} should parse, got {e}"));
+        assert_eq!(parsed.agent_type, expected_type, "type for role {role:?}");
+        assert_eq!(
+            parsed.assignment.role.as_deref(),
+            Some(expected_role),
+            "canonical role for {role:?}"
+        );
+    }
+}
+
+#[test]
+fn test_invalid_role_error_lists_real_aliases() {
+    // The hint must enumerate the actually-accepted vocabulary (#2649).
+    let input = json!({ "prompt": "do work", "role": "nonsense" });
+    let err = parse_spawn_request(&input)
+        .expect_err("invalid role should fail")
+        .to_string();
+    assert!(err.contains("reviewer"), "hint should list reviewer: {err}");
+    assert!(err.contains("verifier"), "hint should list verifier: {err}");
+}
+
+#[test]
 fn test_parse_spawn_request_rejects_conflicting_type_and_role() {
     let input = json!({
         "prompt": "inspect internals",
@@ -881,6 +918,89 @@ async fn agent_eval_on_completed_session_returns_full_projection_not_running_err
         projection.snapshot.result.as_deref(),
         Some(full_output.as_str())
     );
+}
+
+#[tokio::test]
+async fn agent_eval_resolves_session_via_agent_name_alias() {
+    // #2650: `agent_name` is accepted as an alias for `name`/session name.
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(PathBuf::from("."), 1)));
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let mut agent = SubAgent::new(
+        "test_agent_named".to_string(),
+        SubAgentType::Explore,
+        "scan".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        Some("Blue".to_string()),
+        Some(vec!["read_file".to_string()]),
+        input_tx,
+        "boot_test".to_string(),
+    );
+    agent.session_name = "researcher".to_string();
+    agent.status = SubAgentStatus::Completed;
+    agent.result = Some("done".to_string());
+    let agent_id = agent.id.clone();
+    {
+        let mut guard = manager.write().await;
+        guard.agents.insert(agent_id.clone(), agent);
+    }
+
+    let ctx = ToolContext::new(".");
+    let tool = AgentEvalTool::new(manager.clone());
+    let result = tool
+        .execute(json!({ "agent_name": "researcher", "block": false }), &ctx)
+        .await
+        .expect("agent_name alias must resolve the session");
+    let projection: SubAgentSessionProjection =
+        serde_json::from_str(&result.content).expect("projection deserializes");
+    assert_eq!(projection.status, "completed");
+}
+
+#[tokio::test]
+async fn spawn_duplicate_session_name_error_names_conflicting_agent() {
+    // #2656: the duplicate-name error must identify the conflicting agent so a
+    // model can recover deterministically (reuse the id, or pick a new name).
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(PathBuf::from("."), 5)));
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let mut existing = SubAgent::new(
+        "test_agent_existing".to_string(),
+        SubAgentType::Explore,
+        "scan".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        Some("Blue".to_string()),
+        Some(vec!["read_file".to_string()]),
+        input_tx,
+        "boot_test".to_string(),
+    );
+    existing.session_name = "researcher".to_string();
+    existing.status = SubAgentStatus::Running;
+    let existing_id = existing.id.clone();
+    {
+        let mut guard = manager.write().await;
+        guard.agents.insert(existing_id.clone(), existing);
+    }
+
+    let err = {
+        let mut guard = manager.write().await;
+        guard
+            .spawn_background_with_assignment_options(
+                manager.clone(),
+                stub_runtime(),
+                SubAgentType::Explore,
+                "new work".to_string(),
+                make_assignment(),
+                Some(vec!["read_file".to_string()]),
+                SubAgentSpawnOptions {
+                    name: Some("researcher".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect_err("duplicate session name must error")
+    };
+    let msg = err.to_string();
+    assert!(msg.contains(&existing_id), "names the conflicting agent_id: {msg}");
+    assert!(msg.contains("running"), "includes the conflicting status: {msg}");
 }
 
 #[tokio::test]
@@ -1343,9 +1463,28 @@ fn subagent_done_sentinel_format_is_well_formed() {
     assert_eq!(parsed["agent_type"], "general");
     assert_eq!(parsed["summary_location"], "previous_line");
     assert_eq!(parsed["details"], "agent_eval");
+    // Self-describing completion fields (#2658): a short result is complete, so
+    // the parent should trust the previous-line summary.
+    assert_eq!(parsed["result_clipped"], false);
+    assert_eq!(parsed["summary_complete"], true);
+    assert_eq!(parsed["next_action"], "use_summary");
     assert!(parsed.get("summary").is_none());
     assert!(parsed.get("duration_ms").is_none());
     assert!(parsed.get("steps").is_none());
+}
+
+#[test]
+fn subagent_done_sentinel_flags_clipped_result() {
+    let mut res = make_snapshot(SubAgentStatus::Completed);
+    res.result = Some("x".repeat(SUBAGENT_SUMMARY_PREVIEW_MAX + 1));
+    let sentinel = subagent_done_sentinel("agent_big", &res);
+    let inner = sentinel
+        .trim_start_matches("<codewhale:subagent.done>")
+        .trim_end_matches("</codewhale:subagent.done>");
+    let parsed: serde_json::Value = serde_json::from_str(inner).expect("inner JSON parses");
+    assert_eq!(parsed["result_clipped"], true);
+    assert_eq!(parsed["summary_complete"], false);
+    assert_eq!(parsed["next_action"], "call_agent_eval");
 }
 
 #[test]
@@ -1359,7 +1498,22 @@ fn subagent_failed_sentinel_format_is_well_formed() {
     assert_eq!(parsed["status"], "failed");
     assert_eq!(parsed["error_location"], "previous_line");
     assert_eq!(parsed["details"], "agent_eval");
+    assert_eq!(parsed["next_action"], "call_agent_eval");
+    // Stays lean — the error text lives on the previous line, not the sentinel.
     assert!(parsed.get("error").is_none());
+}
+
+#[test]
+fn annotate_child_model_error_adds_actionable_hint() {
+    // #2653: a bare provider 403 becomes actionable by naming the model and the
+    // recovery path, while unrelated errors pass through unchanged.
+    let auth = annotate_child_model_error("403 Forbidden", "kimi-k2");
+    assert!(auth.contains("kimi-k2"), "names the model: {auth}");
+    assert!(auth.contains("agent_open"), "names the recovery path: {auth}");
+    assert!(auth.contains("403 Forbidden"), "preserves the original: {auth}");
+
+    let unrelated = annotate_child_model_error("connection reset by peer", "kimi-k2");
+    assert_eq!(unrelated, "connection reset by peer");
 }
 
 #[test]
