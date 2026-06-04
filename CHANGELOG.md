@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   triage note and are never auto-closed by the contribution gate, while the PR
   gate copy makes clear that dry-run observations are about maintainer safety,
   not contributor quality.
+- Added a PR gate marker guard so reopened unapproved PRs do not get duplicate
+  intake comments, and clarified that PR reopening should happen after
+  allowlist approval is merged.
 - Documented the agent and sub-agent stewardship ethos so future automation
   preserves human issue intake, careful PR review, and contributor credit.
 
