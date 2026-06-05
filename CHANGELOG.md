@@ -161,6 +161,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Browser-opening actions now compile on non-desktop targets by delegating the
+  unsupported-platform error to the shared URL opener instead of hiding the TUI
+  wrapper behind a narrower macOS/Linux/Windows cfg. Thanks @ci4ic4 for the
+  NetBSD/pkgsrc packaging report and fix (#2789).
 - MCP tool routing now preserves server names that contain underscores.
   `parse_prefixed_name` matches the qualified `mcp_<server>_<tool>` name against
   the set of registered server names and prefers the longest match, so tools on
