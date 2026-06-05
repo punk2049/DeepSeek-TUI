@@ -242,7 +242,7 @@ impl ToolSpec for WebSearchTool {
         }
 
         let decider = context.network_policy.as_ref();
-        let client = reqwest::Client::builder()
+        let client = crate::tls::reqwest_client_builder()
             .timeout(Duration::from_millis(timeout_ms))
             .user_agent(USER_AGENT)
             .build()
@@ -382,7 +382,7 @@ impl WebSearchTool {
                 )
             })?;
 
-        let client = reqwest::Client::builder()
+        let client = crate::tls::reqwest_client_builder()
             .timeout(Duration::from_millis(timeout_ms))
             .build()
             .map_err(|e| {
@@ -479,7 +479,7 @@ impl WebSearchTool {
                 )
             })?;
 
-        let client = reqwest::Client::builder()
+        let client = crate::tls::reqwest_client_builder()
             .timeout(Duration::from_millis(timeout_ms))
             .build()
             .map_err(|e| {
@@ -588,7 +588,7 @@ impl WebSearchTool {
             .or(env_key.as_deref())
             .unwrap_or(METASO_DEFAULT_API_KEY);
 
-        let client = reqwest::Client::builder()
+        let client = crate::tls::reqwest_client_builder()
             .timeout(Duration::from_millis(timeout_ms))
             .build()
             .map_err(|e| {
@@ -693,7 +693,7 @@ impl WebSearchTool {
                 )
             })?;
 
-        let client = reqwest::Client::builder()
+        let client = crate::tls::reqwest_client_builder()
             .timeout(Duration::from_millis(timeout_ms))
             .build()
             .map_err(|e| {
@@ -778,7 +778,7 @@ impl WebSearchTool {
         // when it exceeds 90_000 ms.
         let effective_timeout = timeout_ms.max(90_000);
 
-        let client = reqwest::Client::builder()
+        let client = crate::tls::reqwest_client_builder()
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_millis(effective_timeout))
             .tcp_keepalive(Some(Duration::from_secs(30)))

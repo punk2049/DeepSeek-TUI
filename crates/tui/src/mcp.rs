@@ -1319,8 +1319,8 @@ impl McpConnection {
             // local Clash / Shadowsocks tunnel, etc. previously had MCP
             // HTTP traffic bypass the proxy entirely while every other
             // tool on the box (curl, npm, …) used it.
-            let mut client_builder =
-                reqwest::Client::builder().timeout(Duration::from_secs(connect_timeout_secs));
+            let mut client_builder = crate::tls::reqwest_client_builder()
+                .timeout(Duration::from_secs(connect_timeout_secs));
             let env_proxy_url = std::env::var("HTTPS_PROXY")
                 .or_else(|_| std::env::var("https_proxy"))
                 .or_else(|_| std::env::var("HTTP_PROXY"))
@@ -2942,7 +2942,7 @@ mod tests {
 
     fn test_http_client() -> reqwest::Client {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        reqwest::Client::new()
+        crate::tls::reqwest_client()
     }
 
     async fn lock_mcp_loopback_tests() -> tokio::sync::MutexGuard<'static, ()> {

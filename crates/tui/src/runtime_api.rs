@@ -2721,7 +2721,7 @@ mod tests {
         let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
 
         let health: serde_json::Value = client
             .get(format!("http://{addr}/health"))
@@ -2786,7 +2786,7 @@ mod tests {
         else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
 
         let health = client
             .get(format!("http://{addr}/health"))
@@ -2825,7 +2825,7 @@ mod tests {
         let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
 
         let workspace: serde_json::Value = client
             .get(format!("http://{addr}/v1/workspace/status"))
@@ -2949,7 +2949,7 @@ mod tests {
         let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
 
         let resp = client
             .post(format!("http://{addr}/v1/stream"))
@@ -2966,7 +2966,7 @@ mod tests {
         let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
 
         let created: serde_json::Value = client
             .post(format!("http://{addr}/v1/threads"))
@@ -3238,7 +3238,7 @@ mod tests {
         let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
 
         let created: serde_json::Value = client
             .post(format!("http://{addr}/v1/threads"))
@@ -3364,7 +3364,7 @@ mod tests {
         let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
 
         let created: serde_json::Value = client
             .post(format!("http://{addr}/v1/threads"))
@@ -3587,7 +3587,7 @@ mod tests {
         let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
 
         // Create a thread and install a mock engine so /v1/stream doesn't call the real API.
         let created: serde_json::Value = client
@@ -3704,7 +3704,7 @@ mod tests {
         let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
 
         let resp = client
             .get(format!("http://{addr}/v1/sessions/nonexistent_id"))
@@ -3721,7 +3721,7 @@ mod tests {
         let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
 
         let get_resp = client
             .get(format!("http://{addr}/v1/sessions/invalid%20id"))
@@ -3753,7 +3753,7 @@ mod tests {
         let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
 
         let resp = client
             .post(format!(
@@ -3808,7 +3808,7 @@ mod tests {
         else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
 
         let resp = client
             .post(format!(
@@ -3849,7 +3849,7 @@ mod tests {
         else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
 
         let created: serde_json::Value = client
             .post(format!("http://{addr}/v1/threads"))
@@ -3956,7 +3956,7 @@ mod tests {
         let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
 
         let resp = client
             .post(format!("http://{addr}/v1/sessions"))
@@ -3974,7 +3974,7 @@ mod tests {
         let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
 
         let created: serde_json::Value = client
             .post(format!("http://{addr}/v1/threads"))
@@ -4086,7 +4086,7 @@ mod tests {
         let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
         let resp = client
             .delete(format!("http://{addr}/v1/sessions/nonexistent-id"))
             .send()
@@ -4121,7 +4121,7 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
 
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
 
         // The user-supplied origin is allowed.
         let resp = client
@@ -4191,7 +4191,7 @@ mod tests {
         let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
 
         let created: serde_json::Value = client
             .post(format!("http://{addr}/v1/threads"))
@@ -4277,7 +4277,7 @@ mod tests {
         let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
 
         // Two threads — keep one active, archive the other.
         let active: serde_json::Value = client
@@ -4388,7 +4388,7 @@ mod tests {
         let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
 
         let body: serde_json::Value = client
             .get(format!("http://{addr}/v1/usage"))
@@ -4447,7 +4447,7 @@ mod tests {
         let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
         let info: serde_json::Value = client
             .get(format!("http://{addr}/v1/runtime/info"))
             .send()
@@ -4478,7 +4478,7 @@ mod tests {
         else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
         let disabled = client.get(format!("http://{addr}/mobile")).send().await?;
         assert_eq!(disabled.status(), StatusCode::NOT_FOUND);
         handle.abort();
@@ -4517,7 +4517,7 @@ mod tests {
         else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
 
         let unauthorized = client.get(format!("http://{addr}/mobile")).send().await?;
         assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
@@ -4552,7 +4552,7 @@ mod tests {
         else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
 
         let page = client
             .get(format!("http://{addr}/mobile"))
@@ -4577,7 +4577,7 @@ mod tests {
         let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
         let resp = client
             .post(format!("http://{addr}/v1/approvals/no_such_id"))
             .json(&json!({ "decision": "allow" }))
@@ -4594,7 +4594,7 @@ mod tests {
         let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
         let resp = client
             .post(format!("http://{addr}/v1/approvals/whatever"))
             .json(&json!({ "decision": "yolo" }))
@@ -4611,7 +4611,7 @@ mod tests {
         let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
         let rx = runtime_threads.register_pending_approval_for_test("ext_id");
 
         let resp = client
@@ -4640,7 +4640,7 @@ mod tests {
         let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
         let body: serde_json::Value = client
             .get(format!("http://{addr}/v1/skills"))
             .send()
@@ -4663,7 +4663,7 @@ mod tests {
         let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
             return Ok(());
         };
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
         let resp = client
             .post(format!("http://{addr}/v1/skills/no-such-skill"))
             .json(&json!({ "enabled": false }))

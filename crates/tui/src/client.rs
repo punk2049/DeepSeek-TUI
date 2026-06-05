@@ -625,7 +625,7 @@ impl DeepSeekClient {
         base_url: &str,
     ) -> Result<reqwest::Client> {
         let headers = build_default_headers(api_key, extra_headers, api_provider, base_url)?;
-        let mut builder = reqwest::Client::builder()
+        let mut builder = crate::tls::reqwest_client_builder()
             .default_headers(headers)
             .user_agent(concat!(
                 "Mozilla/5.0 (compatible; codewhale/",

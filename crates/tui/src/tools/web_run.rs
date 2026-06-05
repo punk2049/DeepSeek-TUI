@@ -774,7 +774,7 @@ async fn run_search(
     timeout_ms: u64,
     domains: &[String],
 ) -> Result<(Vec<SearchEntry>, String, Option<String>), ToolError> {
-    let client = reqwest::Client::builder()
+    let client = crate::tls::reqwest_client_builder()
         .timeout(Duration::from_millis(timeout_ms))
         .user_agent(USER_AGENT)
         .build()
@@ -970,7 +970,7 @@ async fn run_image_search(
     timeout_ms: u64,
     domains: &[String],
 ) -> Result<(Vec<ImageResultEntry>, Option<String>), ToolError> {
-    let client = reqwest::Client::builder()
+    let client = crate::tls::reqwest_client_builder()
         .timeout(Duration::from_millis(timeout_ms))
         .user_agent(USER_AGENT)
         .build()
@@ -1123,7 +1123,7 @@ fn check_network_policy(url: &str, context: &ToolContext) -> Result<(), ToolErro
 }
 
 async fn fetch_page(url: &str, timeout_ms: u64) -> Result<WebPage, ToolError> {
-    let client = reqwest::Client::builder()
+    let client = crate::tls::reqwest_client_builder()
         .timeout(Duration::from_millis(timeout_ms))
         .user_agent(USER_AGENT)
         .build()

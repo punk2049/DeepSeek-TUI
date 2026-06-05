@@ -621,6 +621,8 @@ impl Engine {
 
     /// Create a new engine with the given configuration
     pub fn new(config: EngineConfig, api_config: &Config) -> (Self, EngineHandle) {
+        crate::tls::ensure_rustls_crypto_provider();
+
         if let Some(objective) = normalized_goal_objective(config.goal_objective.as_deref()) {
             sync_goal_state_from_host(&config.goal_state, Some(&objective), None, false);
         }

@@ -2566,7 +2566,7 @@ mod tests {
     // in the cached prefix must produce identical bytes given identical
     // inputs across calls.
 
-    use crate::test_support::assert_byte_identical;
+    use crate::test_support::{EnvVarGuard, assert_byte_identical};
 
     #[test]
     fn compose_prompt_is_byte_stable_across_calls() {
@@ -2592,7 +2592,12 @@ mod tests {
         // identical bytes. This pins the most representative production
         // surface (engine.rs builds the system prompt via this fn or
         // its sibling _and_skills variant on every turn).
+        let _env_guard = crate::test_support::lock_test_env();
         let tmp = tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let _home = EnvVarGuard::set("HOME", home.as_os_str());
+        let _userprofile = EnvVarGuard::set("USERPROFILE", home.as_os_str());
+        let _skills_dir = EnvVarGuard::remove("DEEPSEEK_SKILLS_DIR");
         let workspace = tmp.path();
 
         for mode in [AppMode::Agent, AppMode::Yolo, AppMode::Plan] {

@@ -140,6 +140,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dedicated hydrated status, so it is no longer indistinguishable from a real
   successful execution. A hydrated row also ranks with active work rather than
   completed successes (#2648).
+- TUI HTTP clients now install the Rustls ring crypto provider before building
+  `reqwest` clients, covering engine, runtime API, tool, MCP, config, and skill
+  download paths. This keeps the no-provider TLS build from panicking during
+  tests or embedded startup paths that do not enter through the main binary.
+- Prompt byte-stability tests now pin their temporary home and skills
+  environment under the shared test-env lock so global skill directories cannot
+  perturb deterministic prompt bytes during parallel test runs.
 
 ### Community
 

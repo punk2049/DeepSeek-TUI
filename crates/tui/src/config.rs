@@ -5202,7 +5202,7 @@ fn refresh_kimi_oauth_token(refresh_token: &str) -> Result<KimiOAuthCredential> 
         .or_else(|_| std::env::var("KIMI_OAUTH_HOST"))
         .unwrap_or_else(|_| "https://auth.kimi.com".to_string());
     let url = format!("{}/api/oauth/token", oauth_host.trim_end_matches('/'));
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::tls::reqwest_blocking_client_builder()
         .timeout(Duration::from_secs(15))
         .build()
         .context("Failed to build Kimi OAuth refresh client")?;

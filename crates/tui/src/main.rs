@@ -78,6 +78,7 @@ mod task_manager;
 #[cfg(test)]
 mod test_support;
 mod theme_qa_audit;
+mod tls;
 mod tool_output_receipts;
 mod tools;
 mod tui;
@@ -111,7 +112,7 @@ fn configure_windows_console_utf8() {
 fn configure_windows_console_utf8() {}
 
 fn install_rustls_crypto_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    crate::tls::ensure_rustls_crypto_provider();
 }
 
 #[derive(Parser, Debug)]

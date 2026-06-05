@@ -405,7 +405,7 @@ pub async fn start_web_editor(app: &App, config: &Config) -> Result<WebConfigSes
         let poll_tx = tx.clone();
         let poll_url = format!("{url}/api/session");
         let poll_task = tokio::spawn(async move {
-            let client = reqwest::Client::new();
+            let client = crate::tls::reqwest_client();
             let mut last: Option<ConfigUiDocument> = Some(app_snapshot);
             loop {
                 tokio::time::sleep(Duration::from_millis(750)).await;
