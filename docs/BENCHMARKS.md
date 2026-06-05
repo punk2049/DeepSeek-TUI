@@ -1,0 +1,153 @@
+# Benchmarks
+
+CodeWhale integrates with three external benchmarks to measure real-world
+coding-agent performance. Each benchmark tests a different surface:
+
+| Benchmark | What it tests | Harness | Output format |
+|---|---|---|---|
+| **SWE-bench** | Patch generation from GitHub issues | CodeWhale built-in (`codewhale swebench`) | `all_preds.jsonl` |
+| **Terminal-Bench** | End-to-end terminal tasks (compile, deploy, configure) | Harbor framework adapter | Harbor result JSON |
+| **PinchBench** | Real-world agent tasks (calendar, email, coding, research) | Standalone runner via OpenClaw-compatible adapter | PinchBench result JSON |
+
+All three require Docker. SWE-bench and Terminal-Bench also need the official
+evaluation harness installed separately.
+
+## Prerequisites
+
+```bash
+# Docker (all benchmarks)
+docker --version
+
+# Python 3.10+ with uv (Terminal-Bench, PinchBench, SWE-bench eval)
+python3 --version
+uv --version
+
+# CodeWhale v0.8.53+
+codewhale --version
+
+# API key
+export DEEPSEEK_API_KEY="sk-..."
+```
+
+## SWE-bench
+
+CodeWhale has built-in SWE-bench support via `codewhale swebench run` and
+`codewhale swebench export`. See [docs/SWEBENCH.md](SWEBENCH.md) for the
+single-instance workflow.
+
+### Batch run
+
+```bash
+# Run all instances from a dataset split
+./scripts/benchmarks/run-swebench.sh \
+  --dataset princeton-nlp/SWE-bench_Lite \
+  --split test \
+  --predictions-path ./results/swebench_preds.jsonl
+
+# Run a single instance
+./scripts/benchmarks/run-swebench.sh \
+  --instance-id django__django-12345 \
+  --issue-file ./issue.md \
+  --predictions-path ./results/swebench_preds.jsonl
+```
+
+### Evaluate
+
+```bash
+python -m swebench.harness.run_evaluation \
+  --dataset_name princeton-nlp/SWE-bench_Lite \
+  --predictions_path ./results/swebench_preds.jsonl \
+  --max_workers 1 \
+  --run_id codewhale-v0.8.53
+```
+
+## Terminal-Bench (via Harbor)
+
+Terminal-Bench tests agents on real terminal tasks — compiling, deploying,
+configuring servers, training models. The [Harbor framework](https://github.com/harbor-framework/harbor)
+is the official harness.
+
+CodeWhale plugs in via a Harbor adapter (`scripts/benchmarks/harbor/codewhale_agent.py`).
+
+### Setup
+
+```bash
+pip install harbor
+```
+
+### Run
+
+```bash
+# Via the convenience script
+./scripts/benchmarks/run-terminal-bench.sh \
+  --dataset terminal-bench@2.0 \
+  --model deepseek/deepseek-chat \
+  --n-concurrent 4
+
+# Or directly with harbor
+harbor run \
+  --dataset terminal-bench@2.0 \
+  --agent codewhale \
+  --model deepseek/deepseek-chat \
+  --n-concurrent 4
+```
+
+### Custom agent path
+
+If the adapter is not installed system-wide, point Harbor at it:
+
+```bash
+harbor run \
+  --dataset terminal-bench@2.0 \
+  --agent scripts.benchmarks.harbor.codewhale_agent:CodeWhaleAgent \
+  --model deepseek/deepseek-chat
+```
+
+## PinchBench
+
+PinchBench measures agent performance on real-world tasks — scheduling, email
+triage, code generation, research, file management. It uses OpenClaw as the
+agent runtime.
+
+### Setup
+
+```bash
+git clone https://github.com/pinchbench/skill.git /tmp/pinchbench
+cd /tmp/pinchbench
+uv venv && source .venv/bin/activate
+uv pip install -e .
+```
+
+### Run
+
+```bash
+# Via the convenience script
+./scripts/benchmarks/run-pinchbench.sh \
+  --model deepseek/deepseek-chat \
+  --suite all
+
+# Or directly
+cd /tmp/pinchbench && ./scripts/run.sh \
+  --model deepseek/deepseek-chat \
+  --suite all
+```
+
+## Reproducibility checklist
+
+When publishing benchmark results, record:
+
+- [ ] CodeWhale version: `codewhale --version`
+- [ ] Git commit: `git rev-parse HEAD`
+- [ ] Model and provider (e.g. `deepseek/deepseek-chat`)
+- [ ] Benchmark dataset and version
+- [ ] Docker platform (`linux/amd64` vs `linux/arm64`)
+- [ ] Worker concurrency
+- [ ] Timestamp (UTC)
+- [ ] Full result file (`all_preds.jsonl`, Harbor result dir, or PinchBench results JSON)
+
+## References
+
+- SWE-bench: https://github.com/SWE-bench/SWE-bench
+- Terminal-Bench: https://github.com/laude-institute/terminal-bench / https://www.tbench.ai
+- Harbor: https://github.com/harbor-framework/harbor / https://harborframework.com
+- PinchBench: https://github.com/pinchbench/skill / https://pinchbench.com
