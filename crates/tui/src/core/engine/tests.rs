@@ -1852,9 +1852,22 @@ async fn change_mode_op_updates_current_mode_and_emits_status() {
         .await
         .expect("session update after mode switch")
         .expect("event");
+    let Event::SessionUpdated { messages, .. } = session_updated else {
+        panic!(
+            "should emit SessionUpdated after mode change, got: {session_updated:?}"
+        );
+    };
     assert!(
-        matches!(session_updated, Event::SessionUpdated { .. }),
-        "should emit SessionUpdated after mode change, got: {session_updated:?}"
+        messages.iter().all(|message| {
+            message.content.iter().all(|block| {
+                !matches!(
+                    block,
+                    ContentBlock::Text { text, .. }
+                        if text.contains("<runtime_prompt")
+                )
+            })
+        }),
+        "runtime prompt tags must not be persisted into session messages after mode change"
     );
 
     // Also expect a status event
@@ -2379,9 +2392,10 @@ fn turn_metadata_mode_updates_with_change_mode_op() {
 
 #[test]
 fn current_mode_field_assignment_takes_effect_synchronously() {
-    // Basic unit-level invariant: the current_mode field mutates as expected.
-    // Op::ChangeMode dispatch is exercised by the integration test
-    // change_mode_op_updates_current_mode_and_emits_status.
+    // Basic unit-level invariant: the current_mode field mutates as expected
+    // and the per-turn <runtime_prompt> tag reflects the current mode.
+    // Op::ChangeMode dispatch through the run loop is exercised by the
+    // integration test change_mode_op_updates_current_mode_and_emits_status.
     let tmp = tempdir().expect("tempdir");
     let config = EngineConfig {
         workspace: tmp.path().to_path_buf(),
@@ -2391,8 +2405,39 @@ fn current_mode_field_assignment_takes_effect_synchronously() {
     let (mut engine, _handle) = Engine::new(config, &Config::default());
     assert_eq!(engine.current_mode, AppMode::Agent);
 
+    // Verify runtime tag in Agent mode
+    let agent_messages = engine.messages_with_turn_metadata();
+    let agent_tag = agent_messages.last().expect("runtime tag message");
+    let ContentBlock::Text { text: agent_text, .. } =
+        agent_tag.content.first().expect("text block")
+    else {
+        panic!("expected text runtime tag in Agent mode");
+    };
+    assert!(
+        agent_text.contains("mode=\"agent\""),
+        "Agent mode should produce runtime tag with mode=\"agent\", got: {agent_text}"
+    );
+
+    // Switch to YOLO
     engine.current_mode = AppMode::Yolo;
     assert_eq!(engine.current_mode, AppMode::Yolo);
+
+    // Verify runtime tag reflects the YOLO mode with auto approval
+    let yolo_messages = engine.messages_with_turn_metadata();
+    let yolo_tag = yolo_messages.last().expect("runtime tag message");
+    let ContentBlock::Text { text: yolo_text, .. } =
+        yolo_tag.content.first().expect("text block")
+    else {
+        panic!("expected text runtime tag in YOLO mode");
+    };
+    assert!(
+        yolo_text.contains("mode=\"yolo\""),
+        "YOLO mode should produce runtime tag with mode=\"yolo\", got: {yolo_text}"
+    );
+    assert!(
+        yolo_text.contains("approval=\"auto\""),
+        "YOLO mode should project auto approval in runtime tag, got: {yolo_text}"
+    );
 }
 
 #[test]

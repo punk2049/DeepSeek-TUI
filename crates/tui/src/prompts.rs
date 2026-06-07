@@ -1580,8 +1580,10 @@ mod tests {
             Personality::Calm,
             "deepseek-v4-pro",
         );
-        // The generated "## Core Tool Taxonomy" block now travels in the
-        // request-time <mode_prompt> metadata rather than being prepended here.
+        // The core tool taxonomy (grep_files / git_status / run_tests hints)
+        // is no longer prepended as a standalone "## Core Tool Taxonomy" block.
+        // It now lives inside the "## Runtime Policy Reference" section of the
+        // system prompt, scoped under each mode sub-heading.
         // (The "## Toolbox" section from the Constitutional preamble remains.)
         assert!(!prompt.contains("## Core Tool Taxonomy"));
         assert!(prompt.contains("You are deepseek-v4-pro"));
@@ -1602,8 +1604,9 @@ mod tests {
             "Plan taxonomy must not mention run_tests, run_verifiers, or exec_shell"
         );
         // The taxonomy block is rendered correctly but no longer inlined
-        // into the base system prompt — it travels in request-time
-        // <mode_prompt> metadata instead.
+        // into the base system prompt — it lives inside the
+        // "## Runtime Policy Reference" section of the system prompt,
+        // scoped under each mode sub-heading.
     }
 
     #[test]
@@ -1642,6 +1645,65 @@ mod tests {
         assert!(
             text.contains("The Constitution of CodeWhale (Articles I-VII) governs your behavior"),
             "authority recap must reference the Constitution"
+        );
+    }
+
+    #[test]
+    fn runtime_policy_reference_is_included_in_full_prompt() {
+        let tmp = tempdir().expect("tempdir");
+        let text = match system_prompt_for_mode_with_context_skills_session_and_approval(
+            AppMode::Agent,
+            tmp.path(),
+            None,
+            None,
+            None,
+            PromptSessionContext::default(),
+        ) {
+            SystemPrompt::Text(text) => text,
+            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
+        };
+
+        assert!(
+            text.contains("## Runtime Policy Reference"),
+            "full system prompt must contain the Runtime Policy Reference lookup table"
+        );
+        assert!(
+            text.contains(
+                "<runtime_prompt visibility=\"internal\" mode=\"<mode>\" approval=\"<approval>\"/>"
+            ),
+            "Runtime Policy Reference must explain the per-turn tag format"
+        );
+        assert!(
+            text.contains("### Modes"),
+            "Runtime Policy Reference must contain the Modes section"
+        );
+        assert!(
+            text.contains("#### agent"),
+            "Runtime Policy Reference must document Agent mode"
+        );
+        assert!(
+            text.contains("#### plan"),
+            "Runtime Policy Reference must document Plan mode"
+        );
+        assert!(
+            text.contains("#### yolo"),
+            "Runtime Policy Reference must document YOLO mode"
+        );
+        assert!(
+            text.contains("### Approval Policies"),
+            "Runtime Policy Reference must contain the Approval Policies section"
+        );
+        assert!(
+            text.contains("#### auto"),
+            "Runtime Policy Reference must document auto approval"
+        );
+        assert!(
+            text.contains("#### suggest"),
+            "Runtime Policy Reference must document suggest approval"
+        );
+        assert!(
+            text.contains("#### never"),
+            "Runtime Policy Reference must document never approval"
         );
     }
 
