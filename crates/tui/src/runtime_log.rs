@@ -154,12 +154,24 @@ pub fn init() -> Result<TuiLogGuard> {
         .or_else(|_| EnvFilter::try_new("info"))
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
+    let log_path_clone = log_path.clone();
     let subscriber = tracing_subscriber::registry().with(env_filter).with(
         fmt::layer()
             .with_writer(move || {
-                subscriber_file
-                    .try_clone()
-                    .expect("clone log file handle for tracing writer")
+                // Clone the file handle for each write. If clone fails (fd exhaustion),
+                // fall back to reopening the same path, or ultimately stderr.
+                subscriber_file.try_clone().unwrap_or_else(|e| {
+                    tracing::warn!("Failed to clone log file handle: {e}, reopening");
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&log_path_clone)
+                        .unwrap_or_else(|_| {
+                            // Last resort: wrap stderr as a File to prevent panic.
+                            use std::os::unix::io::FromRawFd;
+                            unsafe { std::fs::File::from_raw_fd(2) }
+                        })
+                })
             })
             .with_ansi(false)
             .with_target(true)

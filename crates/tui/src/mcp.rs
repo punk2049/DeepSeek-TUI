@@ -585,6 +585,8 @@ pub struct SseTransport {
     endpoint_url: Option<String>,
     receiver: tokio::sync::mpsc::UnboundedReceiver<SseInbound>,
     pending_messages: VecDeque<Vec<u8>>,
+    #[allow(dead_code)]
+    sse_task: tokio::task::JoinHandle<()>,
 }
 
 enum SseInbound {
@@ -644,7 +646,7 @@ impl SseTransport {
         let headers_clone = headers.clone();
         let wait_cancel_token = cancel_token.clone();
 
-        tokio::spawn(async move {
+        let sse_task = tokio::spawn(async move {
             if cancel_token.is_cancelled() {
                 return;
             }
@@ -683,6 +685,7 @@ impl SseTransport {
             endpoint_url: None,
             receiver: rx,
             pending_messages: VecDeque::new(),
+            sse_task,
         };
         transport
             .wait_for_endpoint(&wait_cancel_token, endpoint_timeout)
