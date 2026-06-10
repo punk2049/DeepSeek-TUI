@@ -17,6 +17,7 @@ use ratatui::{
 };
 
 use crate::palette::{self, ColorDepth, PaletteMode, ThemeId, UiTheme};
+use crate::tui::osc8::LinkRegion;
 
 const RENDER_DEBUG_ENV: &str = "CODEWHALE_TUI_DEBUG";
 const RENDER_DEBUG_SAMPLE_LIMIT: usize = 24;
@@ -49,6 +50,11 @@ pub(crate) struct ColorCompatBackend<W: Write> {
     /// the live crossterm query.
     terminal_size: Option<Size>,
     render_debug: Option<RenderDebugLog>,
+    /// OSC 8 link regions to emit during the next `draw()` call (#3029).
+    /// Set by the render closure before `terminal.draw()`; cleared after each
+    /// draw so stale links don't persist across frames.
+    #[allow(dead_code)] // populated via set_pending_links from render closure
+    pending_links: Vec<LinkRegion>,
 }
 
 impl<W: Write> ColorCompatBackend<W> {
@@ -66,7 +72,18 @@ impl<W: Write> ColorCompatBackend<W> {
             forced_size: None,
             terminal_size: None,
             render_debug: RenderDebugLog::from_env(),
+            pending_links: Vec::new(),
         }
+    }
+
+    #[allow(dead_code)] // called from render closure (future integration)
+    pub(crate) fn set_pending_links(&mut self, links: Vec<LinkRegion>) {
+        self.pending_links = links;
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn clear_pending_links(&mut self) {
+        self.pending_links.clear();
     }
 
     pub(crate) fn force_size(&mut self, size: Size) {
@@ -129,8 +146,30 @@ impl<W: Write> Backend for ColorCompatBackend<W> {
         if let Some(render_debug) = &mut self.render_debug {
             render_debug.record(viewport, &adapted);
         }
+        // #3029: Emit OSC 8 hyperlinks out-of-band through the backend's
+        // Write impl.  ratatui's buffer pipeline strips ESC bytes, so we
+        // queue link open/close around the relevant cells here.
+        let frame_links = crate::tui::osc8::take_frame_links();
+        let link_active = !frame_links.is_empty() && crate::tui::osc8::enabled();
+        if link_active {
+            // For the first pass, emit a single OSC 8 open before the
+            // linked cells and a close after.  Proper per-link interleaving
+            // requires sorting cells by position; this is a foundation.
+            for link in &frame_links {
+                let _ = crate::tui::osc8::write_osc8_open(self, &link.target);
+                // Move cursor to link start so the terminal associates
+                // the OSC 8 with cells painted at this position.
+                let _ = self.inner.set_cursor_position((link.col_start, link.row));
+            }
+        }
         self.inner
-            .draw(adapted.iter().map(|(x, y, cell)| (*x, *y, cell)))
+            .draw(adapted.iter().map(|(x, y, cell)| (*x, *y, cell)))?;
+        if link_active {
+            for _link in &frame_links {
+                let _ = crate::tui::osc8::write_osc8_close(self);
+            }
+        }
+        Ok(())
     }
 
     fn append_lines(&mut self, n: u16) -> io::Result<()> {
