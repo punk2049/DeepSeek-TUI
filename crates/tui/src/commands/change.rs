@@ -869,11 +869,18 @@ Older release.\n";
     fn change_with_explicit_version_includes_previous_hint() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut app = make_app(&tmp, Locale::En, false);
-        let result = change(&mut app, Some("0.8.32"));
+        // Derive versions from the bundled changelog: it only embeds a recent
+        // slice of releases, so hardcoded versions would age out of it.
+        let explicit = extract_previous_version_number(DEEPSEEK_TUI_CHANGELOG)
+            .expect("bundled changelog should have a previous release");
+        let expected_prev =
+            extract_previous_version_number_after_version(DEEPSEEK_TUI_CHANGELOG, &explicit)
+                .expect("bundled changelog should have at least three releases");
+        let result = change(&mut app, Some(&explicit));
         assert!(!result.is_error);
         let msg = result.message.as_deref().unwrap_or("");
         assert!(
-            msg.contains("Previous version:") && msg.contains("0.8.31"),
+            msg.contains("Previous version:") && msg.contains(&expected_prev),
             "explicit version should show previous-version hint: {msg}"
         );
     }

@@ -31,6 +31,10 @@ not enumerate.
       if there is something material the user must work around.
 - [ ] The entry mentions all referenced issue/PR numbers as `#NNNN` so the
       auto-linker on GitHub picks them up.
+- [ ] Run `scripts/sync-changelog.sh` to regenerate `crates/tui/CHANGELOG.md`
+      (the recent-releases slice embedded in the binary for `/change`). Do
+      not edit that file by hand, and do not copy the full root changelog
+      into it — older entries live in `docs/CHANGELOG_ARCHIVE.md`.
 
 ## 2. Version pins are in sync
 
