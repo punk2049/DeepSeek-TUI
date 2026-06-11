@@ -312,6 +312,12 @@ pub fn model_supports_reasoning(model: &str) -> bool {
     if lower.contains("deepseek") && lower.contains("v4") {
         return true;
     }
+    // #3016: Moonshot-native Kimi IDs also emit reasoning_content.
+    // `kimi-for-coding` is Moonshot's documented non-thinking model — it
+    // must not be classified as reasoning-capable by the prefix rule.
+    if lower.starts_with("kimi-") && lower != "kimi-for-coding" {
+        return true;
+    }
     matches!(
         lower.as_str(),
         "arcee-ai/trinity-large-thinking"
@@ -540,6 +546,15 @@ mod tests {
             assert_eq!(context_window_for_model(model), Some(expected_window));
             assert!(model_supports_reasoning(model));
         }
+    }
+
+    #[test]
+    fn moonshot_native_kimi_ids_support_reasoning_except_for_coding() {
+        // #3016: bare Moonshot ids (no moonshotai/ prefix) emit
+        // reasoning_content; kimi-for-coding is the non-thinking exception.
+        assert!(model_supports_reasoning("kimi-k2.6"));
+        assert!(model_supports_reasoning("kimi-k2.5"));
+        assert!(!model_supports_reasoning("kimi-for-coding"));
     }
 
     #[test]
