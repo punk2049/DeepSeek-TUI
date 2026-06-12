@@ -9,6 +9,9 @@ use crate::tui::app::AppMode;
 use crate::tui::approval::ApprovalMode;
 use std::path::PathBuf;
 
+/// Prefix used for tool-call ids created by local composer shell shortcuts.
+pub const USER_SHELL_TOOL_ID_PREFIX: &str = "user_shell_";
+
 /// Operations that can be submitted to the engine.
 #[derive(Debug, Clone)]
 pub enum Op {
@@ -27,6 +30,25 @@ pub enum Op {
         /// True when the user selected auto model routing.
         auto_model: bool,
         allow_shell: bool,
+        trust_mode: bool,
+        auto_approve: bool,
+        approval_mode: ApprovalMode,
+        translation_enabled: bool,
+        show_thinking: bool,
+        /// Tool restriction from custom slash command frontmatter.
+        /// `None` means the current turn may use the normal tool set.
+        allowed_tools: Option<Vec<String>>,
+        /// Hook executor for control-plane hooks.
+        /// `ToolCallBefore` hooks may deny a tool call with exit code 2.
+        hook_executor: Option<std::sync::Arc<crate::hooks::HookExecutor>>,
+    },
+
+    /// Execute a user-submitted composer shell command (`! <command>`) without
+    /// sending a model turn. This still routes through `exec_shell`, approval,
+    /// sandbox, and command-safety handling.
+    RunShellCommand {
+        command: String,
+        mode: AppMode,
         trust_mode: bool,
         auto_approve: bool,
         approval_mode: ApprovalMode,
@@ -55,17 +77,22 @@ pub enum Op {
     #[allow(dead_code)]
     ChangeMode { mode: AppMode },
 
-    /// Update the model being used
+    /// Update the model being used and refresh stable prompt context.
     #[allow(dead_code)]
-    SetModel { model: String },
+    SetModel { model: String, mode: AppMode },
 
     /// Update auto-compaction settings
     SetCompaction { config: CompactionConfig },
 
+    /// Update the SSE idle timeout used for subsequent streamed turns.
+    SetStreamChunkTimeout { timeout_secs: u64 },
+
     /// Sync engine session state (used for resume/load)
     SyncSession {
+        session_id: Option<String>,
         messages: Vec<Message>,
         system_prompt: Option<SystemPrompt>,
+        system_prompt_override: bool,
         model: String,
         workspace: PathBuf,
     },
@@ -73,20 +100,8 @@ pub enum Op {
     /// Run context compaction immediately.
     CompactContext,
 
-    /// Run a Recursive Language Model (RLM) turn per Algorithm 1 of
-    /// Zhang et al. (arXiv:2512.24601). The prompt is stored in the REPL
-    /// as `context`; the root LLM only sees metadata.
-    Rlm {
-        /// The user's prompt — stored in REPL, NOT in the LLM context.
-        content: String,
-        /// The model to use for root LLM calls.
-        model: String,
-        /// The model to use for sub-LLM (llm_query) calls.
-        child_model: String,
-        /// Recursion budget for `sub_rlm()` calls. Paper experiments use
-        /// depth=1; defaults set by the `/rlm` command.
-        max_depth: u32,
-    },
+    /// Run agent-driven context purging.
+    PurgeContext,
 
     /// Edit the last user message: remove the last user+assistant exchange
     /// from the session, then re-send with the new content.

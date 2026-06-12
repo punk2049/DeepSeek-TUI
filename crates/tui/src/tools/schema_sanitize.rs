@@ -75,6 +75,35 @@ pub fn sanitize_for_strict(schema: &mut Value) {
     enforce_strict_subset(schema);
 }
 
+/// Sanitize a schema for OpenAI Responses function tools.
+///
+/// The Responses API requires the top-level `parameters` schema to be an object
+/// and rejects top-level `oneOf` / `anyOf` / `allOf` / `enum` / `not`. Keep the
+/// schema permissive rather than changing tool semantics: merge any root
+/// alternative properties we can see, then remove the root-only composition
+/// keywords while preserving nested schemas.
+pub fn sanitize_for_responses(schema: &mut Value) {
+    sanitize(schema);
+
+    if !schema.is_object() {
+        *schema = Value::Object(Map::new());
+    }
+
+    let Some(obj) = schema.as_object_mut() else {
+        return;
+    };
+
+    merge_root_composition_properties(obj);
+    obj.insert("type".into(), Value::String("object".to_string()));
+    obj.remove("oneOf");
+    obj.remove("anyOf");
+    obj.remove("allOf");
+    obj.remove("enum");
+    obj.remove("not");
+    ensure_properties_object(obj);
+    prune_dangling_required(schema);
+}
+
 fn strict_schema_supported(schema: &Value) -> bool {
     let mut normalized = schema.clone();
     sanitize(&mut normalized);
@@ -248,6 +277,32 @@ fn ensure_properties_object(obj: &mut Map<String, Value>) -> &mut Map<String, Va
     obj.get_mut("properties")
         .and_then(Value::as_object_mut)
         .expect("properties was just ensured as object")
+}
+
+fn merge_root_composition_properties(obj: &mut Map<String, Value>) {
+    let mut merged = Map::new();
+    for key in ["oneOf", "anyOf", "allOf"] {
+        let Some(items) = obj.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            let Some(properties) = item.get("properties").and_then(Value::as_object) else {
+                continue;
+            };
+            for (name, schema) in properties {
+                merged.entry(name.clone()).or_insert_with(|| schema.clone());
+            }
+        }
+    }
+
+    if merged.is_empty() {
+        return;
+    }
+
+    let properties = ensure_properties_object(obj);
+    for (name, schema) in merged {
+        properties.entry(name).or_insert(schema);
+    }
 }
 
 #[cfg(test)]
@@ -602,5 +657,223 @@ mod tests {
         assert_eq!(tools[0].strict, Some(true));
         assert_eq!(tools[0].input_schema["required"], json!(["query"]));
         assert_eq!(tools[0].input_schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn responses_sanitize_removes_root_composition_from_apply_patch_shape() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "patch": {"type": "string"},
+                "changes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"}
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
+            },
+            "oneOf": [
+                {"required": ["patch"]},
+                {"required": ["changes"]}
+            ]
+        });
+
+        sanitize_for_responses(&mut schema);
+
+        assert_eq!(schema["type"], "object");
+        assert!(schema.get("oneOf").is_none());
+        assert!(schema.get("anyOf").is_none());
+        assert!(schema.get("allOf").is_none());
+        assert!(schema.get("enum").is_none());
+        assert!(schema.get("not").is_none());
+        assert!(schema["properties"].get("patch").is_some());
+        assert!(schema["properties"].get("changes").is_some());
+    }
+
+    #[test]
+    fn responses_sanitize_merges_root_alternative_properties() {
+        let mut schema = json!({
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"}
+                    },
+                    "required": ["path"]
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string"}
+                    },
+                    "required": ["url"]
+                }
+            ]
+        });
+
+        sanitize_for_responses(&mut schema);
+
+        assert_eq!(schema["type"], "object");
+        assert!(schema.get("anyOf").is_none());
+        assert!(schema["properties"].get("path").is_some());
+        assert!(schema["properties"].get("url").is_some());
+        assert!(schema.get("required").is_none());
+    }
+
+    #[test]
+    fn responses_sanitize_preserves_nested_alternatives() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "value": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "integer"}
+                    ]
+                }
+            }
+        });
+
+        sanitize_for_responses(&mut schema);
+
+        assert_eq!(schema["type"], "object");
+        assert!(schema.get("anyOf").is_none());
+        assert!(schema["properties"]["value"].get("anyOf").is_some());
+    }
+}
+
+/// Normalize a tool's function schema for Kimi / Moonshot API compatibility.
+///
+/// Kimi's API enforces stricter JSON Schema validation: when a schema uses
+/// `anyOf` / `oneOf`, the `type` field must be placed inside each item rather
+/// than on the parent object.  This function walks the schema root and any
+/// nested objects, pushing `"type": "object"` down into `anyOf` / `oneOf`
+/// items when present.
+///
+/// Invariant: only mutates objects that carry a top-level `type` + an
+/// `anyOf` or `oneOf` array — pure schemas without conditional alternatives
+/// are left untouched.
+pub fn sanitize_for_kimi(schema: &mut serde_json::Value) {
+    if let Some(obj) = schema.as_object_mut() {
+        // Recurse first so a type injected into this object's alternatives is
+        // not immediately removed again by processing that freshly-mutated item.
+        for (_, v) in obj.iter_mut() {
+            sanitize_for_kimi(v);
+        }
+
+        // If this object has `type` + `anyOf`/`oneOf`, push `type` into
+        // each item and remove it from the parent. Otherwise leave it alone.
+        let should_push =
+            obj.contains_key("type") && (obj.contains_key("anyOf") || obj.contains_key("oneOf"));
+        if should_push && let Some(type_val) = obj.remove("type") {
+            for key in ["anyOf", "oneOf"] {
+                if let Some(items) = obj.get_mut(key).and_then(|v| v.as_array_mut()) {
+                    for item in items {
+                        if let Some(item_obj) = item.as_object_mut()
+                            && !item_obj.contains_key("type")
+                        {
+                            item_obj.insert("type".to_string(), type_val.clone());
+                        }
+                    }
+                }
+            }
+        }
+    } else if let Some(arr) = schema.as_array_mut() {
+        for v in arr.iter_mut() {
+            sanitize_for_kimi(v);
+        }
+    }
+}
+
+#[cfg(test)]
+mod kimi_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn kimi_sanitize_pushes_type_into_anyof_items() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "handle": {
+                    "type": "object",
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "null"}
+                    ]
+                }
+            }
+        });
+        sanitize_for_kimi(&mut schema);
+        let handle = &schema["properties"]["handle"];
+        assert!(
+            !handle.as_object().unwrap().contains_key("type"),
+            "root type should be removed"
+        );
+        let any_of = handle["anyOf"].as_array().unwrap();
+        assert_eq!(any_of[0]["type"], "string");
+        assert_eq!(any_of[1]["type"], "null");
+    }
+
+    #[test]
+    fn kimi_sanitize_injects_missing_anyof_item_types() {
+        let mut schema = json!({
+            "type": "object",
+            "anyOf": [
+                {"properties": {"path": {"type": "string"}}},
+                {"required": ["url"], "properties": {"url": {"type": "string"}}}
+            ]
+        });
+
+        sanitize_for_kimi(&mut schema);
+
+        assert!(
+            !schema.as_object().unwrap().contains_key("type"),
+            "parent type should be removed"
+        );
+        let any_of = schema["anyOf"].as_array().unwrap();
+        assert_eq!(any_of[0]["type"], "object");
+        assert_eq!(any_of[1]["type"], "object");
+    }
+
+    #[test]
+    fn kimi_sanitize_preserves_type_injected_into_nested_anyof_item() {
+        let mut schema = json!({
+            "type": "object",
+            "anyOf": [
+                {
+                    "anyOf": [
+                        {"properties": {"path": {"type": "string"}}}
+                    ]
+                }
+            ]
+        });
+
+        sanitize_for_kimi(&mut schema);
+
+        let outer_item = &schema["anyOf"][0];
+        assert_eq!(outer_item["type"], "object");
+        assert!(
+            !schema.as_object().unwrap().contains_key("type"),
+            "outer parent type should be removed"
+        );
+    }
+
+    #[test]
+    fn kimi_sanitize_leaves_pure_object_untouched() {
+        let original = json!({
+            "type": "object",
+            "properties": {"x": {"type": "string"}},
+            "required": ["x"]
+        });
+        let mut schema = original.clone();
+        sanitize_for_kimi(&mut schema);
+        assert_eq!(schema, original);
     }
 }

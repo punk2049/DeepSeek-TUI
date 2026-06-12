@@ -1,7 +1,7 @@
 //! Clipboard handling for paste support in TUI
 //!
 //! Supports text and image paste operations. Images on the clipboard are
-//! encoded as PNG and persisted under `~/.deepseek/clipboard-images/` so the
+//! encoded as PNG and persisted under `~/.codewhale/clipboard-images/` so the
 //! model can reach them via the existing `@`-mention / file tools (DeepSeek
 //! V4 does not currently accept inline image input on its Chat Completions
 //! endpoint, so we materialize the bytes to disk instead of base64-embedding
@@ -10,13 +10,36 @@
 #[cfg(not(test))]
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-#[cfg(all(any(target_os = "macos", target_os = "windows"), not(test)))]
+#[cfg(any(
+    all(test, unix),
+    all(not(test), target_os = "macos"),
+    all(not(test), target_os = "windows"),
+    all(not(test), target_os = "linux", not(target_env = "ohos"))
+))]
 use std::process::{Command, Stdio};
+#[cfg(any(
+    test,
+    target_os = "macos",
+    target_os = "windows",
+    all(target_os = "linux", not(target_env = "ohos"))
+))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+#[cfg(any(
+    test,
+    target_os = "macos",
+    target_os = "windows",
+    all(target_os = "linux", not(target_env = "ohos"))
+))]
 use arboard::{Clipboard, ImageData};
 use base64::Engine as _;
+#[cfg(any(
+    test,
+    target_os = "macos",
+    target_os = "windows",
+    all(target_os = "linux", not(target_env = "ohos"))
+))]
 use image::{ImageBuffer, Rgba};
 
 const OSC52_MAX_BYTES: usize = 100 * 1024;
@@ -47,6 +70,7 @@ impl PastedImage {
 }
 
 /// Clipboard payloads supported by the TUI.
+#[cfg_attr(all(target_env = "ohos", not(test)), allow(dead_code))]
 pub enum ClipboardContent {
     Text(String),
     Image(PastedImage),
@@ -54,38 +78,112 @@ pub enum ClipboardContent {
 
 /// Clipboard reader/writer helper.
 pub struct ClipboardHandler {
+    #[cfg(any(
+        test,
+        target_os = "macos",
+        target_os = "windows",
+        all(target_os = "linux", not(target_env = "ohos"))
+    ))]
     clipboard: Option<Clipboard>,
+    #[cfg(any(
+        test,
+        target_os = "macos",
+        target_os = "windows",
+        all(target_os = "linux", not(target_env = "ohos"))
+    ))]
+    clipboard_init_attempted: bool,
     #[cfg(test)]
     written_text: Vec<String>,
 }
 
 impl ClipboardHandler {
-    /// Create a new clipboard handler, falling back to a no-op when unavailable.
+    /// Create a new clipboard handler without connecting.
+    ///
+    /// The actual clipboard connection is deferred to first use
+    /// (`ensure_clipboard`) so that startup on hosts without an X11/Wayland
+    /// server (headless, WSL2) never blocks the TUI event loop.
     pub fn new() -> Self {
-        let clipboard = Clipboard::new().ok();
         Self {
-            clipboard,
+            #[cfg(any(
+                test,
+                target_os = "macos",
+                target_os = "windows",
+                all(target_os = "linux", not(target_env = "ohos"))
+            ))]
+            clipboard: None,
+            #[cfg(any(
+                test,
+                target_os = "macos",
+                target_os = "windows",
+                all(target_os = "linux", not(target_env = "ohos"))
+            ))]
+            clipboard_init_attempted: false,
             #[cfg(test)]
             written_text: Vec::new(),
         }
     }
 
+    /// Try to connect to the system clipboard, bounded by a short timeout.
+    ///
+    /// On Linux, `arboard::Clipboard::new()` opens a blocking X11 connection.
+    /// When no X server is running (headless, WSL2 without WSLg), the connect
+    /// call can hang indefinitely. We spawn the connection attempt on a
+    /// temporary thread and give it 500 ms; if it doesn't return in time the
+    /// handler stays in fallback/no-op mode and `read`/`write_text` fall
+    /// through to their OSC 52 and pbcopy/powershell fallbacks.
+    #[cfg(any(
+        test,
+        target_os = "macos",
+        target_os = "windows",
+        all(target_os = "linux", not(target_env = "ohos"))
+    ))]
+    fn ensure_clipboard(&mut self) {
+        if self.clipboard_init_attempted {
+            return;
+        }
+        self.clipboard_init_attempted = true;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(Clipboard::new().ok());
+        });
+        self.clipboard = rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .ok()
+            .flatten();
+    }
+
     /// Read the clipboard and return the parsed content.
     ///
-    /// `workspace` is used as a fallback location when `~/.deepseek/` cannot
+    /// `workspace` is used as a fallback location when `~/.codewhale/` cannot
     /// be resolved (e.g. running with a stripped HOME in CI sandboxes).
     pub fn read(&mut self, workspace: &Path) -> Option<ClipboardContent> {
-        let clipboard = self.clipboard.as_mut()?;
-        if let Ok(text) = clipboard.get_text() {
+        #[cfg(all(target_os = "linux", not(target_env = "ohos"), not(test)))]
+        if let Ok(text) = read_text_with_wlpaste() {
             return Some(ClipboardContent::Text(text));
         }
 
-        if let Ok(image) = clipboard.get_image()
-            && let Ok(pasted) = save_image_as_png(workspace, &image)
+        #[cfg(any(
+            test,
+            target_os = "macos",
+            target_os = "windows",
+            all(target_os = "linux", not(target_env = "ohos"))
+        ))]
         {
-            return Some(ClipboardContent::Image(pasted));
+            self.ensure_clipboard();
+            let clipboard = self.clipboard.as_mut()?;
+            if let Ok(text) = clipboard.get_text() {
+                return Some(ClipboardContent::Text(text));
+            }
+
+            if let Ok(image) = clipboard.get_image()
+                && let Ok(pasted) = save_image_as_png(workspace, &image)
+            {
+                return Some(ClipboardContent::Image(pasted));
+            }
         }
 
+        let _ = workspace;
         None
     }
 
@@ -99,10 +197,23 @@ impl ClipboardHandler {
 
         #[cfg(not(test))]
         {
-            if let Some(clipboard) = self.clipboard.as_mut()
-                && clipboard.set_text(text.to_string()).is_ok()
-            {
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            if write_text_with_wlcopy(text).is_ok() {
                 return Ok(());
+            }
+
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "windows",
+                all(target_os = "linux", not(target_env = "ohos"))
+            ))]
+            {
+                self.ensure_clipboard();
+                if let Some(clipboard) = self.clipboard.as_mut()
+                    && clipboard.set_text(text.to_string()).is_ok()
+                {
+                    return Ok(());
+                }
             }
 
             #[cfg(target_os = "macos")]
@@ -128,43 +239,93 @@ impl ClipboardHandler {
 
 #[cfg(all(target_os = "macos", not(test)))]
 fn write_text_with_pbcopy(text: &str) -> Result<()> {
-    let mut child = Command::new("pbcopy")
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("Failed to run pbcopy: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(text.as_bytes())
-            .map_err(|e| anyhow::anyhow!("Failed to write to pbcopy: {e}"))?;
-    }
-    let status = child
-        .wait()
-        .map_err(|e| anyhow::anyhow!("Failed to wait for pbcopy: {e}"))?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(anyhow::anyhow!("pbcopy failed"))
+    write_text_with_stdin_command("pbcopy", &[], text, "pbcopy")
 }
 
 #[cfg(all(target_os = "windows", not(test)))]
 fn write_text_with_set_clipboard(text: &str) -> Result<()> {
-    let mut child = Command::new("powershell.exe")
-        .args(["-NoProfile", "-Command", "Set-Clipboard -Value $input"])
+    write_text_with_stdin_command(
+        "powershell.exe",
+        &["-NoProfile", "-Command", "Set-Clipboard -Value $input"],
+        text,
+        "Set-Clipboard",
+    )
+}
+
+#[cfg(all(any(target_os = "macos", target_os = "windows"), not(test)))]
+fn write_text_with_stdin_command(
+    program: &str,
+    args: &[&str],
+    text: &str,
+    label: &str,
+) -> Result<()> {
+    let mut child = Command::new(program)
+        .args(args)
         .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| anyhow::anyhow!("Failed to run Set-Clipboard: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Failed to run {label}: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(text.as_bytes())
-            .map_err(|e| anyhow::anyhow!("Failed to write to Set-Clipboard: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("Failed to write to {label}: {e}"))?;
     }
+    let _ = std::thread::Builder::new()
+        .name("clipboard-wait".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "ohos"), not(test)))]
+fn write_text_with_wlcopy(text: &str) -> Result<()> {
+    write_text_with_wlcopy_using_argv("wl-copy", text)
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "ohos"), not(test)))]
+fn read_text_with_wlpaste() -> Result<String> {
+    read_text_with_wlpaste_using_argv("wl-paste")
+}
+
+#[cfg(any(all(test, unix), all(target_os = "linux", not(target_env = "ohos"))))]
+fn read_text_with_wlpaste_using_argv(program: &str) -> Result<String> {
+    let output = Command::new(program)
+        .arg("--no-newline")
+        .arg("--type")
+        .arg("text/plain")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to run {program}: {e}"))?;
+    if !output.status.success() {
+        bail!("{program} exited with {}", output.status);
+    }
+    String::from_utf8(output.stdout).context("wl-paste returned non-UTF-8 text")
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "ohos"), not(test)))]
+fn write_text_with_wlcopy_using_argv(program: &str, text: &str) -> Result<()> {
+    let mut child = Command::new(program)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to run {program}: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|e| anyhow::anyhow!("Failed to write to {program}: {e}"))?;
+    }
+    // stdin is dropped here, closing the pipe so wl-copy flushes.
     let status = child
         .wait()
-        .map_err(|e| anyhow::anyhow!("Failed to wait for Set-Clipboard: {e}"))?;
-    if status.success() {
-        return Ok(());
+        .map_err(|e| anyhow::anyhow!("Failed to wait on {program}: {e}"))?;
+    if !status.success() {
+        bail!("{program} exited with {status}");
     }
-    Err(anyhow::anyhow!("Set-Clipboard failed"))
+    Ok(())
 }
 
 #[cfg(not(test))]
@@ -196,24 +357,41 @@ fn osc52_sequence(text: &str, in_tmux: bool) -> Result<String> {
 }
 
 /// Resolve the directory pasted images should land in. Prefers
-/// `~/.deepseek/clipboard-images/` so the path is stable across worktrees and
+/// `~/.codewhale/clipboard-images/` so the path is stable across worktrees and
 /// matches the location described in user-facing docs; falls back to
 /// `<workspace>/clipboard-images/` if the home dir is unavailable.
-fn clipboard_images_dir(workspace: &Path) -> PathBuf {
-    if let Some(home) = dirs::home_dir() {
-        return home.join(".deepseek").join("clipboard-images");
+pub(crate) fn clipboard_images_dir(workspace: &Path) -> PathBuf {
+    let home = dirs::home_dir();
+    clipboard_images_dir_for_home(workspace, home.as_deref())
+}
+
+fn clipboard_images_dir_for_home(workspace: &Path, home: Option<&Path>) -> PathBuf {
+    if let Some(home) = home {
+        return home.join(".codewhale").join("clipboard-images");
     }
     workspace.join("clipboard-images")
 }
 
 /// Encode an RGBA `ImageData` from arboard as PNG and persist it. Returns
 /// the resulting path along with metadata used to render the paste hint.
+#[cfg(any(
+    test,
+    target_os = "macos",
+    target_os = "windows",
+    all(target_os = "linux", not(target_env = "ohos"))
+))]
 fn save_image_as_png(workspace: &Path, image: &ImageData) -> Result<PastedImage> {
     save_image_as_png_in(&clipboard_images_dir(workspace), image)
 }
 
 /// Lower-level variant that writes into an explicit directory. Exposed so the
 /// unit tests don't have to scribble inside the user's real home directory.
+#[cfg(any(
+    test,
+    target_os = "macos",
+    target_os = "windows",
+    all(target_os = "linux", not(target_env = "ohos"))
+))]
 fn save_image_as_png_in(dir: &Path, image: &ImageData) -> Result<PastedImage> {
     std::fs::create_dir_all(dir).context("create clipboard-images dir")?;
 
@@ -259,6 +437,8 @@ fn save_image_as_png_in(dir: &Path, image: &ImageData) -> Result<PastedImage> {
 mod tests {
     use super::*;
     use std::borrow::Cow;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn solid_rgba(width: u16, height: u16, rgba: [u8; 4]) -> ImageData<'static> {
         let mut bytes = Vec::with_capacity((width as usize) * (height as usize) * 4);
@@ -293,6 +473,27 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_images_dir_uses_codewhale_home_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            clipboard_images_dir_for_home(workspace.path(), Some(home.path())),
+            home.path().join(".codewhale").join("clipboard-images")
+        );
+    }
+
+    #[test]
+    fn clipboard_images_dir_falls_back_to_workspace_without_home() {
+        let workspace = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            clipboard_images_dir_for_home(workspace.path(), None),
+            workspace.path().join("clipboard-images")
+        );
+    }
+
+    #[test]
     fn pasted_image_labels_format_correctly() {
         let p = PastedImage {
             path: PathBuf::from("/tmp/x.png"),
@@ -324,5 +525,44 @@ mod tests {
             err.to_string().contains("too large"),
             "unexpected error: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wl_paste_helper_reads_text_from_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("wl-paste");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+seen_no_newline=0
+seen_text_plain=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --no-newline) seen_no_newline=1 ;;
+    --type)
+      shift
+      [ "${1:-}" = "text/plain" ] && seen_text_plain=1
+      ;;
+  esac
+  shift
+done
+[ "$seen_text_plain" -eq 1 ] || exit 40
+if [ "$seen_no_newline" -eq 1 ]; then
+  printf 'from-wayland'
+else
+  printf 'from-wayland\n'
+fi
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let text = read_text_with_wlpaste_using_argv(script.to_str().unwrap())
+            .expect("read text through wl-paste helper");
+
+        assert_eq!(text, "from-wayland");
     }
 }

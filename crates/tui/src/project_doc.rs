@@ -1,15 +1,21 @@
 //! Project document discovery and loading
 //!
 //! Supports auto-discovery of project instructions like Claude Code.
-//! Priority: AGENTS.md > .claude/instructions.md > CLAUDE.md > .deepseek/instructions.md
+//! Priority: AGENTS.md > WHALE.md (deprecated) > .claude/instructions.md > CLAUDE.md > .codewhale/instructions.md > .deepseek/instructions.md
 
 use std::path::{Path, PathBuf};
 
-/// Document filenames to search for (in priority order)
+/// Document filenames to search for (in priority order).
+/// `AGENTS.md` is canonical. `WHALE.md` is **deprecated** (read-only legacy
+/// fallback, now below `AGENTS.md`); CodeWhale-specific authority policy lives
+/// in `.codewhale/constitution.json`. `CLAUDE.md` and the `*/instructions.md`
+/// variants are read-only compatibility fallbacks.
 pub const DOC_FILENAMES: &[&str] = &[
     "AGENTS.md",
+    "WHALE.md", // deprecated: legacy CodeWhale-native, read-only fallback
     ".claude/instructions.md",
     "CLAUDE.md",
+    ".codewhale/instructions.md",
     ".deepseek/instructions.md",
 ];
 
@@ -60,7 +66,7 @@ pub fn discover_paths(cwd: &Path) -> Vec<PathBuf> {
 }
 
 /// Find the git root directory from cwd
-fn find_git_root(cwd: &Path) -> Option<PathBuf> {
+pub(crate) fn find_git_root(cwd: &Path) -> Option<PathBuf> {
     let mut current = cwd.to_path_buf();
     loop {
         if current.join(".git").exists() {

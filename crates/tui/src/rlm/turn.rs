@@ -284,12 +284,7 @@ async fn run_rlm_turn_impl(
                 }
             };
 
-            total_usage.input_tokens = total_usage
-                .input_tokens
-                .saturating_add(response.usage.input_tokens);
-            total_usage.output_tokens = total_usage
-                .output_tokens
-                .saturating_add(response.usage.output_tokens);
+            super::add_usage_with_prompt_cache(&mut total_usage, &response.usage);
 
             let response_text = extract_text_blocks(&response.content);
             last_response_text = response_text.clone();
@@ -329,7 +324,8 @@ async fn run_rlm_turn_impl(
                             text: "You called FINAL(...) without ever running a ```repl block. \
                                    That defeats the recursive language model — you're guessing \
                                    from the preview alone. Emit a ```repl block now that uses \
-                                   `llm_query`, `llm_query_batched`, or `rlm_query` against \
+                                   `llm_query`, `sub_query_sequence`, or an explicitly independent \
+                                   `llm_query_batched(..., dependency_mode=\"independent\")` against \
                                    `context` to actually compute the answer."
                                 .to_string(),
                             cache_control: None,
@@ -388,7 +384,8 @@ async fn run_rlm_turn_impl(
                         role: "user".to_string(),
                         content: vec![ContentBlock::Text {
                             text: "Reminder: emit Python inside a ```repl … ``` fence. \
-                                   Use `llm_query` / `llm_query_batched` / `rlm_query` to \
+                                   Use `llm_query`, `sub_query_sequence`, or \
+                                   `llm_query_batched(..., dependency_mode=\"independent\")` to \
                                    process `context` and call `FINAL(value)` when done."
                                 .to_string(),
                             cache_control: None,
@@ -510,12 +507,7 @@ async fn run_rlm_turn_impl(
     // Fold bridge usage (children + nested sub_rlm) into totals.
     let bridge_usage = usage_handle.lock().await;
     let mut final_usage = result.usage.clone();
-    final_usage.input_tokens = final_usage
-        .input_tokens
-        .saturating_add(bridge_usage.input_tokens);
-    final_usage.output_tokens = final_usage
-        .output_tokens
-        .saturating_add(bridge_usage.output_tokens);
+    super::add_usage_with_prompt_cache(&mut final_usage, &bridge_usage);
     drop(bridge_usage);
 
     repl.shutdown().await;
@@ -605,7 +597,7 @@ fn build_metadata_message(
             .to_string(),
     );
     parts.push(
-        "- `llm_query_batched([p1, p2, ...])`     — concurrent fan-out; `model` is ignored"
+        "- `llm_query_batched([p1, p2, ...], dependency_mode=\"independent\")` — concurrent fan-out for independent prompts only; `model` is ignored"
             .to_string(),
     );
     parts.push(
@@ -613,7 +605,15 @@ fn build_metadata_message(
             .to_string(),
     );
     parts.push(
-        "- `rlm_query_batched([p1, p2, ...])`     — concurrent recursive sub-RLMs; `model` is ignored"
+        "- `rlm_query_batched([p1, p2, ...], dependency_mode=\"independent\")` — concurrent recursive sub-RLMs for independent prompts only; `model` is ignored"
+            .to_string(),
+    );
+    parts.push(
+        "- `sub_query_sequence(prompt, slices)`   — sequential child calls for A->B dependencies and rollback-sensitive work"
+            .to_string(),
+    );
+    parts.push(
+        "- Batch safety: never batch dependent steps, global-state refactors, schema migrations, or rollback-sensitive tasks"
             .to_string(),
     );
     parts.push("- `SHOW_VARS()`                          — list user variables".to_string());
@@ -952,6 +952,7 @@ mod tests {
                 cache_control: None,
             },
             ContentBlock::Thinking {
+                signature: None,
                 thinking: "skip".to_string(),
             },
             ContentBlock::Text {

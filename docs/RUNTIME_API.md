@@ -1,8 +1,8 @@
 # Runtime API & Integration Contract
 
-DeepSeek TUI exposes a local runtime API through `deepseek serve --http` and
-machine-readable health via `deepseek doctor --json`. It also exposes
-`deepseek serve --acp` for editor clients that speak the Agent Client Protocol
+codewhale exposes a local runtime API through `codewhale serve --http` and
+machine-readable health via `codewhale doctor --json`. It also exposes
+`codewhale serve --acp` for editor clients that speak the Agent Client Protocol
 over stdio. This document is the stable integration contract for native macOS
 workbench applications (and other local supervisors) that embed the DeepSeek
 engine without screen-scraping terminal output.
@@ -12,19 +12,23 @@ engine without screen-scraping terminal output.
 ```
 macOS workbench (or any local supervisor)
         │
-        ├─ deepseek doctor --json   → machine-readable health & capability
-        ├─ deepseek serve --http    → HTTP/SSE runtime API
-        ├─ deepseek serve --acp     → ACP stdio agent for editors such as Zed
-        ├─ deepseek serve --mcp     → MCP stdio server
-        └─ deepseek [args]          → interactive TUI session
+        ├─ codewhale doctor --json   → machine-readable health & capability
+        ├─ codewhale serve --http    → HTTP/SSE runtime API
+        ├─ codewhale serve --acp     → ACP stdio agent for editors such as Zed
+        ├─ codewhale serve --mcp     → MCP stdio server
+        └─ codewhale [args]          → interactive TUI session
 ```
 
 The engine runs as a local-only process. All APIs bind to `localhost` by
 default. No hosted relay, no provider-token custody, no secret leakage.
 
-## ACP stdio adapter: `deepseek serve --acp`
+For a proposed read-only audit export over completed turns, see
+[`docs/RECEIPTS.md`](RECEIPTS.md). That document is a protocol note; the receipt
+CLI/API surfaces are not implemented yet.
 
-`deepseek serve --acp` speaks JSON-RPC 2.0 over newline-delimited stdio for
+## ACP stdio adapter: `codewhale serve --acp`
+
+`codewhale serve --acp` speaks JSON-RPC 2.0 over newline-delimited stdio for
 ACP-compatible editor clients. The initial adapter implements the ACP baseline:
 
 - `initialize`
@@ -38,16 +42,16 @@ followed by a `session/prompt` response with `stopReason: "end_turn"`.
 
 The adapter is intentionally conservative: it does not yet expose shell tools,
 file-write tools, checkpoint replay, or session loading through ACP. Use
-`deepseek serve --http` for the full local runtime API and `deepseek serve --mcp`
+`codewhale serve --http` for the full local runtime API and `codewhale serve --mcp`
 when another client needs DeepSeek's tools as MCP tools.
 
-## Capability endpoint: `deepseek doctor --json`
+## Capability endpoint: `codewhale doctor --json`
 
 Returns a JSON object describing the current installation's readiness state.
 Suitable for health-check polling from a macOS workbench.
 
 ```bash
-deepseek doctor --json
+codewhale doctor --json
 ```
 
 ### Response schema (key fields)
@@ -68,7 +72,7 @@ deepseek doctor --json
 | `mcp.present` | bool | Whether MCP config exists |
 | `mcp.servers` | array | Per-server health: `{name, enabled, status, detail}` |
 | `skills.selected` | string | Resolved skills directory |
-| `skills.global.path` / `.present` / `.count` | — | DeepSeek global skills dir (`~/.deepseek/skills`) |
+| `skills.global.path` / `.present` / `.count` | — | CodeWhale global skills dir (`~/.codewhale/skills`, with legacy `~/.deepseek/skills` support) |
 | `skills.agents.path` / `.present` / `.count` | — | Workspace `.agents/skills/` dir |
 | `skills.agents_global.path` / `.present` / `.count` | — | agentskills.io global skills dir (`~/.agents/skills`) |
 | `skills.local.path` / `.present` / `.count` | — | `skills/` dir |
@@ -86,9 +90,9 @@ deepseek doctor --json
 ```json
 {
   "version": "0.8.9",
-  "config_path": "/Users/you/.deepseek/config.toml",
+  "config_path": "/Users/you/.codewhale/config.toml",
   "config_present": true,
-  "workspace": "/Users/you/projects/deepseek-tui",
+  "workspace": "/Users/you/projects/codewhale-tui",
   "api_key": {
     "source": "env"
   },
@@ -96,11 +100,11 @@ deepseek doctor --json
   "default_text_model": "deepseek-v4-pro",
   "memory": {
     "enabled": false,
-    "path": "/Users/you/.deepseek/memory.md",
+    "path": "/Users/you/.codewhale/memory.md",
     "file_present": true
   },
   "mcp": {
-    "config_path": "/Users/you/.deepseek/mcp.json",
+    "config_path": "/Users/you/.codewhale/mcp.json",
     "present": true,
     "servers": [
       {"name": "filesystem", "enabled": true, "status": "ok", "detail": "ready"}
@@ -113,10 +117,11 @@ deepseek doctor --json
 }
 ```
 
-## HTTP/SSE runtime API: `deepseek serve --http`
+## HTTP/SSE runtime API: `codewhale serve --http`
 
 ```bash
-deepseek serve --http [--host 127.0.0.1] [--port 7878] [--workers 2] [--auth-token TOKEN]
+codewhale serve --http [--host 127.0.0.1] [--port 7878] [--workers 2] [--auth-token TOKEN]
+codewhale serve --mobile [--host 0.0.0.0] [--port 7878] [--auth-token TOKEN]
 ```
 
 Defaults: host `127.0.0.1`, port `7878`, 2 workers (clamped 1–8).
@@ -124,15 +129,34 @@ Defaults: host `127.0.0.1`, port `7878`, 2 workers (clamped 1–8).
 The server binds to `localhost` by default. Configuration is via CLI flags —
 there is no `[app_server]` config section.
 
-By default, existing local behavior is unchanged and `/v1/*` routes are not
-authenticated. To require a bearer token for `/v1/*` routes, pass
-`--auth-token TOKEN` or set `DEEPSEEK_RUNTIME_TOKEN=TOKEN` before starting the
-server. `/health` remains public for local process supervision and readiness
-checks.
+`/v1/*` routes require a bearer token unless `--insecure` is explicitly set.
+Pass `--auth-token TOKEN` or set `DEEPSEEK_RUNTIME_TOKEN=TOKEN` before starting
+the server. If neither is set, the process generates a one-time token and prints
+it at startup. `/health` and `/v1/runtime/info` remain public for local
+supervision and bootstrap. `/mobile` returns 404 when mobile mode is disabled;
+when mobile mode is enabled and auth is enabled, `/mobile` returns 401 unless
+the request supplies the runtime token.
 
 Authenticated clients can provide the token as `Authorization: Bearer TOKEN`,
 `X-DeepSeek-Runtime-Token: TOKEN`, or `?token=TOKEN` for EventSource-style
 clients that cannot set custom headers.
+
+### Mobile control page
+
+`codewhale serve --mobile` starts the same HTTP/SSE runtime API and serves a
+phone-friendly control page at `/mobile`. When the bind host is left at the
+default, mobile mode binds to `0.0.0.0`, prints a warning, and prints local/LAN
+URLs. Pass `--host 127.0.0.1` to keep the mobile page loopback-only. If a
+runtime token is generated or supplied, the printed mobile URL includes it as a
+query parameter; the page stores it locally and removes it from the address bar.
+The static HTML page contains no secrets, but it is still token-gated when auth
+is enabled so unauthenticated LAN clients cannot fingerprint the mobile surface.
+
+The mobile page can list/create threads, send prompts, follow live SSE events,
+steer or interrupt an active turn, and resolve normal tool approvals through
+`POST /v1/approvals/{approval_id}`. It is still a local/LAN convenience surface:
+do not expose it directly to the public internet without TLS and a trusted
+fronting layer.
 
 ### Endpoints
 
@@ -153,6 +177,43 @@ clients that cannot set custom headers.
 - `PATCH /v1/threads/{id}` (see body shape below)
 - `POST /v1/threads/{id}/resume`
 - `POST /v1/threads/{id}/fork`
+
+`GET /v1/threads/summary` is the read-only summary surface used by the VS Code
+Agent View. Each item includes `id`, `title`, `preview`, `model`, `mode`,
+`archived`, `updated_at`, `latest_turn_id`, `latest_turn_status`, plus
+workspace metadata:
+
+```json
+{
+  "id": "thread_...",
+  "title": "Implement MCP status count",
+  "preview": "The TUI footer should count project MCP servers...",
+  "model": "deepseek-v4-pro",
+  "mode": "agent",
+  "branch": "feature/runtime-api",
+  "head": "abc1234",
+  "dirty": false,
+  "workspace": "/Users/you/projects/codewhale",
+  "archived": false,
+  "updated_at": "2026-06-06T05:43:00Z",
+  "latest_turn_id": "turn_...",
+  "latest_turn_status": "completed"
+}
+```
+
+`branch` is resolved from the thread workspace at request time and may be
+`null` when the workspace is not a Git repository or the branch cannot be read.
+`head` is the current short Git commit for that workspace when available.
+`dirty` is true when the workspace has staged, unstaged, or untracked changes.
+`workspace` is included so editor clients can show when an agent lane is working
+outside the current VS Code folder.
+
+Thread forks are sibling runtime threads, not an in-place tree projection.
+`thread.forked` events include `source_thread_id`; internal backtrack-aware
+forks may also include `backtrack_depth_from_tail` and `dropped_turn_id`.
+Thread list and summary responses remain flat in v0.8.40, so clients that need
+a graph should reconstruct it from events instead of assuming list order is a
+complete tree.
 
 `archived_only=true` returns archived threads only (mutually overrides
 `include_archived`). Default behavior is unchanged: `include_archived=false`
@@ -181,8 +242,37 @@ accept an empty string to clear a previously-set value. Added in v0.8.10 (#562):
 - `POST /v1/threads/{id}/turns/{turn_id}/interrupt`
 - `POST /v1/threads/{id}/compact` (manual compaction)
 
+**Approvals**
+- `POST /v1/approvals/{approval_id}` with body
+  `{ "decision": "allow" | "deny", "remember": false }`
+
 **Events** (SSE replay + live stream)
 - `GET /v1/threads/{id}/events?since_seq=<u64>`
+
+**Snapshots** (read-only side-git restore point listing)
+- `GET /v1/snapshots?limit=20`
+
+`/v1/snapshots` lists recent side-git restore points for the runtime workspace.
+It is read-only and does not restore files. `limit` defaults to `20` and must be
+between `1` and `100`.
+
+```json
+[
+  {
+    "id": "snap_...",
+    "label": "post-turn:1",
+    "timestamp": 1780730580
+  }
+]
+```
+
+Runtime API restore/retry/undo/editor-apply mutation endpoints are intentionally
+deferred. GUI clients should treat thread summaries and snapshots as inspection
+surfaces until atomic filesystem + conversation-state mutation semantics are
+specified and tested.
+
+**Receipts** (future read-only audit export)
+- Proposed only: `GET /v1/threads/{thread_id}/turns/{turn_id}/receipt`
 
 **Compatibility stream** (one-shot, backwards-compatible)
 - `POST /v1/stream`
@@ -279,16 +369,19 @@ Events are append-only with a global monotonic `seq` for replay/resume.
 
 ### SSE event stream
 
-The SSE event payload shape:
+The SSE event payload shape for `/v1/threads/{id}/events`:
 
 ```json
 {
+  "schema_version": 1,
   "seq": 42,
-  "timestamp": "2026-02-11T20:18:49.123Z",
+  "event": "item.delta",
+  "kind": "item.delta",
   "thread_id": "thr_1234abcd",
   "turn_id": "turn_5678efgh",
   "item_id": "item_90ab12cd",
-  "event": "item.delta",
+  "timestamp": "2026-02-11T20:18:49.123Z",
+  "created_at": "2026-02-11T20:18:49.123Z",
   "payload": {
     "delta": "partial output",
     "kind": "agent_message"
@@ -296,16 +389,31 @@ The SSE event payload shape:
 }
 ```
 
+Compatibility notes:
+
+- `schema_version` is the HTTP/SSE envelope schema version. It is independent of
+  the runtime store schema used for persisted thread/turn/event records.
+- `event` remains the SSE event name in existing clients; it is preserved as-is.
+- `kind` mirrors `event` in the stable envelope for typed clients.
+- `thread.started`, `turn.started`, and `turn.completed` are emitted as SSE event
+  names exactly as before.
+- `timestamp` remains the canonical event time for schema version 1. `created_at`
+  is an equivalent alias for clients that use `created_at` naming elsewhere; do
+  not require both fields to be present.
+
 Common event names: `thread.started`, `thread.forked`, `turn.started`,
 `turn.lifecycle`, `turn.steered`, `turn.interrupt_requested`,
 `turn.completed`, `item.started`, `item.delta`, `item.completed`,
-`item.failed`, `item.interrupted`, `approval.required`, `sandbox.denied`,
-`coherence.state`.
+`item.failed`, `item.interrupted`, `approval.required`, `approval.decided`,
+`approval.timeout`, `sandbox.denied`, `coherence.state`.
 
 ## Security boundary
 
-- **Localhost only**. The server binds to `127.0.0.1` by default. Set
-  `--host 0.0.0.0` only when you have a reverse-proxy / VPN that
+- **Localhost by default**. The server binds to `127.0.0.1` by default.
+  `--mobile` binds to `0.0.0.0` when no host is supplied so phones on the same
+  LAN can reach it, and the CLI prints a warning for that rebind. Pass
+  `--host 127.0.0.1` for a loopback-only mobile page. Set a non-loopback host
+  only when you trust the network path or have a reverse-proxy / VPN that
   authenticates. The runtime does not provide user isolation or TLS.
 - **Optional token guard**. `--auth-token` or `DEEPSEEK_RUNTIME_TOKEN`
   requires a matching bearer token for `/v1/*` routes. This is a local
@@ -326,9 +434,9 @@ The runtime API ships with a built-in dev-origin allow-list:
 `http://127.0.0.1:1420`, `tauri://localhost`. To add additional origins (e.g.
 when developing a UI on Vite's default `:5173`), use any of:
 
-- CLI flag (repeatable): `deepseek serve --http --cors-origin http://localhost:5173`
+- CLI flag (repeatable): `codewhale serve --http --cors-origin http://localhost:5173`
 - Env var (comma-separated): `DEEPSEEK_CORS_ORIGINS="http://localhost:5173,http://localhost:8080"`
-- Config (`~/.deepseek/config.toml`):
+- Config (`~/.codewhale/config.toml`):
   ```toml
   [runtime_api]
   cors_origins = ["http://localhost:5173"]
@@ -359,7 +467,7 @@ model is preserved. Added in v0.8.10 (#561).
 Contract snapshots live in `crates/protocol/tests/`. Run:
 
 ```bash
-cargo test -p deepseek-protocol --test parity_protocol --locked
+cargo test -p codewhale-protocol --test parity_protocol --locked
 ```
 
 This validates that the app-server's event schema hasn't drifted from the

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use deepseek_app_server::{AppServerOptions, run};
+use codewhale_app_server::{AppServerOptions, run};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -17,10 +17,18 @@ struct Cli {
     port: u16,
     #[arg(long)]
     config: Option<PathBuf>,
+    #[arg(long = "auth-token")]
+    auth_token: Option<String>,
+    #[arg(long, default_value_t = false)]
+    insecure_no_auth: bool,
+    #[arg(long = "cors-origin")]
+    cors_origin: Vec<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    install_rustls_crypto_provider();
+
     let cli = Cli::parse();
     let listen: SocketAddr = format!("{}:{}", cli.host, cli.port)
         .parse()
@@ -28,6 +36,19 @@ async fn main() -> Result<()> {
     run(AppServerOptions {
         listen,
         config_path: cli.config,
+        auth_token: cli.auth_token.or_else(app_server_token_from_env),
+        insecure_no_auth: cli.insecure_no_auth,
+        cors_origins: cli.cors_origin,
     })
     .await
+}
+
+fn install_rustls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+fn app_server_token_from_env() -> Option<String> {
+    std::env::var("CODEWHALE_APP_SERVER_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("DEEPSEEK_APP_SERVER_TOKEN").ok())
 }

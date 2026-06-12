@@ -3,6 +3,13 @@
 //! This module keeps DeepSeek-only execution while exposing Codex-like lifecycle
 //! semantics (threads, turns, items, interrupt/steer, and replayable events).
 
+// Background-task runtime — runs alongside the TUI. Raw stdio prints
+// here would still land in the alt-screen on whichever terminal the
+// foreground TUI happens to own. Route everything through `tracing::*`
+// instead — see `runtime_log` for the rationale.
+#![deny(clippy::print_stdout)]
+#![deny(clippy::print_stderr)]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -24,7 +31,10 @@ use crate::core::coherence::CoherenceState;
 use crate::core::engine::{EngineConfig, EngineHandle, spawn_engine};
 use crate::core::events::{Event as EngineEvent, TurnOutcomeStatus};
 use crate::core::ops::Op;
-use crate::models::{ContentBlock, Message, SystemPrompt, Usage, compaction_threshold_for_model};
+use crate::models::{
+    ContentBlock, Message, SystemPrompt, Usage, auto_compact_default_for_model,
+    compaction_threshold_for_model_at_percent,
+};
 use crate::tools::plan::new_shared_plan_state;
 use crate::tools::subagent::SubAgentStatus;
 use crate::tools::todo::new_shared_todo_list;
@@ -33,12 +43,27 @@ use crate::tui::app::AppMode;
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const MAX_ACTIVE_THREADS_DEFAULT: usize = 8;
 const SUMMARY_LIMIT: usize = 280;
-/// Bumped to 2 for v0.6.6 — see issue #124. The persisted thread/turn/item
-/// records didn't change shape, but the live engine semantics did: cycle
-/// boundaries advance the `Session.cycle_count` and produce archived JSONL
-/// files at `~/.deepseek/sessions/<id>/cycles/<n>.jsonl`. A v1 reader on a
-/// session written by v2 wouldn't know about the cycle archive directory and
-/// might misinterpret message counts; bumping is the safe choice.
+
+fn validated_record_id<'a>(id: &'a str, label: &str) -> Result<&'a str> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        bail!("{label} cannot be empty");
+    }
+    if trimmed != id {
+        bail!("{label} cannot contain leading or trailing whitespace");
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!("{label} contains unsupported characters");
+    }
+    Ok(trimmed)
+}
+
+/// Bumped to 2 for v0.6.6 after live engine semantics changed. The persisted
+/// thread/turn/item records did not change shape, but a v1 reader on a v2
+/// session should still fail closed rather than silently mis-replay.
 const CURRENT_RUNTIME_SCHEMA_VERSION: u32 = 2;
 const RUNTIME_RESTART_REASON: &str = "Interrupted by process restart";
 const APPROVAL_DECISION_TIMEOUT: Duration = Duration::from_secs(300);
@@ -241,36 +266,43 @@ impl RuntimeThreadStore {
         })
     }
 
-    fn thread_path(&self, thread_id: &str) -> PathBuf {
-        self.threads_dir.join(format!("{thread_id}.json"))
+    fn record_path(base: &Path, id: &str, extension: &str, label: &str) -> Result<PathBuf> {
+        let id = validated_record_id(id, label)?;
+        Ok(base.join(format!("{id}.{extension}")))
     }
 
-    fn turn_path(&self, turn_id: &str) -> PathBuf {
-        self.turns_dir.join(format!("{turn_id}.json"))
+    fn thread_path(&self, thread_id: &str) -> Result<PathBuf> {
+        Self::record_path(&self.threads_dir, thread_id, "json", "thread id")
     }
 
-    fn item_path(&self, item_id: &str) -> PathBuf {
-        self.items_dir.join(format!("{item_id}.json"))
+    fn turn_path(&self, turn_id: &str) -> Result<PathBuf> {
+        Self::record_path(&self.turns_dir, turn_id, "json", "turn id")
     }
 
-    fn events_path(&self, thread_id: &str) -> PathBuf {
-        self.events_dir.join(format!("{thread_id}.jsonl"))
+    fn item_path(&self, item_id: &str) -> Result<PathBuf> {
+        Self::record_path(&self.items_dir, item_id, "json", "item id")
+    }
+
+    fn events_path(&self, thread_id: &str) -> Result<PathBuf> {
+        Self::record_path(&self.events_dir, thread_id, "jsonl", "thread id")
     }
 
     pub fn save_thread(&self, thread: &ThreadRecord) -> Result<()> {
-        write_json_atomic(&self.thread_path(&thread.id), thread)
+        write_json_atomic(&self.thread_path(&thread.id)?, thread)
     }
 
     pub fn save_turn(&self, turn: &TurnRecord) -> Result<()> {
-        write_json_atomic(&self.turn_path(&turn.id), turn)
+        validated_record_id(&turn.thread_id, "thread id")?;
+        write_json_atomic(&self.turn_path(&turn.id)?, turn)
     }
 
     pub fn save_item(&self, item: &TurnItemRecord) -> Result<()> {
-        write_json_atomic(&self.item_path(&item.id), item)
+        validated_record_id(&item.turn_id, "turn id")?;
+        write_json_atomic(&self.item_path(&item.id)?, item)
     }
 
     pub fn load_thread(&self, thread_id: &str) -> Result<ThreadRecord> {
-        let path = self.thread_path(thread_id);
+        let path = self.thread_path(thread_id)?;
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read thread {}", path.display()))?;
         let record: ThreadRecord = serde_json::from_str(&raw)
@@ -286,7 +318,7 @@ impl RuntimeThreadStore {
     }
 
     pub fn load_turn(&self, turn_id: &str) -> Result<TurnRecord> {
-        let path = self.turn_path(turn_id);
+        let path = self.turn_path(turn_id)?;
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read turn {}", path.display()))?;
         let record: TurnRecord = serde_json::from_str(&raw)
@@ -302,7 +334,7 @@ impl RuntimeThreadStore {
     }
 
     pub fn load_item(&self, item_id: &str) -> Result<TurnItemRecord> {
-        let path = self.item_path(item_id);
+        let path = self.item_path(item_id)?;
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read item {}", path.display()))?;
         let record: TurnItemRecord = serde_json::from_str(&raw)
@@ -345,6 +377,7 @@ impl RuntimeThreadStore {
     }
 
     pub fn list_turns_for_thread(&self, thread_id: &str) -> Result<Vec<TurnRecord>> {
+        validated_record_id(thread_id, "thread id")?;
         let mut out = Vec::new();
         for entry in fs::read_dir(&self.turns_dir)
             .with_context(|| format!("Failed to read {}", self.turns_dir.display()))?
@@ -374,6 +407,7 @@ impl RuntimeThreadStore {
     }
 
     pub fn list_items_for_turn(&self, turn_id: &str) -> Result<Vec<TurnItemRecord>> {
+        validated_record_id(turn_id, "turn id")?;
         let mut out = Vec::new();
         for entry in fs::read_dir(&self.items_dir)
             .with_context(|| format!("Failed to read {}", self.items_dir.display()))?
@@ -414,6 +448,15 @@ impl RuntimeThreadStore {
         event: impl Into<String>,
         payload: Value,
     ) -> Result<RuntimeEventRecord> {
+        validated_record_id(thread_id, "thread id")?;
+        if let Some(turn_id) = turn_id {
+            validated_record_id(turn_id, "turn id")?;
+        }
+        if let Some(item_id) = item_id {
+            validated_record_id(item_id, "item id")?;
+        }
+        let path = self.events_path(thread_id)?;
+
         let mut state = self.state.lock().await;
         let seq = state.next_seq;
         state.next_seq = state.next_seq.saturating_add(1);
@@ -431,7 +474,6 @@ impl RuntimeThreadStore {
             payload,
         };
 
-        let path = self.events_path(thread_id);
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -451,7 +493,7 @@ impl RuntimeThreadStore {
         thread_id: &str,
         since_seq: Option<u64>,
     ) -> Result<Vec<RuntimeEventRecord>> {
-        let path = self.events_path(thread_id);
+        let path = self.events_path(thread_id)?;
         if !path.exists() {
             return Ok(Vec::new());
         }
@@ -554,6 +596,7 @@ pub struct UpdateThreadRequest {
     pub mode: Option<String>,
     pub title: Option<String>,
     pub system_prompt: Option<String>,
+    pub workspace: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -783,12 +826,39 @@ impl RuntimeThreadManager {
     ) -> bool {
         let sender = match self.pending_approvals.lock() {
             Ok(mut map) => map.remove(approval_id),
-            Err(_) => return false,
+            Err(e) => {
+                tracing::error!("pending_approvals mutex poisoned: {e}");
+                return false;
+            }
         };
         match sender {
             Some(tx) => tx.send(decision).is_ok(),
             None => false,
         }
+    }
+
+    pub async fn submit_user_input(
+        &self,
+        thread_id: &str,
+        input_id: &str,
+        response: crate::tools::user_input::UserInputResponse,
+    ) -> Result<bool> {
+        let active = self.active.lock().await;
+        let Some(state) = active.engines.get(thread_id) else {
+            bail!("thread '{thread_id}' not found");
+        };
+        state.engine.submit_user_input(input_id, response).await?;
+        Ok(true)
+    }
+
+    #[allow(dead_code)]
+    pub async fn cancel_user_input(&self, thread_id: &str, input_id: &str) -> Result<bool> {
+        let active = self.active.lock().await;
+        let Some(state) = active.engines.get(thread_id) else {
+            bail!("thread '{thread_id}' not found");
+        };
+        state.engine.cancel_user_input(input_id).await?;
+        Ok(true)
     }
 
     #[allow(dead_code)]
@@ -822,6 +892,15 @@ impl RuntimeThreadManager {
                 thread_id,
                 err
             );
+        }
+
+        {
+            let mut active = self.active.lock().await;
+            if let Some(state) = active.engines.get_mut(thread_id)
+                && let Some(turn) = state.active_turn.as_mut()
+            {
+                turn.auto_approve = true;
+            }
         }
     }
 
@@ -1014,6 +1093,7 @@ impl RuntimeThreadManager {
             && req.mode.is_none()
             && req.title.is_none()
             && req.system_prompt.is_none()
+            && req.workspace.is_none()
         {
             bail!("At least one thread field is required");
         }
@@ -1027,6 +1107,11 @@ impl RuntimeThreadManager {
             && mode.trim().is_empty()
         {
             bail!("mode must not be empty");
+        }
+        if let Some(workspace) = req.workspace.as_ref()
+            && workspace.as_os_str().is_empty()
+        {
+            bail!("workspace must not be empty");
         }
 
         let mut thread = self.get_thread(id).await?;
@@ -1091,10 +1176,24 @@ impl RuntimeThreadManager {
                 changes.insert("system_prompt".to_string(), json!(new_sys));
             }
         }
+        if let Some(workspace) = req.workspace
+            && thread.workspace != workspace
+        {
+            changes.insert("workspace".to_string(), json!(workspace));
+            thread.workspace = workspace;
+        }
 
         if !changes.is_empty() {
+            let workspace_changed = changes.contains_key("workspace");
+            if workspace_changed {
+                self.ensure_thread_has_no_active_turn(&thread.id).await?;
+            }
+
             thread.updated_at = Utc::now();
             self.store.save_thread(&thread)?;
+            if workspace_changed {
+                self.evict_cached_engine(&thread.id).await;
+            }
             self.emit_event(
                 &thread.id,
                 None,
@@ -1109,6 +1208,30 @@ impl RuntimeThreadManager {
         }
 
         Ok(thread)
+    }
+
+    async fn ensure_thread_has_no_active_turn(&self, thread_id: &str) -> Result<()> {
+        let active = self.active.lock().await;
+        if active
+            .engines
+            .get(thread_id)
+            .and_then(|state| state.active_turn.as_ref())
+            .is_some()
+        {
+            bail!("workspace cannot be changed while the thread has an active turn");
+        }
+        Ok(())
+    }
+
+    async fn evict_cached_engine(&self, thread_id: &str) {
+        let engine = {
+            let mut active = self.active.lock().await;
+            active.lru.retain(|id| id != thread_id);
+            active.engines.remove(thread_id).map(|state| state.engine)
+        };
+        if let Some(engine) = engine {
+            let _ = engine.send(Op::Shutdown).await;
+        }
     }
 
     pub async fn get_thread_detail(&self, id: &str) -> Result<ThreadDetail> {
@@ -1383,7 +1506,7 @@ impl RuntimeThreadManager {
 
             if let Some(assistant_text) = assistant_text {
                 let asst_summary = if assistant_text.len() > SUMMARY_LIMIT {
-                    format!("{}...", &assistant_text[..SUMMARY_LIMIT.saturating_sub(3)])
+                    crate::utils::truncate_with_ellipsis(&assistant_text, SUMMARY_LIMIT, "...")
                 } else {
                     assistant_text.clone()
                 };
@@ -1540,7 +1663,7 @@ impl RuntimeThreadManager {
         let requested_model = req.model.unwrap_or_else(|| thread.model.clone());
         let auto_model = requested_model.trim().eq_ignore_ascii_case("auto");
         let (model, reasoning_effort) = if auto_model {
-            let selection = crate::commands::resolve_auto_route_with_flash(
+            let selection = crate::model_routing::resolve_auto_route_with_flash(
                 &self.config,
                 &prompt,
                 "",
@@ -1560,6 +1683,9 @@ impl RuntimeThreadManager {
         let allow_shell = req.allow_shell.unwrap_or(thread.allow_shell);
         let trust_mode = req.trust_mode.unwrap_or(thread.trust_mode);
         let auto_approve = req.auto_approve.unwrap_or(thread.auto_approve);
+        let show_thinking = crate::settings::Settings::load()
+            .unwrap_or_default()
+            .show_thinking;
 
         engine
             .send(Op::SendMessage {
@@ -1573,6 +1699,10 @@ impl RuntimeThreadManager {
                 allow_shell,
                 trust_mode,
                 auto_approve,
+                translation_enabled: false,
+                show_thinking,
+                allowed_tools: None,
+                hook_executor: None,
                 approval_mode: if auto_approve {
                     crate::tui::approval::ApprovalMode::Auto
                 } else {
@@ -1863,12 +1993,20 @@ impl RuntimeThreadManager {
         }
 
         // Compaction defaults to disabled in v0.6.6 — the cycle architecture
-        // (issue #124) handles long-context resets. Threads keep the
-        // legacy summarizer wired off unless an operator opts in via config.
+        let settings = crate::settings::Settings::load().unwrap_or_default();
+        let auto_compact_enabled =
+            if crate::settings::Settings::auto_compact_explicitly_configured() {
+                settings.auto_compact
+            } else {
+                auto_compact_default_for_model(&thread.model)
+            };
         let compaction = CompactionConfig {
-            enabled: false,
+            enabled: auto_compact_enabled,
             model: thread.model.clone(),
-            token_threshold: compaction_threshold_for_model(&thread.model),
+            token_threshold: compaction_threshold_for_model_at_percent(
+                &thread.model,
+                settings.auto_compact_threshold_percent,
+            ),
             ..Default::default()
         };
         let network_policy = self.config.network.clone().map(|toml_cfg| {
@@ -1887,20 +2025,33 @@ impl RuntimeThreadManager {
             notes_path: self.config.notes_path(),
             mcp_config_path: self.config.mcp_config_path(),
             skills_dir: self.config.skills_dir(),
-            instructions: self.config.instructions_paths(),
+            instructions: self
+                .config
+                .instructions_paths()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            project_context_pack_enabled: self.config.project_context_pack_enabled(),
+            translation_enabled: false,
+            show_thinking: settings.show_thinking,
             max_steps: 100,
             max_subagents: self.config.max_subagents().clamp(1, MAX_SUBAGENTS),
             features: self.config.features(),
             compaction,
-            cycle: crate::cycle_manager::CycleConfig::default(),
             capacity: crate::core::capacity::CapacityControllerConfig::from_app_config(
                 &self.config,
             ),
             todos: new_shared_todo_list(),
             plan_state: new_shared_plan_state(),
+            goal_state: crate::tools::goal::new_shared_goal_state(),
             max_spawn_depth: crate::tools::subagent::DEFAULT_MAX_SPAWN_DEPTH,
             network_policy,
             snapshots_enabled: self.config.snapshots_config().enabled,
+            snapshots_max_workspace_bytes: self
+                .config
+                .snapshots_config()
+                .max_workspace_gb
+                .saturating_mul(1024 * 1024 * 1024),
             lsp_config,
             runtime_services: crate::tools::spec::RuntimeToolServices {
                 task_manager: self.task_manager.lock().ok().and_then(|slot| slot.clone()),
@@ -1910,18 +2061,38 @@ impl RuntimeThreadManager {
                 active_thread_id: Some(thread.id.clone()),
                 shell_manager: None,
                 hook_executor: None,
+                handle_store: crate::tools::handle::new_shared_handle_store(),
+                rlm_sessions: crate::rlm::session::new_shared_rlm_session_store(),
             },
             subagent_model_overrides: self.config.subagent_model_overrides(),
+            subagent_api_timeout: std::time::Duration::from_secs(
+                self.config.subagent_api_timeout_secs(),
+            ),
+            stream_chunk_timeout: std::time::Duration::from_secs(
+                self.config.stream_chunk_timeout_secs(),
+            ),
+            subagent_heartbeat_timeout: std::time::Duration::from_secs(
+                self.config.subagent_heartbeat_timeout_secs(),
+            ),
+            prefer_bwrap: self.config.prefer_bwrap.unwrap_or(false),
             memory_enabled: self.config.memory_enabled(),
             memory_path: self.config.memory_path(),
+            speech_output_dir: self.config.speech_output_dir(),
+            vision_config: self.config.vision_model_config(),
             strict_tool_mode: self.config.strict_tool_mode.unwrap_or(false),
             goal_objective: None,
-            locale_tag: crate::localization::resolve_locale(
-                &crate::settings::Settings::load().unwrap_or_default().locale,
-            )
-            .tag()
-            .to_string(),
+            allowed_tools: None,
+            disallowed_tools: None,
+            hook_executor: None,
+            locale_tag: crate::localization::resolve_locale(&settings.locale)
+                .tag()
+                .to_string(),
             workshop: self.config.workshop.clone(),
+            search_provider: self.config.search_provider(),
+            search_api_key: self.config.search.as_ref().and_then(|s| s.api_key.clone()),
+            search_base_url: self.config.search.as_ref().and_then(|s| s.base_url.clone()),
+            tools_always_load: self.config.tools_always_load(),
+            tools: self.config.tools.clone(),
         };
 
         let engine = spawn_engine(engine_cfg, &self.config);
@@ -1935,8 +2106,10 @@ impl RuntimeThreadManager {
         if !session_messages.is_empty() || sys_prompt.is_some() {
             engine
                 .send(Op::SyncSession {
+                    session_id: None,
                     messages: session_messages,
                     system_prompt: sys_prompt,
+                    system_prompt_override: thread.system_prompt.is_some(),
                     model: thread.model.clone(),
                     workspace: thread.workspace.clone(),
                 })
@@ -2307,26 +2480,6 @@ impl RuntimeThreadManager {
                         .await?;
                     }
                 }
-                EngineEvent::CycleAdvanced { from, to, briefing } => {
-                    // Surface the cycle boundary in the runtime event timeline so
-                    // background-task subscribers and replay see it. The actual
-                    // archive write is the engine's responsibility (see
-                    // `cycle_manager::archive_cycle`); this event is informational.
-                    self.emit_event(
-                        &thread_id,
-                        Some(&turn_id),
-                        None,
-                        "cycle.advanced",
-                        json!({
-                            "from": from,
-                            "to": to,
-                            "briefing_tokens": briefing.token_estimate,
-                            "cycle": briefing.cycle,
-                            "timestamp": briefing.timestamp,
-                        }),
-                    )
-                    .await?;
-                }
                 EngineEvent::CoherenceState {
                     state,
                     label,
@@ -2394,8 +2547,7 @@ impl RuntimeThreadManager {
                     ..
                 } => {
                     let message = format!(
-                        "Capacity intervention: {action} (~{before_prompt_tokens} -> ~{after_prompt_tokens}) replay={:?} replan={replan_performed}",
-                        replay_outcome
+                        "Capacity intervention: {action} (~{before_prompt_tokens} -> ~{after_prompt_tokens}) replay={replay_outcome:?} replan={replan_performed}"
                     );
                     let item = TurnItemRecord {
                         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
@@ -2577,6 +2729,7 @@ impl RuntimeThreadManager {
                     id,
                     tool_name,
                     description,
+                    intent_summary,
                     ..
                 } => {
                     self.emit_event(
@@ -2589,6 +2742,7 @@ impl RuntimeThreadManager {
                             "approval_id": id,
                             "tool_name": tool_name,
                             "description": description,
+                            "intent_summary": intent_summary,
                         }),
                     )
                     .await?;
@@ -2709,6 +2863,19 @@ impl RuntimeThreadManager {
                         }
                     }
                 }
+                EngineEvent::UserInputRequired { id, request } => {
+                    self.emit_event(
+                        &thread_id,
+                        Some(&turn_id),
+                        None,
+                        "user_input.required",
+                        json!({
+                            "id": id,
+                            "request": request,
+                        }),
+                    )
+                    .await?;
+                }
                 EngineEvent::Status { message } => {
                     let item = TurnItemRecord {
                         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
@@ -2766,6 +2933,7 @@ impl RuntimeThreadManager {
                     usage,
                     status,
                     error,
+                    ..
                 } => {
                     turn_usage = Some(usage);
                     turn_status = match status {
@@ -3320,6 +3488,37 @@ mod tests {
     }
 
     #[test]
+    fn store_rejects_path_like_record_ids() {
+        let dir = test_runtime_dir();
+        let store = RuntimeThreadStore::open(dir.clone()).expect("open store");
+
+        let err = store
+            .load_thread("../outside")
+            .expect_err("path traversal id should fail");
+        assert!(
+            format!("{err:#}").contains("unsupported characters"),
+            "got: {err:#}"
+        );
+
+        let mut thread = sample_thread("thr_bad/id");
+        let err = store
+            .save_thread(&thread)
+            .expect_err("path separator id should fail");
+        assert!(
+            format!("{err:#}").contains("unsupported characters"),
+            "got: {err:#}"
+        );
+
+        thread.id = " thr_bad".to_string();
+        let err = store
+            .save_thread(&thread)
+            .expect_err("whitespace id should fail");
+        assert!(format!("{err:#}").contains("whitespace"), "got: {err:#}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn store_load_turn_rejects_newer_schema_version() {
         let dir = test_runtime_dir();
         let store = RuntimeThreadStore::open(dir.clone()).expect("open store");
@@ -3559,6 +3758,8 @@ mod tests {
                         },
                         status: TurnOutcomeStatus::Completed,
                         error: None,
+                        tool_catalog: None,
+                        base_url: None,
                     })
                     .await;
             }
@@ -3626,6 +3827,169 @@ mod tests {
 
         assert!(!thread.auto_approve);
         assert_eq!(thread.coherence_state, CoherenceState::Healthy);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_thread_workspace_persists_event_and_evicts_idle_engine() -> Result<()> {
+        let manager = test_manager(test_runtime_dir())?;
+        let old_workspace = std::env::temp_dir().join("codewhale-runtime-old-workspace");
+        let new_workspace = std::env::temp_dir().join("codewhale-runtime-new-workspace");
+        let thread = manager
+            .create_thread(CreateThreadRequest {
+                model: None,
+                workspace: Some(old_workspace.clone()),
+                mode: None,
+                allow_shell: None,
+                trust_mode: None,
+                auto_approve: None,
+                archived: false,
+                system_prompt: None,
+                task_id: None,
+            })
+            .await?;
+
+        let harness = install_mock_engine(&manager, &thread.id).await;
+        let mut rx_op = harness.rx_op;
+
+        let updated = manager
+            .update_thread(
+                &thread.id,
+                UpdateThreadRequest {
+                    workspace: Some(new_workspace.clone()),
+                    ..UpdateThreadRequest::default()
+                },
+            )
+            .await?;
+
+        assert_eq!(updated.workspace, new_workspace);
+        assert_eq!(
+            manager.store.load_thread(&thread.id)?.workspace,
+            new_workspace
+        );
+        {
+            let active = manager.active.lock().await;
+            assert!(
+                !active.engines.contains_key(&thread.id),
+                "workspace changes must evict the stale cached engine"
+            );
+            assert!(!active.lru.iter().any(|id| id == &thread.id));
+        }
+
+        match tokio::time::timeout(Duration::from_secs(1), rx_op.recv()).await {
+            Ok(Some(Op::Shutdown)) => {}
+            other => panic!("expected cached engine shutdown, got {other:?}"),
+        }
+
+        let events = manager.events_since(&thread.id, None)?;
+        let event = events
+            .iter()
+            .rev()
+            .find(|event| event.event == "thread.updated")
+            .expect("thread.updated event");
+        let workspace_value = serde_json::to_value(&updated.workspace)?;
+        assert_eq!(
+            event
+                .payload
+                .get("changes")
+                .and_then(|changes| changes.get("workspace")),
+            Some(&workspace_value)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_thread_workspace_rejects_empty_path() -> Result<()> {
+        let manager = test_manager(test_runtime_dir())?;
+        let thread = manager
+            .create_thread(CreateThreadRequest {
+                model: None,
+                workspace: None,
+                mode: None,
+                allow_shell: None,
+                trust_mode: None,
+                auto_approve: None,
+                archived: false,
+                system_prompt: None,
+                task_id: None,
+            })
+            .await?;
+
+        let err = manager
+            .update_thread(
+                &thread.id,
+                UpdateThreadRequest {
+                    workspace: Some(PathBuf::new()),
+                    ..UpdateThreadRequest::default()
+                },
+            )
+            .await
+            .expect_err("empty workspace must be rejected");
+        assert!(format!("{err:#}").contains("workspace must not be empty"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_thread_workspace_rejects_active_turn() -> Result<()> {
+        let manager = test_manager(test_runtime_dir())?;
+        let old_workspace = std::env::temp_dir().join("codewhale-runtime-active-old");
+        let new_workspace = std::env::temp_dir().join("codewhale-runtime-active-new");
+        let thread = manager
+            .create_thread(CreateThreadRequest {
+                model: None,
+                workspace: Some(old_workspace.clone()),
+                mode: None,
+                allow_shell: None,
+                trust_mode: None,
+                auto_approve: None,
+                archived: false,
+                system_prompt: None,
+                task_id: None,
+            })
+            .await?;
+
+        let harness = install_mock_engine(&manager, &thread.id).await;
+        let mut rx_op = harness.rx_op;
+        {
+            let mut active = manager.active.lock().await;
+            let state = active.engines.get_mut(&thread.id).expect("mock engine");
+            state.active_turn = Some(ActiveTurnState {
+                turn_id: "turn_live".to_string(),
+                interrupt_requested: false,
+                auto_approve: false,
+                trust_mode: false,
+            });
+        }
+
+        let err = manager
+            .update_thread(
+                &thread.id,
+                UpdateThreadRequest {
+                    workspace: Some(new_workspace),
+                    ..UpdateThreadRequest::default()
+                },
+            )
+            .await
+            .expect_err("workspace update during active turn must fail");
+
+        assert!(format!("{err:#}").contains("active turn"));
+        assert_eq!(
+            manager.store.load_thread(&thread.id)?.workspace,
+            old_workspace
+        );
+        {
+            let active = manager.active.lock().await;
+            assert!(
+                active.engines.contains_key(&thread.id),
+                "active engine should stay cached after rejected update"
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx_op.recv())
+                .await
+                .is_err(),
+            "rejected workspace update must not shut down the active engine"
+        );
         Ok(())
     }
 
@@ -3851,6 +4215,8 @@ mod tests {
                         },
                         status: TurnOutcomeStatus::Completed,
                         error: None,
+                        tool_catalog: None,
+                        base_url: None,
                     })
                     .await;
                 if turn_index >= 2 {
@@ -4062,9 +4428,12 @@ mod tests {
             .tx_event
             .send(EngineEvent::ApprovalRequired {
                 approval_key: "test_key".to_string(),
+                approval_grouping_key: "test_key".to_string(),
                 id: "tool_stale".to_string(),
                 tool_name: "exec_command".to_string(),
                 description: "stale approval".to_string(),
+                input: serde_json::json!({}),
+                intent_summary: None,
             })
             .await?;
 
@@ -4085,6 +4454,8 @@ mod tests {
                 },
                 status: TurnOutcomeStatus::Completed,
                 error: None,
+                tool_catalog: None,
+                base_url: None,
             })
             .await?;
 
@@ -4134,9 +4505,12 @@ mod tests {
             .tx_event
             .send(EngineEvent::ApprovalRequired {
                 approval_key: "key1".to_string(),
+                approval_grouping_key: "key1".to_string(),
                 id: "tool_external_allow".to_string(),
                 tool_name: "exec_command".to_string(),
                 description: "external allow".to_string(),
+                input: serde_json::json!({}),
+                intent_summary: Some("I will update the config file.".to_string()),
             })
             .await?;
 
@@ -4145,6 +4519,20 @@ mod tests {
             sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(manager.pending_approvals_count(), 1);
+
+        let events = manager.events_since(&thread.id, None)?;
+        let approval_event = events
+            .iter()
+            .rev()
+            .find(|event| event.event == "approval.required")
+            .context("missing approval.required event")?;
+        assert_eq!(
+            approval_event
+                .payload
+                .get("intent_summary")
+                .and_then(Value::as_str),
+            Some("I will update the config file.")
+        );
 
         assert!(manager.deliver_external_approval(
             "tool_external_allow",
@@ -4164,6 +4552,8 @@ mod tests {
                 usage: Usage::default(),
                 status: TurnOutcomeStatus::Completed,
                 error: None,
+                tool_catalog: None,
+                base_url: None,
             })
             .await?;
         Ok(())
@@ -4210,9 +4600,12 @@ mod tests {
             .tx_event
             .send(EngineEvent::ApprovalRequired {
                 approval_key: "key2".to_string(),
+                approval_grouping_key: "key2".to_string(),
                 id: "tool_external_deny".to_string(),
                 tool_name: "exec_command".to_string(),
                 description: "external deny".to_string(),
+                input: serde_json::json!({}),
+                intent_summary: None,
             })
             .await?;
 
@@ -4239,6 +4632,8 @@ mod tests {
                 usage: Usage::default(),
                 status: TurnOutcomeStatus::Completed,
                 error: None,
+                tool_catalog: None,
+                base_url: None,
             })
             .await?;
         Ok(())
@@ -4302,6 +4697,8 @@ mod tests {
                 usage: Usage::default(),
                 status: TurnOutcomeStatus::Completed,
                 error: None,
+                tool_catalog: None,
+                base_url: None,
             })
             .await?;
 
@@ -4372,7 +4769,7 @@ mod tests {
         assert!(!manager.store.load_thread(&thread.id)?.auto_approve);
 
         let mut harness = install_mock_engine(&manager, &thread.id).await;
-        let _turn = manager
+        let turn = manager
             .start_turn(
                 &thread.id,
                 StartTurnRequest {
@@ -4395,9 +4792,12 @@ mod tests {
             .tx_event
             .send(EngineEvent::ApprovalRequired {
                 approval_key: "key3".to_string(),
+                approval_grouping_key: "key3".to_string(),
                 id: "tool_remember".to_string(),
                 tool_name: "exec_command".to_string(),
                 description: "remember=true".to_string(),
+                input: serde_json::json!({}),
+                intent_summary: None,
             })
             .await?;
 
@@ -4415,6 +4815,11 @@ mod tests {
             manager.store.load_thread(&thread.id)?.auto_approve,
             "remember=true should flip thread auto_approve"
         );
+        assert_eq!(
+            manager.active_turn_flags(&thread.id, &turn.id).await,
+            Some((true, false)),
+            "remember=true should update the active turn used by subsequent approvals"
+        );
 
         harness
             .tx_event
@@ -4422,6 +4827,8 @@ mod tests {
                 usage: Usage::default(),
                 status: TurnOutcomeStatus::Completed,
                 error: None,
+                tool_catalog: None,
+                base_url: None,
             })
             .await?;
         Ok(())
@@ -4502,6 +4909,8 @@ mod tests {
                 },
                 status: TurnOutcomeStatus::Completed,
                 error: None,
+                tool_catalog: None,
+                base_url: None,
             })
             .await?;
 
@@ -4563,6 +4972,8 @@ mod tests {
                         },
                         status: TurnOutcomeStatus::Completed,
                         error: None,
+                        tool_catalog: None,
+                        base_url: None,
                     })
                     .await;
             }
@@ -4673,6 +5084,8 @@ mod tests {
                                 },
                                 status: TurnOutcomeStatus::Completed,
                                 error: None,
+                                tool_catalog: None,
+                                base_url: None,
                             })
                             .await;
                     }
@@ -4703,6 +5116,8 @@ mod tests {
                                 },
                                 status: TurnOutcomeStatus::Completed,
                                 error: None,
+                                tool_catalog: None,
+                                base_url: None,
                             })
                             .await;
                     }

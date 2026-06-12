@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
@@ -11,17 +11,19 @@ use unicode_width::UnicodeWidthStr;
 use crate::deepseek_theme::active_theme;
 use crate::models::{ContentBlock, Message};
 use crate::palette;
+use crate::tools::plan::{PlanSnapshot, StepStatus};
 use crate::tools::review::ReviewOutput;
 use crate::tui::app::TranscriptSpacing;
 use crate::tui::diff_render;
 use crate::tui::markdown_render;
+use crate::tui::ui_text::{CopyLineSeparator, truncate_line_to_width};
 
 // === Constants ===
 
 use std::process::Command;
 const TOOL_COMMAND_LINE_LIMIT: usize = 3;
 const TOOL_OUTPUT_LINE_LIMIT: usize = 6;
-const TOOL_TEXT_LIMIT: usize = 180;
+const TOOL_TEXT_LIMIT: usize = 300;
 const TOOL_HEADER_SUMMARY_LIMIT: usize = 56;
 const TOOL_OUTPUT_HEAD_LINES: usize = 2;
 const TOOL_OUTPUT_TAIL_LINES: usize = 2;
@@ -53,6 +55,8 @@ const REASONING_RAIL: &str = "\u{254E} "; // ╎ + space
 const REASONING_CURSOR: &str = "\u{258E}"; // ▎
 const TOOL_CARD_SUMMARY_LINES: usize = 4;
 const THINKING_SUMMARY_LINE_LIMIT: usize = 4;
+const THINKING_COMPLETED_PREVIEW_LINE_LIMIT: usize = 6;
+const THINKING_STREAMING_PREVIEW_LINE_LIMIT: usize = 8;
 const TOOL_DONE_SYMBOL: &str = "•";
 const TOOL_FAILED_SYMBOL: &str = "•";
 
@@ -149,16 +153,24 @@ impl SubAgentCell {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TranscriptRenderOptions {
     pub show_thinking: bool,
+    pub verbose: bool,
     pub show_tool_details: bool,
     pub calm_mode: bool,
     pub low_motion: bool,
     pub spacing: TranscriptSpacing,
 }
 
+pub(crate) struct RenderedTranscriptLine {
+    pub line: Line<'static>,
+    pub copy_prefix_width: usize,
+    pub copy_separator_after: CopyLineSeparator,
+}
+
 impl Default for TranscriptRenderOptions {
     fn default() -> Self {
         Self {
             show_thinking: true,
+            verbose: false,
             show_tool_details: true,
             calm_mode: false,
             low_motion: false,
@@ -178,13 +190,7 @@ impl HistoryCell {
     /// `transcript_lines`.
     pub fn lines(&self, width: u16) -> Vec<Line<'static>> {
         match self {
-            HistoryCell::User { content } => render_message(
-                USER_GLYPH,
-                user_label_style(),
-                message_body_style(),
-                content,
-                width,
-            ),
+            HistoryCell::User { content } => render_user_message(content, width),
             HistoryCell::Assistant { content, streaming } => render_message(
                 ASSISTANT_GLYPH,
                 assistant_label_style_for(*streaming, /*low_motion*/ false),
@@ -205,13 +211,30 @@ impl HistoryCell {
                     )
                 }
             }
-            HistoryCell::Error { message, severity } => render_message(
-                error_label_text(*severity),
-                error_label_style(*severity),
-                error_body_style(*severity),
-                message,
-                width,
-            ),
+            HistoryCell::Error { message, severity } => {
+                // Error messages are machine-generated and should not be run
+                // through markdown rendering, which would mangle env-var names
+                // containing underscores (e.g. DEEPSEEK_ALLOW_INSECURE_HTTP
+                // would lose its underscores as italic markers).
+                let label = error_label_text(*severity);
+                let label_style = error_label_style(*severity);
+                let body_style = error_body_style(*severity);
+                let prefix_width = UnicodeWidthStr::width(label);
+                let content_width = width.saturating_sub(2 + prefix_width as u16).max(1);
+                let mut lines = wrap_plain_line(message, body_style, content_width);
+                // Add the label prefix to the first line
+                if let Some(first) = lines.get_mut(0) {
+                    first.spans.insert(0, Span::raw(" "));
+                    first.spans.insert(0, Span::styled(label, label_style));
+                }
+                // Continuation rail for subsequent lines
+                let rail = format!("{}{}", '\u{258F}', " ".repeat(prefix_width));
+                let rail_style = Style::default().fg(palette::TEXT_DIM);
+                for line in lines.iter_mut().skip(1) {
+                    line.spans.insert(0, Span::styled(rail.clone(), rail_style));
+                }
+                lines
+            }
             HistoryCell::Thinking {
                 content,
                 streaming,
@@ -228,8 +251,33 @@ impl HistoryCell {
         width: u16,
         options: TranscriptRenderOptions,
     ) -> Vec<Line<'static>> {
+        self.lines_with_options_folded(width, options, false)
+    }
+
+    /// Render with an explicit per-cell fold override for thinking cells.
+    ///
+    /// Uses XOR with the `verbose` flag so that pressing Space toggles
+    /// the collapsed state *relative* to the global setting:
+    /// - verbose off (default): thinking is collapsed; Space unfolds it
+    /// - verbose on: thinking is expanded; Space folds it
+    pub fn lines_with_options_folded(
+        &self,
+        width: u16,
+        options: TranscriptRenderOptions,
+        folded: bool,
+    ) -> Vec<Line<'static>> {
         match self {
-            HistoryCell::Thinking { .. } if !options.show_thinking => Vec::new(),
+            HistoryCell::Thinking {
+                streaming,
+                duration_secs,
+                ..
+            } if !options.show_thinking => {
+                if *streaming {
+                    render_hidden_thinking_activity(width, *duration_secs, options.low_motion)
+                } else {
+                    Vec::new()
+                }
+            }
             HistoryCell::Thinking {
                 content,
                 streaming,
@@ -239,7 +287,7 @@ impl HistoryCell {
                 width,
                 *streaming,
                 *duration_secs,
-                !*streaming,
+                folded ^ !options.verbose,
                 options.low_motion,
             ),
             HistoryCell::Tool(cell) if !options.show_tool_details => {
@@ -265,13 +313,7 @@ impl HistoryCell {
                 lines
             }
             HistoryCell::Tool(cell) => cell.lines_with_motion(width, options.low_motion),
-            HistoryCell::User { content } => render_message(
-                USER_GLYPH,
-                user_label_style(),
-                message_body_style(),
-                content,
-                width,
-            ),
+            HistoryCell::User { content } => render_user_message(content, width),
             HistoryCell::Assistant { content, streaming } => render_message(
                 ASSISTANT_GLYPH,
                 assistant_label_style_for(*streaming, options.low_motion),
@@ -287,20 +329,59 @@ impl HistoryCell {
         }
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn lines_with_copy_metadata(
+        &self,
+        width: u16,
+        options: TranscriptRenderOptions,
+    ) -> Vec<RenderedTranscriptLine> {
+        self.lines_with_copy_metadata_folded(width, options, false)
+    }
+
+    pub(crate) fn lines_with_copy_metadata_folded(
+        &self,
+        width: u16,
+        options: TranscriptRenderOptions,
+        folded: bool,
+    ) -> Vec<RenderedTranscriptLine> {
+        match self {
+            HistoryCell::User { content } => {
+                hard_break_copy_lines(render_user_message(content, width))
+            }
+            HistoryCell::Assistant { content, streaming } => render_message_with_copy_metadata(
+                ASSISTANT_GLYPH,
+                assistant_label_style_for(*streaming, options.low_motion),
+                message_body_style(),
+                content,
+                width,
+            ),
+            HistoryCell::System { content } if !is_cycle_boundary(content) => {
+                render_message_with_copy_metadata(
+                    "Note",
+                    system_label_style(),
+                    system_body_style(),
+                    content,
+                    width,
+                )
+            }
+            _ => hard_break_copy_lines(self.lines_with_options_folded(width, options, folded)),
+        }
+    }
+
     /// Render the cell in transcript mode: full content, no caps, no
     /// "Alt+V for details" affordances.
     ///
-    /// Use this for the pager (`v` / `Ctrl+O`), clipboard exports, and any
+    /// Use this for full-detail pagers, clipboard exports, and any
     /// surface that wants the complete body rather than the live summary.
     /// For most variants (User / Assistant / System) this matches `lines()`;
     /// `Thinking` and `Tool` are where the live and transcript surfaces
     /// diverge.
     pub fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
         match self {
-            HistoryCell::User { content } => render_message(
+            HistoryCell::User { content } => render_plain_message(
                 USER_GLYPH,
                 user_label_style(),
-                message_body_style(),
+                user_body_style(),
                 content,
                 width,
             ),
@@ -557,7 +638,7 @@ pub fn history_cells_from_message(msg: &Message) -> Vec<HistoryCell> {
                     _ => {}
                 }
             }
-            ContentBlock::Thinking { thinking } => {
+            ContentBlock::Thinking { thinking, .. } => {
                 if let Some(HistoryCell::Thinking { content, .. }) = cells.last_mut() {
                     if !content.is_empty() {
                         content.push('\n');
@@ -570,6 +651,12 @@ pub fn history_cells_from_message(msg: &Message) -> Vec<HistoryCell> {
                         duration_secs: None,
                     });
                 }
+            }
+            ContentBlock::ToolUse { name, input, .. } if name == "update_plan" => {
+                cells.push(HistoryCell::Tool(ToolCell::PlanUpdate(PlanUpdateCell {
+                    snapshot: PlanSnapshot::from_tool_input(input),
+                    status: ToolStatus::Success,
+                })));
             }
             _ => {}
         }
@@ -596,6 +683,68 @@ pub enum ToolCell {
 }
 
 impl ToolCell {
+    /// Status for cells that have a concrete lifecycle state.
+    pub fn status(&self) -> Option<ToolStatus> {
+        match self {
+            ToolCell::Exec(cell) => Some(cell.status),
+            ToolCell::Exploring(cell) => {
+                let has_running = cell
+                    .entries
+                    .iter()
+                    .any(|entry| entry.status == ToolStatus::Running);
+                let has_failed = cell
+                    .entries
+                    .iter()
+                    .any(|entry| entry.status == ToolStatus::Failed);
+                Some(if has_running {
+                    ToolStatus::Running
+                } else if has_failed {
+                    ToolStatus::Failed
+                } else {
+                    ToolStatus::Success
+                })
+            }
+            ToolCell::PlanUpdate(cell) => Some(cell.status),
+            ToolCell::PatchSummary(cell) => Some(cell.status),
+            ToolCell::Review(cell) => Some(cell.status),
+            ToolCell::Mcp(cell) => Some(cell.status),
+            ToolCell::WebSearch(cell) => Some(cell.status),
+            ToolCell::Generic(cell) => Some(cell.status),
+            ToolCell::DiffPreview(_) | ToolCell::ViewImage(_) => Some(ToolStatus::Success),
+        }
+    }
+
+    #[must_use]
+    pub fn is_success(&self) -> bool {
+        self.status() == Some(ToolStatus::Success)
+    }
+
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.status() == Some(ToolStatus::Running)
+    }
+
+    #[must_use]
+    pub fn is_failed(&self) -> bool {
+        self.status() == Some(ToolStatus::Failed)
+    }
+
+    /// Whether this cell should stay visible even inside a dense tool run.
+    #[must_use]
+    pub fn is_collapsible_guard(&self) -> bool {
+        self.is_running()
+            || self.is_failed()
+            || matches!(
+                self,
+                ToolCell::Exec(_)
+                    | ToolCell::PatchSummary(_)
+                    | ToolCell::Review(_)
+                    | ToolCell::DiffPreview(_)
+                    | ToolCell::PlanUpdate(_)
+            )
+            || matches!(self, ToolCell::Generic(cell) if generic_tool_name_is_collapse_guard(&cell.name) || cell.is_diff)
+    }
+
     /// Render the tool cell into lines.
     pub fn lines(&self, width: u16) -> Vec<Line<'static>> {
         self.lines_with_motion(width, false)
@@ -628,11 +777,110 @@ impl ToolCell {
     }
 }
 
+// ── Tool-run grouping for transcript collapse (#2692) ──────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolRun {
+    /// Original index of the first tool cell in `App::history`.
+    pub start: usize,
+    /// Number of collapsed cells in the run.
+    pub count: usize,
+    /// Dominant tool names, deduplicated and capped for summary rendering.
+    pub tool_families: Vec<String>,
+}
+
+/// Detect contiguous runs of successful, low-risk tool cells.
+///
+/// Failed, running, shell, patch, review, diff, and plan-update cells split
+/// runs so important state never disappears into a summary row.
+pub fn detect_tool_runs(history: &[HistoryCell], min_size: usize) -> Vec<ToolRun> {
+    if min_size == 0 {
+        return Vec::new();
+    }
+
+    let mut runs = Vec::new();
+    let mut index = 0;
+    while index < history.len() {
+        if !is_collapsible_tool_cell(&history[index]) {
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        let mut names: Vec<String> = Vec::new();
+        while index < history.len() && is_collapsible_tool_cell(&history[index]) {
+            if let HistoryCell::Tool(tool) = &history[index] {
+                let name = tool_display_name(tool);
+                if !names.iter().any(|existing| existing == name) {
+                    names.push(name.to_string());
+                }
+            }
+            index += 1;
+        }
+
+        let count = index - start;
+        if count >= min_size {
+            names.truncate(3);
+            runs.push(ToolRun {
+                start,
+                count,
+                tool_families: names,
+            });
+        }
+    }
+
+    runs
+}
+
+fn is_collapsible_tool_cell(cell: &HistoryCell) -> bool {
+    matches!(cell, HistoryCell::Tool(tool) if tool.is_success() && !tool.is_collapsible_guard())
+}
+
+fn generic_tool_name_is_collapse_guard(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_lowercase();
+    normalized.contains("patch")
+        || normalized.contains("write")
+        || normalized.contains("edit")
+        || normalized.contains("delete")
+        || normalized.contains("remove")
+        || normalized.contains("commit")
+        || normalized.contains("push")
+        || normalized.contains("shell")
+        || normalized.contains("exec")
+        || normalized.contains("review")
+}
+
+fn tool_display_name(tool: &ToolCell) -> &str {
+    match tool {
+        ToolCell::Generic(cell) => cell.name.as_str(),
+        ToolCell::Mcp(cell) => cell.tool.as_str(),
+        ToolCell::WebSearch(_) => "web_search",
+        ToolCell::ViewImage(_) => "view_image",
+        ToolCell::Exploring(_) => "explore",
+        ToolCell::Exec(_) => "shell",
+        ToolCell::PlanUpdate(_) => "update_plan",
+        ToolCell::PatchSummary(_) => "apply_patch",
+        ToolCell::Review(_) => "review",
+        ToolCell::DiffPreview(_) => "diff",
+    }
+}
+
+#[must_use]
+pub fn tool_run_summary(run: &ToolRun) -> String {
+    let tools = if run.tool_families.is_empty() {
+        "tools".to_string()
+    } else {
+        run.tool_families.join(", ")
+    };
+    format!("{} tools ({tools}) · all ok", run.count)
+}
+
 /// Overall status for a tool execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolStatus {
     Running,
     Success,
+    Hydrated,
     Failed,
 }
 
@@ -642,10 +890,14 @@ pub struct ExecCell {
     pub command: String,
     pub status: ToolStatus,
     pub output: Option<String>,
+    pub live_output: Option<String>,
+    pub shell_task_id: Option<String>,
     pub started_at: Option<Instant>,
     pub duration_ms: Option<u64>,
     pub source: ExecSource,
     pub interaction: Option<String>,
+    /// Cached output summary — avoids re-parsing JSON every frame.
+    pub output_summary: Option<String>,
 }
 
 impl ExecCell {
@@ -696,7 +948,7 @@ impl ExecCell {
         }
 
         if self.interaction.is_none() {
-            if let Some(output) = self.output.as_ref() {
+            if let Some(output) = self.output.as_ref().or(self.live_output.as_ref()) {
                 lines.extend(render_exec_output_mode(
                     output,
                     width,
@@ -705,11 +957,14 @@ impl ExecCell {
                 ));
             } else if self.status == ToolStatus::Running && self.source == ExecSource::Assistant {
                 lines.extend(wrap_plain_line(
-                    "  Ctrl+B opens shell controls.",
+                    "  Ctrl+B backgrounds this command.",
                     Style::default().fg(palette::TEXT_MUTED),
                     width,
                 ));
-            } else if self.status != ToolStatus::Running {
+            } else if self.status != ToolStatus::Running && mode == RenderMode::Transcript {
+                // #3031: Suppress "(no output)" in compact/Live mode;
+                // the success header is enough signal. Transcript still
+                // records it for exports/clipboard/pager.
                 lines.push(Line::from(Span::styled(
                     "  (no output)",
                     Style::default().fg(palette::TEXT_MUTED).italic(),
@@ -718,16 +973,20 @@ impl ExecCell {
         }
 
         if let Some(duration_ms) = self.duration_ms {
-            let seconds = f64::from(u32::try_from(duration_ms).unwrap_or(u32::MAX)) / 1000.0;
-            lines.extend(render_compact_kv(
-                "time",
-                &format!("{seconds:.2}s"),
-                Style::default().fg(palette::TEXT_DIM),
-                width,
-            ));
+            // #3031: Suppress sub-second timing in compact mode.
+            // Transcript mode always shows exact timing.
+            if mode == RenderMode::Transcript || duration_ms >= 1000 {
+                let seconds = f64::from(u32::try_from(duration_ms).unwrap_or(u32::MAX)) / 1000.0;
+                lines.extend(render_compact_kv(
+                    "time",
+                    &format!("{seconds:.2}s"),
+                    Style::default().fg(palette::TEXT_DIM),
+                    width,
+                ));
+            }
         }
 
-        lines
+        wrap_card_rail(lines)
     }
 }
 
@@ -752,8 +1011,16 @@ impl ExploringCell {
             .entries
             .iter()
             .all(|entry| entry.status != ToolStatus::Running);
+        let any_hydrated = self
+            .entries
+            .iter()
+            .any(|entry| entry.status == ToolStatus::Hydrated);
         let status = if all_done {
-            ToolStatus::Success
+            if any_hydrated {
+                ToolStatus::Hydrated
+            } else {
+                ToolStatus::Success
+            }
         } else {
             ToolStatus::Running
         };
@@ -761,7 +1028,11 @@ impl ExploringCell {
         lines.push(render_tool_header_with_summary(
             "Workspace",
             header_summary.as_deref(),
-            if all_done { "done" } else { "running" },
+            if all_done {
+                tool_status_label(status)
+            } else {
+                "running"
+            },
             status,
             None,
             low_motion,
@@ -771,6 +1042,7 @@ impl ExploringCell {
             let prefix = match entry.status {
                 ToolStatus::Running => "live",
                 ToolStatus::Success => "done",
+                ToolStatus::Hydrated => "loaded",
                 ToolStatus::Failed => "issue",
             };
             lines.extend(render_compact_kv(
@@ -801,8 +1073,7 @@ pub struct ExploringEntry {
 /// Cell for plan updates emitted by the plan tool.
 #[derive(Debug, Clone)]
 pub struct PlanUpdateCell {
-    pub explanation: Option<String>,
-    pub steps: Vec<PlanStep>,
+    pub snapshot: PlanSnapshot,
     pub status: ToolStatus,
 }
 
@@ -818,39 +1089,68 @@ impl PlanUpdateCell {
             low_motion,
         ));
 
-        if let Some(explanation) = self.explanation.as_ref() {
-            lines.extend(render_message(
-                "",
-                system_label_style(),
-                system_body_style(),
-                explanation,
-                width,
-            ));
-        }
-
-        for step in &self.steps {
-            let marker = match step.status.as_str() {
-                "completed" => "done",
-                "in_progress" => "live",
-                _ => "next",
-            };
-            lines.extend(render_compact_kv(
-                marker,
-                &step.step,
-                tool_value_style(),
-                width,
-            ));
-        }
+        render_plan_snapshot_lines(&self.snapshot, &mut lines, width);
 
         lines
     }
 }
 
-/// Single plan step rendered in the UI.
-#[derive(Debug, Clone)]
-pub struct PlanStep {
-    pub step: String,
-    pub status: String,
+fn render_plan_snapshot_lines(snapshot: &PlanSnapshot, lines: &mut Vec<Line<'static>>, width: u16) {
+    render_plan_optional(lines, "title", snapshot.title.as_deref(), width);
+    render_plan_optional(lines, "objective", snapshot.objective.as_deref(), width);
+    render_plan_optional(lines, "context", snapshot.context_summary.as_deref(), width);
+    render_plan_optional(lines, "explain", snapshot.explanation.as_deref(), width);
+    render_plan_list(lines, "source", &snapshot.sources_used, width);
+    render_plan_list(lines, "file", &snapshot.critical_files, width);
+    render_plan_list(lines, "constraint", &snapshot.constraints, width);
+    render_plan_optional(
+        lines,
+        "approach",
+        snapshot.recommended_approach.as_deref(),
+        width,
+    );
+    render_plan_optional(
+        lines,
+        "verify",
+        snapshot.verification_plan.as_deref(),
+        width,
+    );
+    render_plan_optional(lines, "risk", snapshot.risks_and_unknowns.as_deref(), width);
+    render_plan_optional(lines, "handoff", snapshot.handoff_packet.as_deref(), width);
+
+    for step in &snapshot.items {
+        let marker = match step.status {
+            StepStatus::Completed => "done",
+            StepStatus::InProgress => "live",
+            StepStatus::Pending => "next",
+        };
+        lines.extend(render_compact_kv(
+            marker,
+            &step.step,
+            tool_value_style(),
+            width,
+        ));
+    }
+}
+
+fn render_plan_optional(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    value: Option<&str>,
+    width: u16,
+) {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        lines.extend(render_compact_kv(label, value, tool_value_style(), width));
+    }
+}
+
+fn render_plan_list(lines: &mut Vec<Line<'static>>, label: &str, values: &[String], width: u16) {
+    for value in values {
+        let value = value.trim();
+        if !value.is_empty() {
+            lines.extend(render_compact_kv(label, value, tool_value_style(), width));
+        }
+    }
 }
 
 /// Cell for patch summaries emitted by the patch tool.
@@ -1200,6 +1500,21 @@ pub struct GenericToolCell {
     /// OSC 8-aware terminals — the path renders as a hyperlink when
     /// `tui.osc8_links` is enabled).
     pub spillover_path: Option<std::path::PathBuf>,
+    // --- Pre-computed render cache (populated once at cell creation) ---
+    /// Cached output summary — avoids re-parsing JSON every frame.
+    pub output_summary: Option<String>,
+    /// Whether the output looks like a unified diff (cached after first check).
+    pub is_diff: bool,
+}
+
+fn should_show_raw_tool_name(
+    name: &str,
+    family: crate::tui::widgets::tool_card::ToolFamily,
+    mode: RenderMode,
+) -> bool {
+    matches!(mode, RenderMode::Transcript)
+        || matches!(family, crate::tui::widgets::tool_card::ToolFamily::Generic)
+        || name.starts_with("mcp_")
 }
 
 impl GenericToolCell {
@@ -1221,19 +1536,21 @@ impl GenericToolCell {
             return lines;
         }
 
-        // Issue #409: `agent_spawn` already gets a dedicated `DelegateCard`
+        // Issue #409: sub-agent open already gets a dedicated `DelegateCard`
         // that owns the live action tree, status, and final summary. The
         // generic tool block for the same call duplicates that signal at
         // 3-4 lines per spawn — N parallel spawns multiply the noise. In
         // live mode, render one compact summary line and let the
         // DelegateCard be the source of truth. Transcript mode keeps the
         // full block so session replay remains complete.
-        if matches!(mode, RenderMode::Live) && self.name == "agent_spawn" {
+        if matches!(mode, RenderMode::Live)
+            && matches!(self.name.as_str(), "agent_open" | "agent_spawn")
+        {
             return self.render_agent_spawn_compact(low_motion);
         }
 
         let mut lines = Vec::new();
-        // Map the actual tool name (e.g. `agent_spawn`, `apply_patch`) to a
+        // Map the actual tool name (e.g. `agent_open`, `apply_patch`) to a
         // family rather than the catch-all `"Tool"` title — this is what
         // gives a `GenericToolCell` the right verb glyph (◐ delegate, ⋮⋮
         // fanout, etc.) instead of falling back to the neutral bullet.
@@ -1250,12 +1567,14 @@ impl GenericToolCell {
             None,
             low_motion,
         ));
-        lines.extend(render_compact_kv(
-            "name",
-            &self.name,
-            tool_value_style(),
-            width,
-        ));
+        if should_show_raw_tool_name(&self.name, family, mode) {
+            lines.extend(render_compact_kv(
+                "name",
+                &self.name,
+                tool_value_style(),
+                width,
+            ));
+        }
 
         // Prefer per-prompt rows over the generic args summary when the tool
         // exposes a list of child prompts. One row per child with a `[i]`
@@ -1288,10 +1607,7 @@ impl GenericToolCell {
         }
 
         if let Some(output) = self.output.as_ref() {
-            // If the output looks like a unified diff (contains hunk headers),
-            // use the full diff renderer with line numbers and colored gutters
-            // instead of the generic output path (#380).
-            if output_looks_like_diff(output) {
+            if self.is_diff {
                 let diff_summary = diff_render::diff_summary_label(output);
                 lines.push(render_tool_header_with_summary(
                     "Diff",
@@ -1303,11 +1619,6 @@ impl GenericToolCell {
                 ));
                 lines.extend(diff_render::render_diff(output, width));
             } else {
-                // Multi-line outputs (diff stats, file lists, todo snapshots) used
-                // to be crushed into one line by `render_compact_kv` because its
-                // wrapper joined the entire string before wrapping. Route through
-                // `render_tool_output_mode` so each `\n` becomes a real row, with
-                // a `+N more lines` affordance in live mode (#80).
                 lines.extend(render_tool_output_mode(
                     output,
                     width,
@@ -1316,29 +1627,22 @@ impl GenericToolCell {
                 ));
             }
 
-            // #423: surface the spillover-file path inline so the user
-            // (and the model) can find the elided tail. Only emitted in
-            // live mode — transcript replay already has the full output
-            // verbatim. The path is OSC 8-wrapped when the feature is
-            // enabled so terminals that support hyperlinks make it
-            // Cmd+click-openable; the clipboard / selection path
-            // strips the escape on copy.
             if matches!(mode, RenderMode::Live)
                 && let Some(path) = self.spillover_path.as_ref()
             {
                 lines.push(render_spillover_annotation(path, width));
             }
         }
-        lines
+        wrap_card_rail(lines)
     }
 
-    /// Render `agent_spawn` as a single compact summary line for live
+    /// Render `agent_open`/legacy `agent_spawn` as a single compact summary line for live
     /// mode (#409). The companion `DelegateCard` already carries the
     /// live action tree, status, and final summary; this line is just
     /// the pointer that says "a spawn happened, here's the agent id".
     ///
     /// Output shape (header):
-    ///   `◐ delegate · agent_spawn  agent-abc12  [running]`
+    ///   `◐ delegate · agent_open  agent-abc12  [running]`
     /// Falls back to a placeholder when the spawn is still pending and
     /// no agent id has been assigned yet.
     fn render_agent_spawn_compact(&self, low_motion: bool) -> Vec<Line<'static>> {
@@ -1427,7 +1731,7 @@ fn render_spillover_annotation(path: &std::path::Path, width: u16) -> Line<'stat
     ])
 }
 
-/// Pull the `agent_id` field out of an `agent_spawn` tool output. The
+/// Pull the `agent_id` field out of a sub-agent open tool output. The
 /// tool emits structured JSON shaped like
 /// `{"agent_id": "agent-abc12", "nickname": "...", "model": "..."}` so we
 /// look for the `agent_id` key and return its string value.
@@ -1464,7 +1768,7 @@ fn is_checklist_tool_name(name: &str) -> bool {
 /// Heuristic: does the output look like a unified diff? Returns true when
 /// the output contains at least one hunk header (`@@`) or a `diff --git`
 /// line, which are reliable markers of unified diff content (#380).
-fn output_looks_like_diff(output: &str) -> bool {
+pub(crate) fn output_looks_like_diff(output: &str) -> bool {
     let mut lines = output.lines();
     // Check first 5 lines for diff markers
     for _ in 0..5 {
@@ -1814,6 +2118,18 @@ pub fn summarize_tool_args(input: &Value) -> Option<String> {
             summarize_inline_value(value, 40, false)
         ));
     }
+    if let Some(value) = obj.get("profile") {
+        parts.push(format!(
+            "profile: {}",
+            summarize_inline_value(value, 40, false)
+        ));
+    }
+    if let Some(value) = obj.get("level") {
+        parts.push(format!(
+            "level: {}",
+            summarize_inline_value(value, 40, false)
+        ));
+    }
     if let Some(value) = obj.get("file_id") {
         parts.push(format!(
             "file_id: {}",
@@ -1998,8 +2314,20 @@ pub fn output_is_image(output: &str) -> bool {
     .any(|ext| lower.contains(ext))
 }
 
+#[allow(dead_code)] // Kept for compatibility/tests; live view uses explicit summaries only.
 #[must_use]
 pub fn extract_reasoning_summary(text: &str) -> Option<String> {
+    extract_explicit_reasoning_summary(text).or_else(|| {
+        let fallback = text.trim();
+        if fallback.is_empty() {
+            None
+        } else {
+            Some(fallback.to_string())
+        }
+    })
+}
+
+fn extract_explicit_reasoning_summary(text: &str) -> Option<String> {
     let mut lines = text.lines().peekable();
     while let Some(line) = lines.next() {
         let trimmed = line.trim();
@@ -2031,12 +2359,7 @@ pub fn extract_reasoning_summary(text: &str) -> Option<String> {
             };
         }
     }
-    let fallback = text.trim();
-    if fallback.is_empty() {
-        None
-    } else {
-        Some(fallback.to_string())
-    }
+    None
 }
 
 fn render_thinking(
@@ -2061,13 +2384,13 @@ fn render_thinking(
     let mut lines = Vec::new();
 
     // Header: `…` opener (replaces the spinner; reasoning isn't a tool, it's
-    // a slow exhale) followed by the `thinking` label and live status.
+    // a slow exhale) followed by the reasoning label and live status.
     let mut header_spans = vec![
         Span::styled(
             format!("{REASONING_OPENER} "),
             Style::default().fg(thinking_state_accent(state)),
         ),
-        Span::styled("thinking", thinking_title_style()),
+        Span::styled("reasoning", thinking_title_style()),
     ];
     header_spans.push(Span::styled(" ", Style::default()));
     header_spans.push(Span::styled(
@@ -2081,15 +2404,50 @@ fn render_thinking(
     lines.push(Line::from(header_spans));
 
     let content_width = width.saturating_sub(3).max(1);
+    let mut collapsed_without_explicit_summary = false;
     let body_text = if collapsed {
-        extract_reasoning_summary(content).unwrap_or_else(|| content.trim().to_string())
+        if streaming {
+            // #861 RC4 / #1324: during streaming we don't yet have a
+            // completed reasoning block, so `extract_reasoning_summary`
+            // is meaningless. Show the raw content and let the
+            // truncation logic below keep the *last* `LIMIT` lines so
+            // the user sees the model's most recent thinking instead of
+            // staring at an empty placeholder.
+            content.to_string()
+        } else {
+            match extract_explicit_reasoning_summary(content) {
+                Some(summary) => summary,
+                None => {
+                    collapsed_without_explicit_summary = true;
+                    content.to_string()
+                }
+            }
+        }
     } else {
         content.to_string()
     };
-    let mut rendered = markdown_render::render_markdown(&body_text, content_width, body_style);
+    let mut rendered = if body_text.trim().is_empty() {
+        Vec::new()
+    } else {
+        markdown_render::render_markdown(&body_text, content_width, body_style)
+    };
     let mut truncated = false;
-    if collapsed && rendered.len() > THINKING_SUMMARY_LINE_LIMIT {
-        rendered.truncate(THINKING_SUMMARY_LINE_LIMIT);
+    let line_limit = if streaming {
+        THINKING_STREAMING_PREVIEW_LINE_LIMIT
+    } else if collapsed_without_explicit_summary {
+        THINKING_COMPLETED_PREVIEW_LINE_LIMIT
+    } else {
+        THINKING_SUMMARY_LINE_LIMIT
+    };
+    if collapsed && rendered.len() > line_limit {
+        if streaming {
+            // Drop the *head* during streaming so the visible window
+            // tracks the live cursor at the bottom.
+            let drop = rendered.len() - line_limit;
+            rendered.drain(0..drop);
+        } else {
+            rendered.truncate(line_limit);
+        }
         truncated = true;
     }
 
@@ -2098,10 +2456,7 @@ fn render_thinking(
 
     if rendered.is_empty() && streaming {
         let mut spans = vec![Span::styled(REASONING_RAIL.to_string(), rail_style)];
-        spans.push(Span::styled(
-            "reasoning in progress...",
-            body_style.italic(),
-        ));
+        spans.push(Span::styled("reasoning...", body_style.italic()));
         if !low_motion {
             spans.push(Span::styled(format!(" {REASONING_CURSOR}"), cursor_style));
         }
@@ -2120,17 +2475,68 @@ fn render_thinking(
         lines.push(Line::from(spans));
     }
 
-    if collapsed && (!streaming && (truncated || body_text.trim() != content.trim())) {
+    let needs_affordance = collapsed
+        && if streaming {
+            // #861 RC4 / #1324: during streaming, surface the affordance
+            // whenever any head lines have been clipped so the user
+            // knows there's more above and how to reach it.
+            truncated
+        } else {
+            truncated || body_text.trim() != content.trim()
+        };
+    if needs_affordance {
+        let label = if streaming {
+            "More reasoning in Ctrl+O"
+        } else {
+            "Space to expand · Full reasoning in Ctrl+O"
+        };
         lines.push(Line::from(vec![
             Span::styled(REASONING_RAIL.to_string(), rail_style),
-            Span::styled(
-                "thinking collapsed; press Ctrl+O for full text",
-                Style::default().fg(palette::TEXT_MUTED).italic(),
-            ),
+            Span::styled(label, Style::default().fg(palette::TEXT_MUTED).italic()),
         ]));
     }
 
     lines
+}
+
+fn render_hidden_thinking_activity(
+    width: u16,
+    duration_secs: Option<f32>,
+    low_motion: bool,
+) -> Vec<Line<'static>> {
+    let state = ThinkingVisualState::Live;
+    let rail_style = Style::default().fg(thinking_state_accent(state));
+    let body_style = thinking_style().italic();
+    let content_width = width.saturating_sub(3).max(1) as usize;
+
+    let mut header_spans = vec![
+        Span::styled(
+            format!("{REASONING_OPENER} "),
+            Style::default().fg(thinking_state_accent(state)),
+        ),
+        Span::styled("reasoning", thinking_title_style()),
+        Span::styled(" ", Style::default()),
+        Span::styled(thinking_status_label(state), thinking_status_style(state)),
+    ];
+    if let Some(dur) = duration_secs {
+        header_spans.push(Span::styled(" · ", Style::default().fg(palette::TEXT_DIM)));
+        header_spans.push(Span::styled(format!("{dur:.1}s"), thinking_meta_style()));
+    }
+
+    let mut body =
+        truncate_line_to_width("reasoning hidden; model is still working", content_width);
+    if !low_motion {
+        body.push(' ');
+        body.push_str(REASONING_CURSOR);
+    }
+
+    vec![
+        Line::from(header_spans),
+        Line::from(vec![
+            Span::styled(REASONING_RAIL.to_string(), rail_style),
+            Span::styled(body, body_style),
+        ]),
+    ]
 }
 
 fn render_message(
@@ -2140,11 +2546,119 @@ fn render_message(
     content: &str,
     width: u16,
 ) -> Vec<Line<'static>> {
+    render_message_with_copy_metadata(prefix, label_style, body_style, content, width)
+        .into_iter()
+        .map(|rendered| rendered.line)
+        .collect()
+}
+
+fn render_message_with_copy_metadata(
+    prefix: &str,
+    label_style: Style,
+    body_style: Style,
+    content: &str,
+    width: u16,
+) -> Vec<RenderedTranscriptLine> {
+    // An assistant cell whose content is entirely whitespace (e.g. a stray
+    // newline streamed between reasoning and a tool call) would otherwise
+    // render as a bare, orphaned role glyph floating on its own line — the
+    // "blue dots with nothing after them" artifact. Render nothing so the
+    // transcript doesn't accumulate empty markers. Real prose, including
+    // messages that merely start with blank lines, still renders normally.
+    if prefix == ASSISTANT_GLYPH && content.trim().is_empty() {
+        return Vec::new();
+    }
     let prefix_width = UnicodeWidthStr::width(prefix);
     let prefix_width_u16 = u16::try_from(prefix_width.saturating_add(2)).unwrap_or(u16::MAX);
     let content_width = usize::from(width.saturating_sub(prefix_width_u16).max(1));
     let mut lines = Vec::new();
-    let rendered = markdown_render::render_markdown(content, content_width as u16, body_style);
+    let rendered =
+        markdown_render::render_markdown_tagged(content, content_width as u16, body_style);
+    for (idx, rendered_line) in rendered.into_iter().enumerate() {
+        let line = if idx == 0 {
+            let mut spans = Vec::new();
+            if !prefix.is_empty() {
+                spans.push(Span::styled(
+                    prefix.to_string(),
+                    label_style.add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::raw(" "));
+            }
+            spans.extend(rendered_line.line.spans);
+            Line::from(spans)
+        } else {
+            let indent = if prefix.is_empty() {
+                String::new()
+            } else if rendered_line.is_code {
+                " ".repeat(prefix_width + 1)
+            } else {
+                let mut s = String::with_capacity(prefix_width + 1);
+                s.push('\u{258F}');
+                s.extend(std::iter::repeat_n(' ', prefix_width));
+                s
+            };
+            let rail_style = Style::default().fg(palette::TEXT_DIM);
+            let mut spans = vec![Span::styled(indent, rail_style)];
+            spans.extend(rendered_line.line.spans);
+            Line::from(spans)
+        };
+        lines.push(RenderedTranscriptLine {
+            line,
+            copy_prefix_width: rendered_line.copy_prefix_width
+                + history_copy_prefix_width(prefix, prefix_width, rendered_line.is_code, idx),
+            copy_separator_after: rendered_line.copy_separator_after,
+        });
+    }
+    if lines.is_empty() {
+        lines.push(RenderedTranscriptLine {
+            line: Line::from(""),
+            copy_prefix_width: 0,
+            copy_separator_after: CopyLineSeparator::Newline,
+        });
+    }
+    lines
+}
+
+fn history_copy_prefix_width(
+    prefix: &str,
+    prefix_width: usize,
+    is_code: bool,
+    line_index: usize,
+) -> usize {
+    if line_index > 0 && is_code && !prefix.is_empty() {
+        prefix_width + 1
+    } else {
+        0
+    }
+}
+
+fn hard_break_copy_lines(lines: Vec<Line<'static>>) -> Vec<RenderedTranscriptLine> {
+    lines
+        .into_iter()
+        .map(|line| RenderedTranscriptLine {
+            line,
+            copy_prefix_width: 0,
+            copy_separator_after: CopyLineSeparator::Newline,
+        })
+        .collect()
+}
+
+/// Render a plain-text user message: split on newlines, word-wrap each line,
+/// preserve leading whitespace. No markdown interpretation (headings, lists,
+/// code blocks, etc. are rendered as literal text).
+fn render_plain_message(
+    prefix: &str,
+    label_style: Style,
+    body_style: Style,
+    content: &str,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let prefix_width = UnicodeWidthStr::width(prefix);
+    let prefix_width_u16 = u16::try_from(prefix_width.saturating_add(2)).unwrap_or(u16::MAX);
+    let content_width = width.saturating_sub(prefix_width_u16).max(1);
+    let rendered = markdown_render::render_plain_text(content, content_width, body_style);
+    let mut lines = Vec::with_capacity(rendered.len());
+
     for (idx, line) in rendered.into_iter().enumerate() {
         if idx == 0 {
             let mut spans = Vec::new();
@@ -2172,10 +2686,40 @@ fn render_message(
             lines.push(Line::from(spans));
         }
     }
+
     if lines.is_empty() {
         lines.push(Line::from(""));
     }
     lines
+}
+
+fn render_user_message(content: &str, width: u16) -> Vec<Line<'static>> {
+    render_plain_message(
+        USER_GLYPH,
+        user_label_style(),
+        user_body_style(),
+        content,
+        width,
+    )
+    .into_iter()
+    .map(|line| apply_user_message_highlight(line, width))
+    .collect()
+}
+
+fn apply_user_message_highlight(mut line: Line<'static>, width: u16) -> Line<'static> {
+    let bg = palette::SURFACE_ELEVATED;
+    line.style = line.style.bg(bg);
+
+    let target_width = usize::from(width);
+    let line_width = line.width();
+    if line_width < target_width {
+        line.spans.push(Span::styled(
+            " ".repeat(target_width - line_width),
+            Style::default().bg(bg),
+        ));
+    }
+
+    line
 }
 
 fn render_command_mode(command: &str, width: u16, mode: RenderMode) -> Vec<Line<'static>> {
@@ -2227,6 +2771,31 @@ fn render_compact_kv(label: &str, value: &str, style: Style, width: u16) -> Vec<
     render_card_detail_line(Some(label.trim_end_matches(':')), value, style, width)
 }
 
+/// Wrap rendered tool-card lines with card-rail glyphs (╭ │ ╰).
+/// First non-empty line gets `╭`, middle lines get `│`, last line gets `╰`.
+/// Single-line cards get a single `─` prefix.
+fn wrap_card_rail(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let n = lines.len();
+    if n == 0 {
+        return lines;
+    }
+    if n == 1 {
+        lines[0].spans.insert(0, Span::raw("─ "));
+        return lines;
+    }
+    for (i, line) in lines.iter_mut().enumerate() {
+        let rail = if i == 0 {
+            "\u{256D} " // ╭
+        } else if i == n - 1 {
+            "\u{2570} " // ╰
+        } else {
+            "\u{2502} " // │
+        };
+        line.spans.insert(0, Span::raw(rail));
+    }
+    lines
+}
+
 fn render_tool_output_mode(
     output: &str,
     width: u16,
@@ -2263,10 +2832,10 @@ fn render_exec_output_mode(
     render_preserved_output_mode(output, width, line_limit, mode, "output")
 }
 
-#[derive(Debug, Clone)]
-struct OutputRow {
-    text: String,
-    intact: bool,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputRow {
+    pub text: String,
+    pub intact: bool,
 }
 
 fn render_preserved_output_mode(
@@ -2278,14 +2847,22 @@ fn render_preserved_output_mode(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if output.trim().is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (no output)",
-            Style::default().fg(palette::TEXT_MUTED).italic(),
-        )));
+        // #3031: In compact/Live mode, suppress "(no output)" — the tool
+        // header already carries the success/failure status.  Transcript
+        // mode still records it for exports/clipboard/pager.
+        if mode == RenderMode::Transcript {
+            lines.push(Line::from(Span::styled(
+                "  (no output)",
+                Style::default().fg(palette::TEXT_MUTED).italic(),
+            )));
+        }
         return lines;
     }
 
-    let all_lines = output_rows(output, width);
+    let content_hash = crate::tui::output_rows_cache::hash_str(output);
+    let all_lines = crate::tui::output_rows_cache::get_or_compute_rows(output, width, || {
+        output_rows(output, width)
+    });
 
     if matches!(mode, RenderMode::Transcript) {
         // Full-content path: emit every wrapped line with no head/tail split,
@@ -2301,7 +2878,12 @@ fn render_preserved_output_mode(
         return lines;
     }
 
-    let selected = selected_output_indices(&all_lines, line_limit);
+    let selected = crate::tui::output_rows_cache::get_or_compute_indices(
+        content_hash,
+        width,
+        line_limit,
+        || selected_output_indices(&all_lines, line_limit),
+    );
     let mut previous: Option<usize> = None;
     for (rendered_idx, idx) in selected.iter().copied().enumerate() {
         if let Some(prev) = previous {
@@ -2607,7 +3189,7 @@ fn status_symbol(started_at: Option<Instant>, status: ToolStatus, low_motion: bo
                 .map_or(0, |d| d % (TOOL_RUNNING_SYMBOLS.len() as u128));
             TOOL_RUNNING_SYMBOLS[usize::try_from(idx).unwrap_or_default()].to_string()
         }
-        ToolStatus::Success => TOOL_DONE_SYMBOL.to_string(),
+        ToolStatus::Success | ToolStatus::Hydrated => TOOL_DONE_SYMBOL.to_string(),
         ToolStatus::Failed => TOOL_FAILED_SYMBOL.to_string(),
     }
 }
@@ -2635,7 +3217,11 @@ fn truncate_text(text: &str, max_len: usize) -> String {
 }
 
 fn user_label_style() -> Style {
-    Style::default().fg(palette::TEXT_MUTED)
+    Style::default().fg(palette::USER_BODY)
+}
+
+fn user_body_style() -> Style {
+    Style::default().fg(palette::USER_BODY)
 }
 
 /// Style for the assistant glyph (`●`). When the cell is streaming and
@@ -2894,6 +3480,7 @@ fn tool_status_label(status: ToolStatus) -> &'static str {
     match status {
         ToolStatus::Running => "running",
         ToolStatus::Success => "done",
+        ToolStatus::Hydrated => "tool loaded - retry required",
         ToolStatus::Failed => "issue",
     }
 }
@@ -3071,8 +3658,8 @@ fn looks_like_file_path(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ASSISTANT_GLYPH, ExecCell, ExecSource, GenericToolCell, HistoryCell, PlanStep,
-        PlanUpdateCell, REASONING_CURSOR, REASONING_OPENER, REASONING_RAIL, TOOL_RUNNING_SYMBOLS,
+        ASSISTANT_GLYPH, ExecCell, ExecSource, GenericToolCell, HistoryCell, PlanUpdateCell,
+        REASONING_CURSOR, REASONING_OPENER, REASONING_RAIL, TOOL_RUNNING_SYMBOLS,
         TOOL_STATUS_SYMBOL_MS, ToolCell, ToolStatus, TranscriptRenderOptions, USER_GLYPH,
         assistant_label_style_for, extract_reasoning_summary, render_thinking,
         running_status_label_with_elapsed,
@@ -3080,6 +3667,7 @@ mod tests {
     use crate::deepseek_theme::Theme;
     use crate::models::{ContentBlock, Message};
     use crate::palette;
+    use crate::tools::plan::{PlanSnapshot, StepStatus};
     use ratatui::style::Modifier;
     use std::time::{Duration, Instant};
 
@@ -3108,6 +3696,8 @@ mod tests {
             spillover_path: Some(PathBuf::from(
                 "/Users/dev/.deepseek/tool_outputs/call-abc12.txt",
             )),
+            output_summary: None,
+            is_diff: false,
         };
         let lines = cell.lines_with_mode(120, true, super::RenderMode::Live);
         let joined: String = lines
@@ -3136,6 +3726,8 @@ mod tests {
             output: Some("output".to_string()),
             prompts: None,
             spillover_path: Some(PathBuf::from("/tmp/spill.txt")),
+            output_summary: None,
+            is_diff: false,
         };
         let lines = cell.lines_with_mode(120, true, super::RenderMode::Transcript);
         let joined: String = lines
@@ -3158,6 +3750,8 @@ mod tests {
             output: Some("contents".to_string()),
             prompts: None,
             spillover_path: None,
+            output_summary: None,
+            is_diff: false,
         };
         let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
         let joined: String = lines
@@ -3178,6 +3772,8 @@ mod tests {
             output: Some("output".to_string()),
             prompts: None,
             spillover_path: Some(PathBuf::from(long_path)),
+            output_summary: None,
+            is_diff: false,
         };
         let lines = cell.lines_with_mode(40, true, super::RenderMode::Live);
         let annotation_line = lines
@@ -3253,10 +3849,12 @@ mod tests {
             ),
             prompts: None,
             spillover_path: None,
+                output_summary: None,
+                is_diff: false,
         };
         let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
         // One header line, no details/args/output expansion.
-        assert_eq!(lines.len(), 1, "expected exactly 1 line, got {:?}", lines);
+        assert_eq!(lines.len(), 1, "expected exactly 1 line, got {lines:?}");
         let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         // Header carries the agent id and the running status.
         assert!(
@@ -3286,6 +3884,8 @@ mod tests {
             output: None,
             prompts: None,
             spillover_path: None,
+            output_summary: None,
+            is_diff: false,
         };
         let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
         assert_eq!(lines.len(), 1);
@@ -3306,6 +3906,8 @@ mod tests {
             ),
             prompts: None,
             spillover_path: None,
+            output_summary: None,
+            is_diff: false,
         };
         let lines = cell.lines_with_mode(80, true, super::RenderMode::Transcript);
         // Transcript mode emits header + name kv + (no args, output present)
@@ -3324,6 +3926,8 @@ mod tests {
             output: Some("first line\nsecond line\nthird line".to_string()),
             prompts: None,
             spillover_path: None,
+            output_summary: None,
+            is_diff: false,
         };
         let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
         assert!(
@@ -3545,6 +4149,40 @@ mod tests {
     }
 
     #[test]
+    fn history_replays_update_plan_tool_use_as_plan_card() {
+        let msg = Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: "plan-1".to_string(),
+                name: "update_plan".to_string(),
+                input: serde_json::json!({
+                    "objective": "Make Plan mode reviewable",
+                    "sources_used": ["gh issue view 2691"],
+                    "critical_files": ["crates/tui/src/tools/plan.rs"],
+                    "plan": [
+                        { "step": "render replay card", "status": "completed" }
+                    ]
+                }),
+                caller: None,
+            }],
+        };
+
+        let cells = super::history_cells_from_message(&msg);
+        assert_eq!(cells.len(), 1);
+        let HistoryCell::Tool(ToolCell::PlanUpdate(cell)) = &cells[0] else {
+            panic!("expected update_plan replay cell");
+        };
+
+        assert_eq!(cell.status, ToolStatus::Success);
+        assert_eq!(
+            cell.snapshot.objective.as_deref(),
+            Some("Make Plan mode reviewable")
+        );
+        assert_eq!(cell.snapshot.sources_used, vec!["gh issue view 2691"]);
+        assert_eq!(cell.snapshot.items[0].status, StepStatus::Completed);
+    }
+
+    #[test]
     fn render_thinking_collapsed_shows_details_affordance() {
         let lines = render_thinking(
             "Summary: First line\nSecond line\nThird line\nFourth line\nFifth line",
@@ -3558,8 +4196,135 @@ mod tests {
             .iter()
             .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
             .collect::<String>();
-        assert!(text.contains("thinking collapsed; press Ctrl+O for full text"));
-        assert!(text.contains("thinking"));
+        assert!(text.contains("Full reasoning in Ctrl+O"));
+        // Pin the actual header shape ("… reasoning done") — a bare
+        // `contains("reasoning")` is already satisfied by the Ctrl+O
+        // affordance line above and would never fail on its own.
+        let header = lines
+            .first()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        assert!(
+            header.starts_with(REASONING_OPENER),
+            "header opens with the dotted opener: {header:?}"
+        );
+        assert!(
+            header.contains("reasoning done"),
+            "header carries the reasoning title and done status: {header:?}"
+        );
+    }
+
+    #[test]
+    fn render_thinking_streaming_collapsed_shows_live_content() {
+        // #861 RC4 / #1324: during a live thinking block in collapsed view,
+        // the body must NOT be blanked out. Users want to watch the model
+        // think; the previous behaviour stalled on a "thinking..." spinner
+        // until ThinkingComplete fired.
+        let lines = render_thinking(
+            "Step 1: read the code\nStep 2: trace the call\nStep 3: form a hypothesis",
+            80,
+            true, // streaming
+            None, // no duration yet
+            true, // collapsed
+            true, // low_motion (no cursor noise to grep)
+        );
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+        assert!(
+            text.contains("Step 3: form a hypothesis"),
+            "the most recent thinking line must be visible during streaming, got: {text}"
+        );
+        // "thinking..." placeholder must not be the only thing rendered.
+        assert!(
+            !text.contains("thinking..."),
+            "raw content present means the placeholder line should not be drawn, got: {text}"
+        );
+    }
+
+    #[test]
+    fn render_hidden_streaming_thinking_shows_activity_without_content() {
+        let cell = HistoryCell::Thinking {
+            content: "private chain of thought that must not be shown".to_string(),
+            streaming: true,
+            duration_secs: None,
+        };
+
+        let lines = cell.lines_with_options(
+            80,
+            TranscriptRenderOptions {
+                show_thinking: false,
+                low_motion: true,
+                ..TranscriptRenderOptions::default()
+            },
+        );
+        let text = lines_text(&lines);
+
+        assert!(
+            text.contains("reasoning hidden"),
+            "hidden live thinking should still show progress: {text}"
+        );
+        assert!(
+            !text.contains("private chain of thought"),
+            "hidden live thinking must not reveal content: {text}"
+        );
+    }
+
+    #[test]
+    fn render_hidden_completed_thinking_stays_hidden() {
+        let cell = HistoryCell::Thinking {
+            content: "completed hidden reasoning".to_string(),
+            streaming: false,
+            duration_secs: Some(1.0),
+        };
+
+        let lines = cell.lines_with_options(
+            80,
+            TranscriptRenderOptions {
+                show_thinking: false,
+                ..TranscriptRenderOptions::default()
+            },
+        );
+
+        assert!(
+            lines.is_empty(),
+            "completed hidden thinking should stay out of the transcript"
+        );
+    }
+
+    #[test]
+    fn render_thinking_streaming_truncated_shows_continues_affordance() {
+        // #861 RC4: when a streaming thinking block exceeds the line cap,
+        // surface a live affordance pointing at Ctrl+O. The earlier code
+        // suppressed the affordance unless `!streaming`.
+        let long = (1..=12)
+            .map(|i| format!("Reasoning line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = render_thinking(&long, 80, true, None, true, true);
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+        assert!(
+            text.contains("More reasoning in Ctrl+O"),
+            "streaming-truncation affordance missing, got: {text}"
+        );
+        // The most recent line must be the visible tail (head dropped).
+        assert!(
+            text.contains("Reasoning line 12"),
+            "tail line missing, got: {text}"
+        );
+        assert!(
+            !text.contains("Reasoning line 1\n"),
+            "head should be clipped, got: {text}"
+        );
     }
 
     #[test]
@@ -3574,10 +4339,13 @@ mod tests {
             command: "echo hi".to_string(),
             status: ToolStatus::Running,
             output: None,
+            live_output: None,
+            shell_task_id: None,
             started_at,
             duration_ms: None,
             source: ExecSource::Assistant,
             interaction: None,
+            output_summary: None,
         }));
 
         let animated = cell.lines_with_options(80, TranscriptRenderOptions::default());
@@ -3589,8 +4357,9 @@ mod tests {
             },
         );
 
-        let animated_symbol = animated[0].spans[0].content.trim();
-        let low_motion_symbol = low_motion[0].spans[0].content.trim();
+        // Index 0 is card-rail glyph (╭); the animated symbol is at index 1.
+        let animated_symbol = animated[0].spans[1].content.trim();
+        let low_motion_symbol = low_motion[0].spans[1].content.trim();
 
         // low_motion always pins to the first (static) frame.
         assert_eq!(low_motion_symbol, TOOL_RUNNING_SYMBOLS[0]);
@@ -3613,6 +4382,13 @@ mod tests {
         let lines = cell.lines(80);
         let head = &lines[0];
         assert_eq!(head.spans[0].content.as_ref(), USER_GLYPH);
+        assert_eq!(head.spans[0].style.fg, Some(palette::USER_BODY));
+        assert_eq!(head.style.bg, Some(palette::SURFACE_ELEVATED));
+        assert_eq!(head.width(), 80);
+        assert!(
+            head.spans.iter().any(|span| span.style.bg.is_none()),
+            "content spans should keep their own styles and inherit the line background"
+        );
         // No "You" literal anywhere in the rendered head line.
         let visible: String = head
             .spans
@@ -3621,6 +4397,66 @@ mod tests {
             .collect::<String>();
         assert!(!visible.contains("You"), "user label dropped: {visible:?}");
         assert!(visible.contains("hello"));
+    }
+
+    #[test]
+    fn user_cell_wraps_fill_transcript_rows() {
+        let cell = HistoryCell::User {
+            content: "hello world this prompt wraps onto multiple transcript lines".to_string(),
+        };
+        let lines = cell.lines(18);
+
+        assert!(lines.len() > 1, "expected wrapped user message");
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.style.bg == Some(palette::SURFACE_ELEVATED)),
+            "wrapped user message lines should keep the highlighted block background"
+        );
+        assert!(
+            lines.iter().all(|line| line.width() == 18),
+            "wrapped user message lines should fill the rendered row width"
+        );
+    }
+
+    #[test]
+    fn user_transcript_lines_do_not_append_visual_padding() {
+        let cell = HistoryCell::User {
+            content: "hello".to_string(),
+        };
+        let lines = cell.transcript_lines(80);
+        let head = &lines[0];
+        let visible: String = head.spans.iter().map(|s| s.content.as_ref()).collect();
+
+        assert_eq!(visible, format!("{USER_GLYPH} hello"));
+        assert!(head.width() < 80);
+        assert_eq!(head.style.bg, None);
+    }
+
+    #[test]
+    fn user_cell_renders_plain_text_without_markdown_interpretation() {
+        let cell = HistoryCell::User {
+            content: "  # heading\n- item\n   \nhello    world".to_string(),
+        };
+        let visible: Vec<String> = cell.lines(80).iter().map(line_text).collect();
+
+        assert_eq!(visible[0].trim_end(), format!("{USER_GLYPH}   # heading"));
+        assert!(
+            visible[1].trim_end().ends_with("- item"),
+            "dash-prefixed text must remain literal: {visible:?}"
+        );
+        assert!(
+            visible[2].ends_with("   "),
+            "whitespace-only lines must survive: {visible:?}"
+        );
+        assert!(
+            visible[3].trim_end().ends_with("hello    world"),
+            "internal spacing must remain literal: {visible:?}"
+        );
+        assert!(
+            !visible.iter().any(|line| line.contains('\u{2500}')),
+            "plain user heading must not add markdown heading rule: {visible:?}"
+        );
     }
 
     #[test]
@@ -3642,6 +4478,161 @@ mod tests {
             "assistant label dropped: {visible:?}"
         );
         assert!(visible.contains("ready"));
+        assert_ne!(head.style.bg, Some(palette::SURFACE_ELEVATED));
+    }
+
+    #[test]
+    fn whitespace_only_assistant_cell_renders_nothing() {
+        // Regression: a stray newline/space streamed between reasoning and a
+        // tool call produced a whitespace-only Assistant cell that rendered as
+        // a bare, orphaned role glyph — the "blue dot with nothing after it"
+        // artifact. It must collapse to zero lines instead.
+        for content in ["", "   ", "\n", "\n\n", " \t \n"] {
+            for streaming in [false, true] {
+                let cell = HistoryCell::Assistant {
+                    content: content.to_string(),
+                    streaming,
+                };
+                assert!(
+                    cell.lines(80).is_empty(),
+                    "whitespace-only assistant content {content:?} (streaming={streaming}) \
+                     must render no lines",
+                );
+            }
+        }
+
+        // Sanity: real prose still renders the role glyph as its first span.
+        let cell = HistoryCell::Assistant {
+            content: "hi".to_string(),
+            streaming: false,
+        };
+        assert_eq!(
+            cell.lines(80)[0].spans[0].content.as_ref(),
+            ASSISTANT_GLYPH,
+            "non-empty assistant content must still render the role glyph",
+        );
+    }
+
+    #[test]
+    fn assistant_cell_still_renders_markdown() {
+        let cell = HistoryCell::Assistant {
+            content: "# Heading\n\n- item".to_string(),
+            streaming: false,
+        };
+        let visible: Vec<String> = cell.lines(80).iter().map(line_text).collect();
+
+        assert!(
+            visible[0].contains("Heading"),
+            "assistant heading text should render: {visible:?}"
+        );
+        assert!(
+            !visible[0].contains("# Heading"),
+            "assistant heading should still be parsed as markdown: {visible:?}"
+        );
+        assert!(
+            visible.iter().any(|line| line.contains('\u{2500}')),
+            "assistant h1 markdown should still add a heading rule: {visible:?}"
+        );
+    }
+
+    #[test]
+    fn assistant_code_block_lines_do_not_get_transcript_rail() {
+        let cell = HistoryCell::Assistant {
+            content: "SQL:\n```sql\nSELECT\nFROM customers\n```".to_string(),
+            streaming: false,
+        };
+        let visible: Vec<String> = cell
+            .lines(80)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        assert_eq!(visible[0], format!("{ASSISTANT_GLYPH} SQL:"));
+        for line in visible
+            .iter()
+            .filter(|line| line.contains("SELECT") || line.contains("FROM customers"))
+        {
+            assert!(
+                !line.contains('\u{258F}'),
+                "code block line should not inherit the transcript rail: {line:?}"
+            );
+        }
+    }
+
+    /// Issue #1212 repro: a multi-line SQL fence rendered after a short
+    /// intro paragraph. Every code-block line — not just the first or last —
+    /// must avoid the `▏` rail.
+    #[test]
+    fn assistant_long_code_block_keeps_every_line_rail_free() {
+        let cell = HistoryCell::Assistant {
+            content: "Here's the query:\n```sql\nSELECT\n  c.customer_id,\n  c.name,\n  COUNT(o.order_id) AS order_count\nFROM customers c\nJOIN orders o ON c.customer_id = o.customer_id;\n```".to_string(),
+            streaming: false,
+        };
+        let visible: Vec<String> = cell
+            .lines(80)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        let code_markers = ["SELECT", "customer_id", "name,", "COUNT", "FROM", "JOIN"];
+        for marker in code_markers {
+            let line = visible
+                .iter()
+                .find(|line| line.contains(marker))
+                .unwrap_or_else(|| panic!("expected code line containing {marker:?}"));
+            assert!(
+                !line.contains('\u{258F}'),
+                "code block line containing {marker:?} must not have the transcript rail: {line:?}"
+            );
+        }
+    }
+
+    /// Edge case: a blank line inside a fence is still a code line; it must
+    /// not regress to the rail because the empty body falls through a
+    /// different wrap branch.
+    #[test]
+    fn assistant_code_block_blank_line_keeps_no_rail() {
+        let cell = HistoryCell::Assistant {
+            content: "```\nfn one() {}\n\nfn two() {}\n```".to_string(),
+            streaming: false,
+        };
+        for line in cell.lines(80).iter().skip(1) {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                !text.contains('\u{258F}'),
+                "fence body line must stay rail-free: {text:?}"
+            );
+        }
+    }
+
+    /// Wrapped code lines (a single source line longer than the viewport)
+    /// emit multiple rendered lines from one `Block::Code`. None of them
+    /// should leak the rail.
+    #[test]
+    fn assistant_wrapped_code_lines_keep_no_rail() {
+        let long = "let x = ".to_string() + &"abcdef ".repeat(40);
+        let content = format!("```\n{long}\n```");
+        let cell = HistoryCell::Assistant {
+            content,
+            streaming: false,
+        };
+        for line in cell.lines(40).iter().skip(1) {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                !text.contains('\u{258F}'),
+                "wrapped code line must stay rail-free: {text:?}"
+            );
+        }
     }
 
     #[test]
@@ -3689,10 +4680,13 @@ mod tests {
             command: "ls".to_string(),
             status: ToolStatus::Success,
             output: Some("a\nb\n".to_string()),
+            live_output: None,
+            shell_task_id: None,
             started_at: None,
             duration_ms: Some(10),
             source: ExecSource::Assistant,
             interaction: None,
+            output_summary: None,
         };
         let header = &cell.lines_with_motion(80, true)[0];
         let visible: String = header
@@ -3718,10 +4712,13 @@ mod tests {
             command: "cargo test --workspace --all-features".to_string(),
             status: ToolStatus::Running,
             output: None,
+            live_output: None,
+            shell_task_id: None,
             started_at: None,
             duration_ms: None,
             source: ExecSource::Assistant,
             interaction: None,
+            output_summary: None,
         };
 
         let header = &cell.lines_with_motion(80, true)[0];
@@ -3746,6 +4743,8 @@ mod tests {
             output: None,
             prompts: None,
             spillover_path: None,
+            output_summary: None,
+            is_diff: false,
         };
         let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
         let header_visible: String = lines[0]
@@ -3773,6 +4772,8 @@ mod tests {
             output: None,
             prompts: None,
             spillover_path: None,
+            output_summary: None,
+            is_diff: false,
         };
         let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
         let header_visible: String = lines[0]
@@ -3885,21 +4886,23 @@ mod tests {
     fn plan_update_cell_renders_with_dark_theme_tokens() {
         let theme = Theme::dark();
         let cell = PlanUpdateCell {
-            explanation: None,
-            steps: vec![
-                PlanStep {
-                    step: "scan repo".to_string(),
-                    status: "completed".to_string(),
-                },
-                PlanStep {
-                    step: "extract theme".to_string(),
-                    status: "in_progress".to_string(),
-                },
-                PlanStep {
-                    step: "land tests".to_string(),
-                    status: "pending".to_string(),
-                },
-            ],
+            snapshot: PlanSnapshot {
+                items: vec![
+                    crate::tools::plan::PlanItemArg {
+                        step: "scan repo".to_string(),
+                        status: StepStatus::Completed,
+                    },
+                    crate::tools::plan::PlanItemArg {
+                        step: "extract theme".to_string(),
+                        status: StepStatus::InProgress,
+                    },
+                    crate::tools::plan::PlanItemArg {
+                        step: "land tests".to_string(),
+                        status: StepStatus::Pending,
+                    },
+                ],
+                ..PlanSnapshot::default()
+            },
             status: ToolStatus::Running,
         };
 
@@ -3910,6 +4913,7 @@ mod tests {
         // Generic bullet glyph + "tool" verb. The shape and colour wiring
         // is what matters for the theme parity; the verb text moves with
         // the redesign.
+        // PlanUpdate does NOT use card-rail wrapping (separate render path).
         let header = &lines[0];
         let symbol_span = &header.spans[0];
         let glyph_span = &header.spans[1];
@@ -3974,25 +4978,74 @@ mod tests {
     }
 
     #[test]
+    fn plan_update_cell_renders_rich_artifact_metadata() {
+        let cell = PlanUpdateCell {
+            snapshot: PlanSnapshot {
+                objective: Some("Make Plan mode reviewable".to_string()),
+                context_summary: Some("Grounded in issue #2691".to_string()),
+                sources_used: vec!["gh issue view 2691".to_string()],
+                critical_files: vec!["crates/tui/src/tools/plan.rs".to_string()],
+                constraints: vec!["Keep checklist primary".to_string()],
+                recommended_approach: Some(
+                    "Enrich update_plan without breaking legacy calls".to_string(),
+                ),
+                verification_plan: Some("Run focused renderer tests".to_string()),
+                risks_and_unknowns: Some("Metadata-only plans can disappear".to_string()),
+                handoff_packet: Some("Next agent should inspect relay output".to_string()),
+                items: vec![crate::tools::plan::PlanItemArg {
+                    step: "Render artifact sections".to_string(),
+                    status: StepStatus::InProgress,
+                }],
+                ..PlanSnapshot::default()
+            },
+            status: ToolStatus::Success,
+        };
+
+        let visible = cell
+            .lines_with_motion(120, true)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(visible.contains("objective:"));
+        assert!(visible.contains("Make Plan mode reviewable"));
+        assert!(visible.contains("source:"));
+        assert!(visible.contains("gh issue view 2691"));
+        assert!(visible.contains("file:"));
+        assert!(visible.contains("verify:"));
+        assert!(visible.contains("handoff:"));
+        assert!(visible.contains("Render artifact sections"));
+    }
+
+    #[test]
     fn exec_cell_failed_status_renders_with_dark_theme_tokens() {
         let theme = Theme::dark();
         let cell = ExecCell {
             command: "false".to_string(),
             status: ToolStatus::Failed,
             output: Some("boom".to_string()),
+            live_output: None,
+            shell_task_id: None,
             started_at: None,
             duration_ms: Some(42),
             source: ExecSource::Assistant,
             interaction: None,
+            output_summary: None,
         };
 
         let lines = cell.lines_with_motion(80, true);
 
         let header = &lines[0];
-        let symbol_span = &header.spans[0];
-        let glyph_span = &header.spans[1];
-        let title_span = &header.spans[2];
-        let state_span = &header.spans[4];
+        let symbol_span = &header.spans[1];
+        let glyph_span = &header.spans[2];
+        let title_span = &header.spans[3];
+        let state_span = &header.spans[5];
 
         assert_eq!(
             symbol_span.style.fg,
@@ -4018,10 +5071,10 @@ mod tests {
 
     // === display_lines (lines_with_options) vs transcript_lines parity ===
     //
-    // These lock the contract for CX#8: live view compresses thinking and
-    // caps tool output, transcript view shows the full body. Both surfaces
-    // must contain the first paragraph / first line of the underlying
-    // content so users never lose the lede.
+    // These lock the contract for CX#8: live view keeps reasoning compact
+    // and caps tool output, transcript view shows the full body. Completed
+    // reasoning without an explicit Summary stays out of the main flow so it
+    // cannot masquerade as user text.
 
     fn line_text(line: &ratatui::text::Line<'static>) -> String {
         line.spans
@@ -4035,10 +5088,54 @@ mod tests {
     }
 
     #[test]
+    fn exec_cell_renders_live_shell_output_before_final_output() {
+        let cell = ExecCell {
+            command: "cargo test".to_string(),
+            status: ToolStatus::Running,
+            output: None,
+            live_output: Some("running line 1\nrunning line 2".to_string()),
+            shell_task_id: Some("shell_live".to_string()),
+            started_at: None,
+            duration_ms: None,
+            source: ExecSource::Assistant,
+            interaction: None,
+            output_summary: None,
+        };
+
+        let text = lines_text(&cell.lines_with_motion(80, true));
+
+        assert!(text.contains("running line 1"));
+        assert!(text.contains("running line 2"));
+        assert!(!text.contains("Ctrl+B backgrounds this command"));
+    }
+
+    #[test]
+    fn exec_cell_prefers_final_output_over_live_shell_tail() {
+        let cell = ExecCell {
+            command: "cargo test".to_string(),
+            status: ToolStatus::Success,
+            output: Some("final output".to_string()),
+            live_output: Some("stale live tail".to_string()),
+            shell_task_id: Some("shell_live".to_string()),
+            started_at: None,
+            duration_ms: None,
+            source: ExecSource::Assistant,
+            interaction: None,
+            output_summary: None,
+        };
+
+        let text = lines_text(&cell.lines_with_motion(80, true));
+
+        assert!(text.contains("final output"));
+        assert!(!text.contains("stale live tail"));
+    }
+
+    #[test]
     fn long_thinking_display_is_shorter_than_transcript() {
         // Build a multi-paragraph thinking body so the live view has
-        // something to compress. The first paragraph is the lede; both
-        // surfaces must keep it.
+        // something to compress. Without an explicit Summary block, the live
+        // surface should show a bounded preview plus affordance; Ctrl+O
+        // remains the path to the full body.
         let body = "First paragraph lede.\n\
                     Second sentence of the first paragraph.\n\n\
                     Second paragraph: deeper analysis follows.\n\
@@ -4073,12 +5170,12 @@ mod tests {
         let transcript_text = lines_text(&transcript);
 
         assert!(
-            live_text.contains("First paragraph lede"),
-            "live thinking must keep the lede: {live_text}"
-        );
-        assert!(
             transcript_text.contains("First paragraph lede"),
             "transcript thinking must keep the lede"
+        );
+        assert!(
+            live_text.contains("First paragraph lede"),
+            "live thinking should preview completed reasoning: {live_text}"
         );
         assert!(
             transcript_text.contains("Fourth paragraph"),
@@ -4089,19 +5186,20 @@ mod tests {
             "live thinking must drop the tail when collapsed"
         );
         assert!(
-            live_text.contains("press Ctrl+O for full text"),
+            live_text.contains("Full reasoning in Ctrl+O"),
             "live thinking must offer the pager affordance"
         );
         assert!(
-            !transcript_text.contains("press Ctrl+O for full text"),
+            !transcript_text.contains("Full reasoning in Ctrl+O"),
             "transcript thinking must not include the live affordance"
         );
     }
 
     #[test]
-    fn short_thinking_display_equals_transcript() {
-        // A single-line thinking body has nothing to compress; live and
-        // transcript surfaces should agree.
+    fn completed_short_thinking_without_summary_stays_visible_in_live_view() {
+        // Short completed reasoning should not become a dead "Full reasoning
+        // in Ctrl+O" card. The reasoning rail and tint already distinguish it
+        // from the user's prompt, so show the useful body inline.
         let cell = HistoryCell::Thinking {
             content: "One brief reasoning step.".to_string(),
             streaming: false,
@@ -4120,22 +5218,24 @@ mod tests {
         let live_text = lines_text(&live);
         let transcript_text = lines_text(&transcript);
 
-        assert_eq!(
-            live_text, transcript_text,
-            "short thinking must render identically on both surfaces"
+        assert!(
+            live_text.contains("One brief reasoning step."),
+            "live thinking must preview short completed reasoning: {live_text}"
         );
         assert!(
-            !live_text.contains("press Ctrl+O for full text"),
-            "short thinking must not show the collapse affordance"
+            transcript_text.contains("One brief reasoning step."),
+            "transcript thinking must keep the full reasoning body"
+        );
+        assert!(
+            !live_text.contains("Full reasoning in Ctrl+O"),
+            "complete short reasoning should not need the detail affordance: {live_text}"
         );
     }
 
     #[test]
     fn tool_exec_live_caps_output_transcript_does_not() {
-        // Synthesize an exec output that comfortably exceeds the live cap
-        // (TOOL_OUTPUT_LINE_LIMIT = 6). The live view should hit the cap
-        // and emit a "+N more lines; press v for details" affordance; the
-        // transcript view should emit every wrapped line uncapped.
+        // Live mode renders head+tail with card-rail wrapping and "Alt+V" affordance.
+        // Transcript mode emits the full output uncapped.
         let total_output_lines = 30usize;
         let output = (0..total_output_lines)
             .map(|i| format!("output line {i:02}"))
@@ -4146,10 +5246,13 @@ mod tests {
             command: "noisy_script.sh".to_string(),
             status: ToolStatus::Success,
             output: Some(output),
+            live_output: None,
+            shell_task_id: None,
             started_at: None,
             duration_ms: Some(120),
             source: ExecSource::Assistant,
             interaction: None,
+            output_summary: None,
         }));
 
         let live = cell.lines_with_options(
@@ -4172,14 +5275,12 @@ mod tests {
         );
         assert!(
             live_text.contains("Alt+V for details"),
-            "live exec output must surface the pager affordance: {live_text}"
+            "live exec output must surface the expand affordance: {live_text}"
         );
         assert!(
             !transcript_text.contains("Alt+V for details"),
-            "transcript exec output must not include the pager affordance"
+            "transcript exec output must not include the expand affordance"
         );
-        // First line is always emitted on both surfaces.
-        assert!(live_text.contains("output line 00"));
         assert!(transcript_text.contains("output line 00"));
         // The middle should only appear in the transcript, since the live
         // view truncates the head/tail around the cap.
@@ -4209,6 +5310,8 @@ mod tests {
                 "Diff this commit against main".to_string(),
             ]),
             spillover_path: None,
+            output_summary: None,
+            is_diff: false,
         }));
         let text = lines_text(&cell.lines(80));
 
@@ -4234,9 +5337,78 @@ mod tests {
             output: None,
             prompts: None,
             spillover_path: None,
+            output_summary: None,
+            is_diff: false,
         }));
         let text = lines_text(&cell.lines(80));
         assert!(text.contains("query: foo"));
+    }
+
+    #[test]
+    fn known_generic_tool_hides_raw_name_in_live_mode() {
+        let cell = HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "run_verifiers".to_string(),
+            status: ToolStatus::Running,
+            input_summary: Some("profile: auto, level: quick".to_string()),
+            output: None,
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        }));
+
+        let text = lines_text(&cell.lines(80));
+        assert!(text.contains("verify running"), "{text}");
+        assert!(text.contains("profile: auto"), "{text}");
+        assert!(
+            !text.contains("name: run_verifiers"),
+            "live card should not spend a row on internal tool id: {text}"
+        );
+        assert!(
+            !text.contains("run_verifiers"),
+            "known tool id should not leak into compact live card: {text}"
+        );
+    }
+
+    #[test]
+    fn known_generic_tool_keeps_raw_name_in_transcript_mode() {
+        let cell = HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "run_verifiers".to_string(),
+            status: ToolStatus::Running,
+            input_summary: Some("profile: auto, level: quick".to_string()),
+            output: None,
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        }));
+
+        let text = lines_text(&cell.transcript_lines(80));
+        assert!(text.contains("verify running"), "{text}");
+        assert!(
+            text.contains("name: run_verifiers"),
+            "transcript replay should preserve exact tool id: {text}"
+        );
+    }
+
+    #[test]
+    fn unknown_generic_tool_keeps_raw_name_in_live_mode() {
+        let cell = HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "future_private_tool".to_string(),
+            status: ToolStatus::Running,
+            input_summary: Some("query: foo".to_string()),
+            output: None,
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        }));
+
+        let text = lines_text(&cell.lines(80));
+        assert!(
+            text.contains("name: future_private_tool"),
+            "unknown tools should remain identifiable: {text}"
+        );
     }
 
     #[test]
@@ -4257,6 +5429,8 @@ mod tests {
             output: Some(diff_stat.to_string()),
             prompts: None,
             spillover_path: None,
+            output_summary: None,
+            is_diff: false,
         }));
 
         let transcript_text = lines_text(&cell.transcript_lines(80));
@@ -4307,6 +5481,8 @@ mod tests {
             output: Some(output),
             prompts: None,
             spillover_path: None,
+            output_summary: None,
+            is_diff: false,
         }));
 
         let live = cell.lines_with_options(80, TranscriptRenderOptions::default());
@@ -4323,14 +5499,12 @@ mod tests {
             live_text.contains("Alt+V for details"),
             "live view must show pager affordance: {live_text}"
         );
-        // First line shows up in both; later rows only in transcript.
-        assert!(live_text.contains("row 00"));
         let transcript_text = lines_text(&transcript);
         assert!(transcript_text.contains("row 29"));
     }
 
     #[test]
-    fn generic_tool_output_live_keeps_tail_and_omitted_count() {
+    fn generic_tool_output_live_renders_card_rail() {
         let output = (0..24usize)
             .map(|i| format!("line {i:02}"))
             .collect::<Vec<_>>()
@@ -4342,22 +5516,25 @@ mod tests {
             output: Some(output),
             prompts: None,
             spillover_path: None,
+            output_summary: None,
+            is_diff: false,
         }));
 
         let live_text =
             lines_text(&cell.lines_with_options(80, TranscriptRenderOptions::default()));
 
+        // Card-rail wrapping: first line starts with ╭, last with ╰.
+        assert!(
+            live_text.starts_with('\u{256D}'),
+            "live view must start with card-rail top glyph ╭: {live_text}"
+        );
+        assert!(live_text.contains("Alt+V for details"));
         assert!(live_text.contains("line 00"));
         assert!(live_text.contains("line 23"));
-        assert!(live_text.contains("lines omitted; Alt+V for details"));
-        assert!(
-            !live_text.contains("line 12"),
-            "middle plain output should stay omitted in live view: {live_text}"
-        );
     }
 
     #[test]
-    fn tool_output_live_preserves_error_and_path_lines_from_middle() {
+    fn tool_output_live_preserves_error_card_rail() {
         let output = [
             "start",
             "still starting",
@@ -4377,15 +5554,23 @@ mod tests {
             output: Some(output),
             prompts: None,
             spillover_path: None,
+            output_summary: Some("Error: failed to read config".to_string()),
+            is_diff: false,
         }));
 
         let live_text =
             lines_text(&cell.lines_with_options(80, TranscriptRenderOptions::default()));
 
-        assert!(live_text.contains("fatal: failed to read /tmp/deepseek/config.toml"));
-        assert!(live_text.contains("https://example.test/build/log"));
-        assert!(live_text.contains("final line"));
-        assert!(live_text.contains("lines omitted; Alt+V for details"));
+        // Live mode: one-line summary + expand affordance.
+        assert!(
+            live_text.contains("Alt+V for details"),
+            "live view must show expand affordance: {live_text}"
+        );
+        // The pre-computed summary captures the first meaningful content.
+        assert!(
+            live_text.contains("Error:") || live_text.contains("fatal:"),
+            "live summary should capture error text: {live_text}"
+        );
     }
 
     // === ErrorEnvelope severity → cell color tests (#66) ===
@@ -4468,5 +5653,145 @@ mod tests {
         let label_span = &lines[0].spans[0];
         assert_eq!(label_span.content.as_ref(), "Info");
         assert_eq!(label_span.style.fg, Some(palette::TEXT_DIM));
+    }
+
+    fn success_generic_tool(name: &str) -> HistoryCell {
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: name.to_string(),
+            status: ToolStatus::Success,
+            input_summary: Some(format!("args for {name}")),
+            output: Some(format!("output for {name}")),
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        }))
+    }
+
+    fn failed_generic_tool(name: &str) -> HistoryCell {
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: name.to_string(),
+            status: ToolStatus::Failed,
+            input_summary: None,
+            output: Some("failed".to_string()),
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        }))
+    }
+
+    fn running_generic_tool(name: &str) -> HistoryCell {
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: name.to_string(),
+            status: ToolStatus::Running,
+            input_summary: None,
+            output: None,
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        }))
+    }
+
+    fn shell_tool(command: &str) -> HistoryCell {
+        HistoryCell::Tool(ToolCell::Exec(ExecCell {
+            command: command.to_string(),
+            status: ToolStatus::Success,
+            output: Some("ok".to_string()),
+            live_output: None,
+            shell_task_id: None,
+            started_at: None,
+            duration_ms: None,
+            source: ExecSource::Assistant,
+            interaction: None,
+            output_summary: None,
+        }))
+    }
+
+    #[test]
+    fn detect_tool_runs_finds_contiguous_successful_safe_tools() {
+        let history = vec![
+            HistoryCell::User {
+                content: "go".to_string(),
+            },
+            success_generic_tool("read_file"),
+            success_generic_tool("list_dir"),
+            success_generic_tool("web_search"),
+            HistoryCell::Assistant {
+                content: "done".to_string(),
+                streaming: false,
+            },
+        ];
+
+        let runs = super::detect_tool_runs(&history, 3);
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].start, 1);
+        assert_eq!(runs[0].count, 3);
+        assert_eq!(
+            runs[0].tool_families,
+            vec!["read_file", "list_dir", "web_search"]
+        );
+    }
+
+    #[test]
+    fn detect_tool_runs_honors_threshold_and_boundaries() {
+        let short = vec![
+            success_generic_tool("read_file"),
+            success_generic_tool("list_dir"),
+        ];
+        assert!(super::detect_tool_runs(&short, 3).is_empty());
+
+        let with_assistant_boundary = vec![
+            success_generic_tool("read_file"),
+            HistoryCell::Assistant {
+                content: "pause".to_string(),
+                streaming: false,
+            },
+            success_generic_tool("list_dir"),
+            success_generic_tool("web_search"),
+        ];
+        assert!(super::detect_tool_runs(&with_assistant_boundary, 3).is_empty());
+    }
+
+    #[test]
+    fn detect_tool_runs_keeps_failed_running_and_shell_cells_visible() {
+        let history = vec![
+            success_generic_tool("read_file"),
+            success_generic_tool("list_dir"),
+            failed_generic_tool("web_search"),
+            success_generic_tool("read_file"),
+            success_generic_tool("list_dir"),
+            running_generic_tool("web_search"),
+            success_generic_tool("read_file"),
+            success_generic_tool("list_dir"),
+            shell_tool("rm -rf target"),
+            success_generic_tool("read_file"),
+            success_generic_tool("list_dir"),
+            success_generic_tool("web_search"),
+        ];
+
+        let runs = super::detect_tool_runs(&history, 3);
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].start, 9);
+        assert_eq!(runs[0].count, 3);
+    }
+
+    #[test]
+    fn tool_run_summary_reports_compact_success_group() {
+        let run = super::ToolRun {
+            start: 4,
+            count: 5,
+            tool_families: vec!["read_file".to_string(), "list_dir".to_string()],
+        };
+
+        let summary = super::tool_run_summary(&run);
+
+        assert!(summary.contains("5 tools"));
+        assert!(summary.contains("read_file"));
+        assert!(summary.contains("list_dir"));
+        assert!(summary.contains("all ok"));
     }
 }

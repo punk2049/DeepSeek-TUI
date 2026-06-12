@@ -6,6 +6,30 @@
 //! checkpoints, and loop termination.
 
 use super::*;
+use crate::prompt_zones::PinnedPrefix;
+
+fn loop_guard_block_tool_result(message: String) -> ToolResult {
+    ToolResult::error(message).with_metadata(json!({"loop_guard": "identical_tool_call"}))
+}
+
+const MAX_APPROVAL_INTENT_SUMMARY_CHARS: usize = 2_000;
+
+fn approval_intent_summary(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut chars = trimmed.chars();
+    let mut summary = chars
+        .by_ref()
+        .take(MAX_APPROVAL_INTENT_SUMMARY_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        summary.push_str("...");
+    }
+    Some(summary)
+}
 
 impl Engine {
     pub(super) async fn handle_deepseek_turn(
@@ -16,6 +40,11 @@ impl Engine {
         mode: AppMode,
         force_update_plan_first: bool,
     ) -> (TurnOutcomeStatus, Option<String>) {
+        // Signal to the terminal / taskbar that a turn is in progress
+        // (OSC 9 ; 4 indeterminate progress + title spinner).
+        crate::tui::notifications::set_taskbar_progress_busy();
+        crate::tui::notifications::start_title_animation("CodeWhale");
+
         let client = self
             .deepseek_client
             .clone()
@@ -26,22 +55,28 @@ impl Engine {
         let mut context_recovery_attempts = 0u8;
         let mut tool_catalog = tools.unwrap_or_default();
         if !tool_catalog.is_empty() {
-            ensure_advanced_tooling(&mut tool_catalog);
+            ensure_advanced_tooling(&mut tool_catalog, mode, &self.config.tools_always_load);
+            // Provider-specific first-turn surface (e.g. Arcee's Cloudflare WAF
+            // rejects CodeWhale's full agent catalog). Runs after advanced
+            // tooling so code/js-execution and tool-search rows are policed too.
+            apply_provider_tool_policy(
+                &mut tool_catalog,
+                client.api_provider(),
+                &self.config.tools_always_load,
+            );
         }
         let mut active_tool_names = initial_active_tools(&tool_catalog);
         let mut loop_guard = LoopGuard::default();
+        let mut goal_continuations_this_turn = 0u32;
 
-        // Transparent stream-retry counter: when the chunked-transfer
-        // connection dies mid-stream and we got nothing useful out of it
-        // (no tool calls, no completed text), we silently re-issue the
-        // SAME request up to MAX_STREAM_RETRIES times before surfacing
-        // the failure to the user. This is the #103 Phase 3 retry that
-        // keeps long V4 thinking turns from being killed by transient
-        // proxy disconnects.
-        const MAX_STREAM_RETRIES: u32 = 3;
+        // Outer stream-retry counter: when the chunked-transfer connection
+        // dies mid-stream and either nothing useful was streamed (#103
+        // Phase 3) or the host slept mid-turn (#2990), we silently re-issue
+        // the SAME request up to MAX_STREAM_RETRIES times before surfacing
+        // the failure to the user.
         let mut stream_retry_attempts: u32 = 0;
 
-        loop {
+        'turn_loop: loop {
             if self.cancel_token.is_cancelled() {
                 let _ = self.tx_event.send(Event::status("Request cancelled")).await;
                 return (TurnOutcomeStatus::Interrupted, None);
@@ -67,7 +102,7 @@ impl Engine {
             }
 
             // Ensure system prompt is up to date with latest session states
-            self.refresh_system_prompt(mode);
+            self.refresh_system_prompt();
 
             if turn.at_max_steps() {
                 let _ = self
@@ -118,7 +153,7 @@ impl Engine {
                         // Only update if we got valid messages (never corrupt state)
                         if !result.messages.is_empty() || self.session.messages.is_empty() {
                             let auto_messages_after = result.messages.len();
-                            self.session.messages = result.messages;
+                            self.session.messages = result.messages.into();
                             self.merge_compaction_summary(result.summary_prompt);
                             self.emit_session_updated().await;
                             let removed = auto_messages_before.saturating_sub(auto_messages_after);
@@ -169,16 +204,13 @@ impl Engine {
                 continue;
             }
 
-            if let Some(input_budget) =
-                context_input_budget(&self.session.model, TURN_MAX_OUTPUT_TOKENS)
-            {
+            if let Some(input_budget) = context_input_budget(&self.session.model) {
                 let estimated_input = self.estimated_input_tokens();
                 if estimated_input > input_budget {
                     if context_recovery_attempts >= MAX_CONTEXT_RECOVERY_ATTEMPTS {
                         let message = format!(
-                            "Context remains above model limit after {} recovery attempts \
-                             (~{} token estimate, ~{} budget). Please run /compact or /clear.",
-                            MAX_CONTEXT_RECOVERY_ATTEMPTS, estimated_input, input_budget
+                            "Context remains above model limit after {MAX_CONTEXT_RECOVERY_ATTEMPTS} recovery attempts \
+                             (~{estimated_input} token estimate, ~{input_budget} budget). Please run /compact or /clear."
                         );
                         turn_error = Some(message.clone());
                         let _ = self
@@ -189,11 +221,7 @@ impl Engine {
                     }
 
                     if self
-                        .recover_context_overflow(
-                            &client,
-                            "preflight token budget",
-                            TURN_MAX_OUTPUT_TOKENS,
-                        )
+                        .recover_context_overflow(&client, "preflight token budget")
                         .await
                     {
                         context_recovery_attempts = context_recovery_attempts.saturating_add(1);
@@ -235,6 +263,104 @@ impl Engine {
                 &self.session.messages,
             );
 
+            // Check prefix-cache stability before building the request.
+            // This detects system-prompt or tool-set drift that would
+            // invalidate DeepSeek's KV prefix cache for this turn.
+            // Sends an event on EVERY check so the TUI can maintain
+            // its own counter for the stable-checks tally.
+            if let Some(pm) = self.session.prefix_stability.as_mut() {
+                let system_text =
+                    crate::prefix_cache::system_prompt_text(self.session.system_prompt.as_ref());
+                let tools_ref: Option<&[crate::models::Tool]> = active_tools.as_deref();
+                match pm.check_and_update(&system_text, tools_ref) {
+                    Err(change) => {
+                        let pinned_hash = pm
+                            .pinned_fingerprint()
+                            .map(|fp| fp.combined_sha256.clone())
+                            .unwrap_or_default();
+                        tracing::debug!(
+                            target: "prefix_cache",
+                            "{}",
+                            change.description()
+                        );
+                        let _ = self
+                            .tx_event
+                            .send(Event::PrefixCacheChange {
+                                description: change.description(),
+                                system_prompt_changed: change.system_changed,
+                                tools_changed: change.tools_changed,
+                                stability_pct: (pm.stability_ratio() * 100.0).round() as u32,
+                                changed: true,
+                                pinned_combined_hash: pinned_hash,
+                            })
+                            .await;
+                    }
+                    Ok(_) => {
+                        let pinned_hash = pm
+                            .pinned_fingerprint()
+                            .map(|fp| fp.combined_sha256.clone())
+                            .unwrap_or_default();
+                        // Stable check — keep the TUI counter in sync.
+                        let _ = self
+                            .tx_event
+                            .send(Event::PrefixCacheChange {
+                                description: String::new(),
+                                system_prompt_changed: false,
+                                tools_changed: false,
+                                stability_pct: (pm.stability_ratio() * 100.0).round() as u32,
+                                changed: false,
+                                pinned_combined_hash: pinned_hash,
+                            })
+                            .await;
+                    }
+                }
+            }
+
+            // Three-zone prefix contract (#2264): freeze baseline on first
+            // turn, verify against it on subsequent turns. Operates alongside
+            // PrefixStabilityManager as an independent diagnostic layer.
+            // Phase 3: emit a one-shot 'frozen' event on first turn.
+            // Drift is logged (tracing::debug!) but not re-emitted —
+            // PrefixStabilityManager already reports the change above.
+            let system_text =
+                crate::prefix_cache::system_prompt_text(self.session.system_prompt.as_ref());
+            let current_tools: &[crate::models::Tool] = active_tools.as_deref().unwrap_or_default();
+
+            match &self.session.frozen_prefix {
+                Some(frozen) => {
+                    if let Err(drift) = frozen.verify(&system_text, current_tools) {
+                        tracing::debug!(
+                            target: "prefix_cache",
+                            "three-zone drift: {drift}"
+                        );
+                        let pinned = PinnedPrefix::new(
+                            self.session.system_prompt.as_ref(),
+                            current_tools.to_vec(),
+                        );
+                        self.session.frozen_prefix = Some(pinned.freeze());
+                    }
+                }
+                None => {
+                    let pinned = PinnedPrefix::new(
+                        self.session.system_prompt.as_ref(),
+                        current_tools.to_vec(),
+                    );
+                    let frozen = pinned.freeze();
+                    let _ = self
+                        .tx_event
+                        .send(Event::PrefixCacheChange {
+                            description: format!("frozen: {}", frozen.short_id()),
+                            system_prompt_changed: false,
+                            tools_changed: false,
+                            stability_pct: 100,
+                            changed: false,
+                            pinned_combined_hash: frozen.hash().to_string(),
+                        })
+                        .await;
+                    self.session.frozen_prefix = Some(frozen);
+                }
+            }
+
             let request = MessageRequest {
                 model: self.session.model.clone(),
                 messages: self.messages_with_turn_metadata(),
@@ -262,7 +388,14 @@ impl Engine {
             // first call) so we can resend it on a transparent retry below
             // when the wire dies before any content was streamed (#103).
             let stream_request = request;
-            let stream_result = client.create_message_stream(stream_request.clone()).await;
+            let stream_result = tokio::select! {
+                biased;
+                () = self.cancel_token.cancelled() => {
+                    let _ = self.tx_event.send(Event::status("Request cancelled")).await;
+                    return (TurnOutcomeStatus::Interrupted, None);
+                }
+                result = client.create_message_stream(stream_request.clone()) => result,
+            };
             let stream = match stream_result {
                 Ok(s) => {
                     context_recovery_attempts = 0;
@@ -273,11 +406,7 @@ impl Engine {
                     if is_context_length_error_message(&message)
                         && context_recovery_attempts < MAX_CONTEXT_RECOVERY_ATTEMPTS
                         && self
-                            .recover_context_overflow(
-                                &client,
-                                "provider context-length rejection",
-                                TURN_MAX_OUTPUT_TOKENS,
-                            )
+                            .recover_context_overflow(&client, "provider context-length rejection")
                             .await
                     {
                         context_recovery_attempts = context_recovery_attempts.saturating_add(1);
@@ -301,6 +430,9 @@ impl Engine {
             let mut current_text_raw = String::new();
             let mut current_text_visible = String::new();
             let mut current_thinking = String::new();
+            // #3014: Anthropic signed-thinking signature for the current
+            // thinking block; must be replayed verbatim in tool loops.
+            let mut current_thinking_signature: Option<String> = None;
             let mut tool_uses: Vec<ToolUseState> = Vec::new();
             let mut usage = Usage {
                 input_tokens: 0,
@@ -308,7 +440,17 @@ impl Engine {
                 ..Usage::default()
             };
             let mut current_block_kind: Option<ContentBlockKind> = None;
-            let mut current_tool_index: Option<usize> = None;
+            // Map block_index → tool_uses position. Required because the
+            // OpenAI-compatible streaming parser emits multiple
+            // ContentBlockStart::ToolUse events back-to-back (one per
+            // tool_call in a batch) before any ContentBlockStop arrives —
+            // all Stops are flushed together at `finish_reason`. A single
+            // Option<usize> gets overwritten by each new Start; the first
+            // Stop then takes the last index, and every subsequent Stop
+            // takes `None`, dropping ToolCallStarted events for every
+            // tool call except the last one in the batch.
+            let mut current_tool_indices: std::collections::HashMap<u32, usize> =
+                std::collections::HashMap::new();
             let mut in_tool_call_block = false;
             let mut fake_wrapper_notice_emitted = false;
             let mut pending_message_complete = false;
@@ -326,14 +468,21 @@ impl Engine {
             // `stream_start` is reset on a transparent retry so the wall-clock
             // budget restarts with the fresh stream.
             let mut stream_start = Instant::now();
+            // #2990 sleep-resume bookkeeping: monotonic and wall-clock stamps
+            // of the last stream progress. `Instant` pauses across a host
+            // suspend while `SystemTime` does not, so a large divergence on
+            // the next error tells "machine slept" apart from "network died".
+            let mut last_progress_mono = Instant::now();
+            let mut last_progress_wall = std::time::SystemTime::now();
+            let mut sleep_resume_pending = false;
             let mut stream_content_bytes: usize = 0;
-            let chunk_timeout_secs = stream_chunk_timeout_secs();
-            let chunk_timeout = Duration::from_secs(chunk_timeout_secs);
+            let (chunk_timeout_secs, chunk_timeout) = stream_chunk_timeout_budget(&self.config);
             let max_duration = Duration::from_secs(STREAM_MAX_DURATION_SECS);
 
             // Process stream events
             loop {
                 let poll_outcome = tokio::select! {
+                    biased;
                     _ = self.cancel_token.cancelled() => None,
                     result = tokio::time::timeout(chunk_timeout, stream.next()) => {
                         match result {
@@ -399,6 +548,8 @@ impl Engine {
 
                 let event = match event_result {
                     Ok(e) => {
+                        last_progress_mono = Instant::now();
+                        last_progress_wall = std::time::SystemTime::now();
                         // Flip on the first non-MessageStart event — that's
                         // the moment we cross from "stream not yet productive"
                         // (eligible for transparent retry) into "DeepSeek has
@@ -411,6 +562,27 @@ impl Engine {
                     Err(e) => {
                         stream_errors = stream_errors.saturating_add(1);
                         let message = self.decorate_auth_error_message(e.to_string());
+                        // #2990: wall-clock far ahead of the monotonic clock
+                        // since the last chunk means the host slept mid-stream.
+                        // The partial output predates the sleep and the user
+                        // was not watching — schedule a full request retry in
+                        // the post-loop block instead of failing the turn.
+                        let wall_elapsed = last_progress_wall
+                            .elapsed()
+                            .unwrap_or_else(|_| last_progress_mono.elapsed());
+                        if should_resume_after_sleep(
+                            sleep_gap_detected(last_progress_mono.elapsed(), wall_elapsed),
+                            stream_retry_attempts,
+                            self.cancel_token.is_cancelled(),
+                        ) {
+                            crate::logging::warn(format!(
+                                "Stream error after suspected system sleep ({:?} monotonic vs {:?} wall since last chunk); scheduling request retry: {message}",
+                                last_progress_mono.elapsed(),
+                                wall_elapsed,
+                            ));
+                            sleep_resume_pending = true;
+                            break;
+                        }
                         // #103: when the stream errors before any content was
                         // streamed AND we still have retry budget, transparently
                         // resend the request. DeepSeek has not billed for any
@@ -424,13 +596,17 @@ impl Engine {
                             transparent_stream_retries =
                                 transparent_stream_retries.saturating_add(1);
                             crate::logging::info(format!(
-                                "Transparent stream retry {}/{} (no content received yet): {}",
-                                transparent_stream_retries, MAX_TRANSPARENT_STREAM_RETRIES, message,
+                                "Transparent stream retry {transparent_stream_retries}/{MAX_TRANSPARENT_STREAM_RETRIES} (no content received yet): {message}",
                             ));
                             // Drop the failed stream before issuing the new
                             // request to release the underlying connection.
                             drop(stream);
-                            match client.create_message_stream(stream_request.clone()).await {
+                            let retry_stream_result = tokio::select! {
+                                biased;
+                                () = self.cancel_token.cancelled() => break,
+                                result = client.create_message_stream(stream_request.clone()) => result,
+                            };
+                            match retry_stream_result {
                                 Ok(fresh) => {
                                     stream = fresh;
                                     stream_start = Instant::now();
@@ -515,11 +691,10 @@ impl Engine {
                             caller,
                         } => {
                             crate::logging::info(format!(
-                                "Tool '{}' block start. Initial input: {:?}",
-                                name, input
+                                "Tool '{name}' block start. Initial input: {input:?}"
                             ));
                             current_block_kind = Some(ContentBlockKind::ToolUse);
-                            current_tool_index = Some(tool_uses.len());
+                            current_tool_indices.insert(index, tool_uses.len());
                             // ToolCallStarted is deferred to ContentBlockStop —
                             // see `final_tool_input`. Emitting here would ship
                             // the placeholder `{}` and the cell would render
@@ -534,11 +709,10 @@ impl Engine {
                         }
                         ContentBlockStart::ServerToolUse { id, name, input } => {
                             crate::logging::info(format!(
-                                "Server tool '{}' block start. Initial input: {:?}",
-                                name, input
+                                "Server tool '{name}' block start. Initial input: {input:?}"
                             ));
                             current_block_kind = Some(ContentBlockKind::ToolUse);
-                            current_tool_index = Some(tool_uses.len());
+                            current_tool_indices.insert(index, tool_uses.len());
                             tool_uses.push(ToolUseState {
                                 id,
                                 name,
@@ -586,9 +760,17 @@ impl Engine {
                                     .await;
                             }
                         }
+                        Delta::SignatureDelta { signature } => {
+                            // #3014: capture (and concatenate, defensively)
+                            // the signed-thinking signature for replay.
+                            match current_thinking_signature.as_mut() {
+                                Some(existing) => existing.push_str(&signature),
+                                None => current_thinking_signature = Some(signature),
+                            }
+                        }
                         Delta::InputJsonDelta { partial_json } => {
-                            if let Some(index) = current_tool_index
-                                && let Some(tool_state) = tool_uses.get_mut(index)
+                            if let Some(&tool_idx) = current_tool_indices.get(&index)
+                                && let Some(tool_state) = tool_uses.get_mut(tool_idx)
                             {
                                 tool_state.input_buffer.push_str(&partial_json);
                                 crate::logging::info(format!(
@@ -622,9 +804,15 @@ impl Engine {
                             }
                             Some(ContentBlockKind::ToolUse) | None => {}
                         }
-                        if matches!(stopped_kind, Some(ContentBlockKind::ToolUse))
-                            && let Some(index) = current_tool_index.take()
-                            && let Some(tool_state) = tool_uses.get_mut(index)
+                        // Route the Stop using event.index (via
+                        // `current_tool_indices`) rather than the single
+                        // `current_block_kind` slot. In an OpenAI batch
+                        // tool-call stream every Stop after the first sees
+                        // `stopped_kind = None` because `take()` cleared the
+                        // slot, so the original `matches!(stopped_kind, …)`
+                        // check would skip every tool except the last.
+                        if let Some(tool_idx) = current_tool_indices.remove(&index)
+                            && let Some(tool_state) = tool_uses.get_mut(tool_idx)
                         {
                             crate::logging::info(format!(
                                 "Tool '{}' block stop. Buffer: '{}', Current input: {:?}",
@@ -680,7 +868,20 @@ impl Engine {
                         }
                     }
                     StreamEvent::MessageStop | StreamEvent::Ping => {}
+                    StreamEvent::Error { error } => {
+                        // #3014: Anthropic SSE error event. The adapter
+                        // surfaces fatal errors as stream Err items; this
+                        // defensive arm keeps any passed-through error
+                        // visible instead of silently dropped.
+                        crate::logging::warn(format!("Provider stream error event: {error}"));
+                        stream_errors += 1;
+                    }
                 }
+            }
+
+            if self.cancel_token.is_cancelled() {
+                let _ = self.tx_event.send(Event::status("Request cancelled")).await;
+                return (TurnOutcomeStatus::Interrupted, None);
             }
 
             // #103 Phase 3 — transparent retry. The inner loop above bails
@@ -696,20 +897,37 @@ impl Engine {
                 && current_text_visible.trim().is_empty()
                 && current_thinking.trim().is_empty()
                 && !pending_message_complete;
-            if stream_died_with_nothing {
+            if stream_died_with_nothing || sleep_resume_pending {
                 if stream_retry_attempts < MAX_STREAM_RETRIES {
                     stream_retry_attempts = stream_retry_attempts.saturating_add(1);
-                    crate::logging::warn(format!(
-                        "Stream died with no content (attempt {}/{}); retrying request",
-                        stream_retry_attempts, MAX_STREAM_RETRIES
-                    ));
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
-                            "Connection interrupted; retrying ({}/{})",
-                            stream_retry_attempts, MAX_STREAM_RETRIES
-                        )))
-                        .await;
+                    if sleep_resume_pending {
+                        crate::logging::warn(format!(
+                            "Resuming after system sleep (attempt {stream_retry_attempts}/{MAX_STREAM_RETRIES}); discarding partial output and retrying request"
+                        ));
+                        let _ = self
+                            .tx_event
+                            .send(Event::status(format!(
+                                "System sleep detected; connection lost — retrying request ({stream_retry_attempts}/{MAX_STREAM_RETRIES})"
+                            )))
+                            .await;
+                        // Finalize any partially-rendered assistant cell so
+                        // the retried stream renders fresh instead of
+                        // appending to the pre-sleep fragment.
+                        if pending_message_complete {
+                            let index = last_text_index.unwrap_or(0);
+                            let _ = self.tx_event.send(Event::MessageComplete { index }).await;
+                        }
+                    } else {
+                        crate::logging::warn(format!(
+                            "Stream died with no content (attempt {stream_retry_attempts}/{MAX_STREAM_RETRIES}); retrying request"
+                        ));
+                        let _ = self
+                            .tx_event
+                            .send(Event::status(format!(
+                                "Connection interrupted; retrying ({stream_retry_attempts}/{MAX_STREAM_RETRIES})"
+                            )))
+                            .await;
+                    }
                     // Don't preserve the per-stream `turn_error` — we're
                     // about to retry, and a successful retry should not
                     // surface the transient error as the turn outcome.
@@ -717,8 +935,7 @@ impl Engine {
                     continue;
                 }
                 crate::logging::warn(format!(
-                    "Stream retry budget exhausted ({} attempts); failing turn",
-                    stream_retry_attempts
+                    "Stream retry budget exhausted ({stream_retry_attempts} attempts); failing turn"
                 ));
             } else if stream_errors == 0 {
                 // Healthy round → reset retry budget so we don't carry over
@@ -746,7 +963,10 @@ impl Engine {
                 None
             };
             if let Some(thinking) = thinking_to_persist {
-                content_blocks.push(ContentBlock::Thinking { thinking });
+                content_blocks.push(ContentBlock::Thinking {
+                    thinking,
+                    signature: current_thinking_signature.clone(),
+                });
             }
             let mut final_text = current_text_visible.clone();
             if tool_uses.is_empty() && tool_parser::has_tool_call_markers(&current_text_raw) {
@@ -804,6 +1024,17 @@ impl Engine {
                 )
             });
 
+            // Issue #1727: did this turn produce ONLY a reasoning/thinking
+            // block — empty content, no tool calls (e.g. gpt-oss via ollama's
+            // harmony→OpenAI shim mapping to `reasoning_content`)? We do NOT
+            // surface anything here: after this point the same turn can still
+            // CONTINUE for pending steers (~below) or sub-agent completions,
+            // and emitting now would show a spurious "turn ended" notice right
+            // before the turn resumes. Capture the fact and decide later, at
+            // the point the turn is certain to be finishing with no sendable
+            // content (see the `tool_uses.is_empty()` tail).
+            let thinking_only_no_sendable = !has_sendable_assistant_content;
+
             // Add assistant message to session
             if has_sendable_assistant_content {
                 self.add_session_message(Message {
@@ -832,7 +1063,7 @@ impl Engine {
                 // streaming with no tool calls — but if it has direct children
                 // still running (or completions queued from children that
                 // finished while we were inferring), surface their
-                // `<deepseek:subagent.done>` sentinels into the transcript and
+                // `<codewhale:subagent.done>` sentinels into the transcript and
                 // resume instead of ending the turn. This fulfils the contract
                 // already documented in `prompts/base.md`: the parent is
                 // promised it'll see the sentinel when a child finishes.
@@ -841,11 +1072,14 @@ impl Engine {
                     completions.push(c);
                 }
                 if completions.is_empty() {
-                    let running = {
-                        let mgr = self.subagent_manager.read().await;
-                        mgr.running_count()
-                    };
-                    if running > 0 {
+                    loop {
+                        let running = {
+                            let mgr = self.subagent_manager.read().await;
+                            mgr.running_count()
+                        };
+                        if !should_hold_turn_for_subagents(completions.len(), running) {
+                            break;
+                        }
                         let _ = self
                             .tx_event
                             .send(Event::status(format!(
@@ -868,6 +1102,7 @@ impl Engine {
                                 while let Ok(extra) = self.rx_subagent_completion.try_recv() {
                                     completions.push(extra);
                                 }
+                                break;
                             }
                             Some(steer) = self.rx_steer.recv() => {
                                 let trimmed = steer.trim().to_string();
@@ -888,7 +1123,21 @@ impl Engine {
                                         .await;
                                 }
                                 turn.next_step();
-                                continue;
+                                continue 'turn_loop;
+                            }
+                            () = tokio::time::sleep(self.config.subagent_heartbeat_timeout) => {
+                                let auto_cancelled = {
+                                    let mut mgr = self.subagent_manager.write().await;
+                                    mgr.cleanup(std::time::Duration::from_secs(60 * 60))
+                                };
+                                if auto_cancelled > 0 {
+                                    let _ = self
+                                        .tx_event
+                                        .send(Event::status(format!(
+                                            "Auto-cancelled {auto_cancelled} stale sub-agent(s) after no progress"
+                                        )))
+                                        .await;
+                                }
                             }
                         }
                     }
@@ -1001,10 +1250,91 @@ impl Engine {
                     continue;
                 }
 
+                // Issue #1727: the turn is now genuinely finishing with no
+                // sendable content. Control only reaches here when there were
+                // no pending steers (`continue`d above), no sub-agent
+                // completions to resume with, and we were not holding for
+                // running children (the `should_hold_turn_for_subagents`
+                // branch above would have awaited / `continue`d / returned).
+                // If the assistant produced ONLY a reasoning block, the prior
+                // code fell straight through to this `break`, emitting nothing
+                // and leaving the UI spinner hung. Surface a status now —
+                // safe because the turn can no longer resume.
+                // #1961: Before breaking, drain any sub-agent completions that
+                // arrived between the last hold check and now. If a child finished
+                // while we were running the thinking-only check, surface its
+                // sentinel rather than delaying it to the next turn.
+                let mut late_completions: Vec<crate::tools::subagent::SubAgentCompletion> =
+                    Vec::new();
+                while let Ok(c) = self.rx_subagent_completion.try_recv() {
+                    late_completions.push(c);
+                }
+                if !late_completions.is_empty() {
+                    let count = late_completions.len();
+                    for c in late_completions {
+                        self.add_session_message(subagent_completion_runtime_message(&c.payload))
+                            .await;
+                    }
+                    let _ = self
+                        .tx_event
+                        .send(Event::status(format!(
+                            "Resuming turn with {count} late sub-agent completion(s)"
+                        )))
+                        .await;
+                    turn.next_step();
+                    continue;
+                }
+
+                if let Some(continuation) = self
+                    .goal_continuation_message_if_needed(
+                        tool_registry,
+                        &mut goal_continuations_this_turn,
+                    )
+                    .await
+                {
+                    self.add_session_message(
+                        self.user_text_message_with_turn_metadata(continuation),
+                    )
+                    .await;
+                    turn.next_step();
+                    continue;
+                }
+
+                if thinking_only_no_sendable {
+                    let holding_for_subagents = {
+                        let running = {
+                            let mgr = self.subagent_manager.read().await;
+                            mgr.running_count()
+                        };
+                        should_hold_turn_for_subagents(0, running)
+                    };
+                    if should_emit_thinking_only_status(
+                        tool_uses.is_empty(),
+                        turn_error.is_none(),
+                        self.cancel_token.is_cancelled(),
+                        !pending_steers.is_empty(),
+                        holding_for_subagents,
+                    ) {
+                        let message = "Model returned reasoning but no answer or tool call; \
+                                       turn ended without output. Send a follow-up to retry."
+                            .to_string();
+                        crate::logging::warn(&message);
+                        let _ = self.tx_event.send(Event::status(message)).await;
+                    }
+                }
+
                 break;
             }
 
             // Execute tools
+            if self.shared_paused.lock().is_ok_and(|paused| *paused) {
+                let _ = self
+                    .tx_event
+                    .send(Event::status("Request was Paused"))
+                    .await;
+                return (TurnOutcomeStatus::Interrupted, None);
+            }
+
             let tool_exec_lock = self.tool_exec_lock.clone();
             let mcp_pool = if tool_uses
                 .iter()
@@ -1021,16 +1351,29 @@ impl Engine {
                 None
             };
 
+            let active_tools_at_batch_start = active_tool_names.clone();
+            let mut deferred_tools_hydrated_this_batch: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            // #3026: `additionalContext` strings from tool_call_before hooks,
+            // keyed by tool id; appended to the tool result sent to the model.
+            let mut hook_contexts: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             let mut plans: Vec<ToolExecutionPlan> = Vec::with_capacity(tool_uses.len());
             for (index, tool) in tool_uses.iter_mut().enumerate() {
                 let tool_id = tool.id.clone();
                 let mut tool_name = tool.name.clone();
-                let tool_input = tool.input.clone();
+                let mut tool_input = tool.input.clone();
                 let tool_caller = tool.caller.clone();
                 crate::logging::info(format!(
-                    "Planning tool '{}' with input: {:?}",
-                    tool_name, tool_input
+                    "Planning tool '{tool_name}' with input: {tool_input:?}"
                 ));
+
+                let requested_tool_name = tool_name.clone();
+                let tool_def =
+                    resolve_tool_definition(&mut tool_name, &tool_catalog, tool_registry);
+                if requested_tool_name != tool_name {
+                    tool.name = tool_name.clone();
+                }
 
                 let interactive = (tool_name == "exec_shell"
                     && tool_input
@@ -1045,55 +1388,49 @@ impl Engine {
                 let mut read_only = false;
                 let mut blocked_error: Option<ToolError> = None;
                 let mut guard_result: Option<ToolResult> = None;
-                if maybe_activate_requested_deferred_tool(
-                    &tool_name,
-                    &tool_catalog,
-                    &mut active_tool_names,
-                ) {
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
-                            "Auto-loaded deferred tool '{tool_name}' after model request."
-                        )))
-                        .await;
-                }
-                let mut tool_def = tool_catalog.iter().find(|def| def.name == tool_name);
+                // #3026: set by a hook `ask` decision; applied AFTER the
+                // registry-based approval computation below so it cannot be
+                // clobbered by it.
+                let mut hook_requires_approval = false;
 
-                // Resolve hallucinated tool names when the model emits a
-                // non-canonical variant (Read_file, readFile, read-file, etc.).
-                if tool_def.is_none()
-                    && let Some(registry) = tool_registry
-                    && let Some(canonical) = registry.resolve(&tool_name)
+                if mode == AppMode::Plan
+                    && matches!(
+                        tool_name.as_str(),
+                        "exec_shell"
+                            | "exec_shell_wait"
+                            | "exec_shell_interact"
+                            | "exec_wait"
+                            | "exec_interact"
+                            | CODE_EXECUTION_TOOL_NAME
+                            | JS_EXECUTION_TOOL_NAME
+                    )
                 {
-                    crate::logging::info(format!(
-                        "Resolved hallucinated tool name '{}' -> '{}'",
-                        tool_name, canonical
-                    ));
-                    tool_def = tool_catalog.iter().find(|d| d.name == canonical);
-                    if tool_def.is_some() {
-                        tool_name = canonical.to_string();
-                        // Update the tool_uses entry so the result is
-                        // attributed to the canonical name.
-                        tool.name = tool_name.clone();
-                        // Re-run the deferred-activation check with the
-                        // canonical name.
-                        if maybe_activate_requested_deferred_tool(
-                            &tool_name,
-                            &tool_catalog,
-                            &mut active_tool_names,
-                        ) {
-                            let _ = self
-                                .tx_event
-                                .send(Event::status(format!(
-                                    "Auto-loaded deferred tool '{}' after resolving '{}'.",
-                                    tool_name, tool_name
-                                )))
-                                .await;
-                        }
-                    }
+                    blocked_error = Some(ToolError::permission_denied(format!(
+                        "'{tool_name}' is not available in Plan mode — switch to Agent, Goal, or YOLO mode to run commands and code."
+                    )));
                 }
 
-                if !caller_allowed_for_tool(tool_caller.as_ref(), tool_def) {
+                // #3027: deny wins over allow — check the deny-list first so a
+                // tool present in both lists is still blocked.
+                if blocked_error.is_none()
+                    && command_denies_tool(self.config.disallowed_tools.as_deref(), &tool_name)
+                {
+                    blocked_error = Some(ToolError::permission_denied(format!(
+                        "Tool '{tool_name}' is in the disallowed-tools list"
+                    )));
+                }
+
+                if blocked_error.is_none()
+                    && !command_allows_tool(self.config.allowed_tools.as_deref(), &tool_name)
+                {
+                    blocked_error = Some(ToolError::permission_denied(format!(
+                        "Tool '{tool_name}' is not in the allowed-tools list for the current command"
+                    )));
+                }
+
+                if blocked_error.is_none()
+                    && !caller_allowed_for_tool(tool_caller.as_ref(), tool_def)
+                {
                     blocked_error = Some(ToolError::permission_denied(format!(
                         "Tool '{tool_name}' does not allow caller '{}'",
                         caller_type_for_tool_use(tool_caller.as_ref())
@@ -1104,12 +1441,71 @@ impl Engine {
                     && tool_def.is_none()
                     && !McpPool::is_mcp_tool(&tool_name)
                     && tool_name != CODE_EXECUTION_TOOL_NAME
+                    && tool_name != JS_EXECUTION_TOOL_NAME
                     && !is_tool_search_tool(&tool_name)
                 {
                     blocked_error = Some(ToolError::not_available(missing_tool_error_message(
                         &tool_name,
                         &tool_catalog,
                     )));
+                }
+
+                if blocked_error.is_none()
+                    && let Some(hook_executor) = self.config.hook_executor.as_ref()
+                    && hook_executor.has_hooks_for_event(crate::hooks::HookEvent::ToolCallBefore)
+                {
+                    // Warn if any ToolCallBefore hook is configured as background
+                    // — background hooks return exit_code: None immediately, so
+                    // the denial check (exit_code == Some(2)) can never match.
+                    if hook_executor
+                        .has_background_hooks_for_event(crate::hooks::HookEvent::ToolCallBefore)
+                    {
+                        tracing::warn!(
+                            "ToolCallBefore hook(s) configured with background=true — \
+                             background hooks cannot deny tool calls because they exit \
+                             immediately with no result"
+                        );
+                    }
+
+                    let hook_context = crate::hooks::HookContext::new()
+                        .with_tool_name(&tool_name)
+                        .with_tool_args(&tool_input)
+                        .with_mode(&format!("{mode:?}"))
+                        .with_workspace(self.session.workspace.clone())
+                        .with_model(&self.config.model)
+                        .with_session_id(&self.session.id);
+                    // Run hooks off the Tokio worker thread: `execute()` calls
+                    // `child.wait_timeout()` which is a blocking syscall that
+                    // would stall all other async tasks on this thread.
+                    let executor = hook_executor.clone();
+                    let hook_results = tokio::task::spawn_blocking(move || {
+                        executor.execute(crate::hooks::HookEvent::ToolCallBefore, &hook_context)
+                    })
+                    .await
+                    .unwrap_or_else(|join_err| {
+                        tracing::error!("Hook executor task panicked: {join_err}");
+                        Vec::new()
+                    });
+                    // #3026: fold all foreground hook results into one
+                    // decision: deny (exit code 2 or JSON) > ask > allow;
+                    // last `updatedInput` writer wins; `additionalContext`
+                    // strings are concatenated.
+                    let fold = fold_tool_call_before_results(&hook_results);
+                    if let Some(reason) = fold.deny_reason {
+                        blocked_error = Some(ToolError::permission_denied(format!(
+                            "ToolCallBefore hook denied tool '{tool_name}': {reason}"
+                        )));
+                    } else {
+                        if fold.requires_approval {
+                            hook_requires_approval = true;
+                        }
+                        if let Some(updated) = fold.updated_input {
+                            tool_input = updated;
+                        }
+                        if let Some(context) = fold.additional_context {
+                            hook_contexts.insert(tool_id.clone(), context);
+                        }
+                    }
                 }
 
                 if McpPool::is_mcp_tool(&tool_name) {
@@ -1130,6 +1526,13 @@ impl Engine {
                         "Run model-provided Python code in local execution sandbox".to_string();
                     supports_parallel = false;
                     read_only = false;
+                } else if tool_name == JS_EXECUTION_TOOL_NAME {
+                    approval_required = true;
+                    approval_description =
+                        "Run model-provided JavaScript code in local Node.js execution sandbox"
+                            .to_string();
+                    supports_parallel = false;
+                    read_only = false;
                 } else if is_tool_search_tool(&tool_name) {
                     approval_required = false;
                     approval_description = "Search tool catalog".to_string();
@@ -1137,15 +1540,45 @@ impl Engine {
                     read_only = true;
                 }
 
+                // #3026: a hook `ask` decision forces the approval prompt even
+                // for tools the registry would auto-run. Must stay after the
+                // registry-based computation above, which assigns rather than
+                // ORs `approval_required`.
+                if hook_requires_approval {
+                    approval_required = true;
+                }
+
+                let should_emit_hydration_status =
+                    !deferred_tools_hydrated_this_batch.contains(&tool_name);
                 if blocked_error.is_none()
+                    && let Some(result) = maybe_hydrate_requested_deferred_tool(
+                        &tool_name,
+                        &tool_input,
+                        &tool_catalog,
+                        &active_tools_at_batch_start,
+                        &mut deferred_tools_hydrated_this_batch,
+                    )
+                {
+                    if should_emit_hydration_status {
+                        let status = if requested_tool_name == tool_name {
+                            format!("Auto-loaded deferred tool '{tool_name}' after model request.")
+                        } else {
+                            format!(
+                                "Auto-loaded deferred tool '{tool_name}' after resolving '{requested_tool_name}'."
+                            )
+                        };
+                        let _ = self.tx_event.send(Event::status(status)).await;
+                    }
+                    guard_result = Some(result);
+                }
+
+                if blocked_error.is_none()
+                    && guard_result.is_none()
                     && let AttemptDecision::Block(message) =
                         loop_guard.record_attempt(&tool_name, &tool_input)
                 {
                     crate::logging::warn(message.clone());
-                    guard_result = Some(
-                        ToolResult::success(message)
-                            .with_metadata(json!({"loop_guard": "identical_tool_call"})),
-                    );
+                    guard_result = Some(loop_guard_block_tool_result(message));
                 }
 
                 plans.push(ToolExecutionPlan {
@@ -1163,17 +1596,43 @@ impl Engine {
                     guard_result,
                 });
             }
+            active_tool_names.extend(deferred_tools_hydrated_this_batch);
 
-            let parallel_allowed = should_parallelize_tool_batch(&plans);
-            if parallel_allowed && plans.len() > 1 {
+            // --- Intent summary for write tools (#2381) ---
+            // When the model invokes write tools, extract its preceding text
+            // as an "intent summary" so the approval view can show *why* the
+            // change is being made, not just *what* will change.
+            let has_write_tools = plans.iter().any(|p| {
+                !p.read_only
+                    && p.approval_required
+                    && p.blocked_error.is_none()
+                    && p.guard_result.is_none()
+            });
+            let intent_summary: Option<String> = if has_write_tools {
+                approval_intent_summary(&current_text_visible)
+            } else {
+                None
+            };
+
+            let plan_count = plans.len();
+            let batches = plan_tool_execution_batches(plans);
+            let parallel_chunks = batches
+                .iter()
+                .filter_map(|batch| match batch {
+                    ToolExecutionBatch::Parallel(plans) if plans.len() > 1 => Some(plans.len()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if !parallel_chunks.is_empty() {
+                let parallel_tool_count: usize = parallel_chunks.iter().sum();
                 let _ = self
                     .tx_event
                     .send(Event::status(format!(
-                        "Executing {} read-only tools in parallel",
-                        plans.len()
+                        "Executing {parallel_tool_count} read-only tools in {} parallel chunk(s)",
+                        parallel_chunks.len()
                     )))
                     .await;
-            } else if plans.len() > 1 {
+            } else if plan_count > 1 {
                 let _ = self
                     .tx_event
                     .send(Event::status(
@@ -1182,161 +1641,451 @@ impl Engine {
                     .await;
             }
 
-            let mut outcomes: Vec<Option<ToolExecOutcome>> = Vec::with_capacity(plans.len());
-            outcomes.resize_with(plans.len(), || None);
+            let mut outcomes: Vec<Option<ToolExecOutcome>> = Vec::with_capacity(plan_count);
+            outcomes.resize_with(plan_count, || None);
 
-            if parallel_allowed {
-                let mut tool_tasks = FuturesUnordered::new();
-                for plan in plans {
-                    if let Some(result) = plan.guard_result.clone() {
-                        let result = Ok(result);
-                        let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
-                                id: plan.id.clone(),
-                                name: plan.name.clone(),
-                                result: result.clone(),
+            for batch in batches {
+                let (parallel_allowed, plans) = match batch {
+                    ToolExecutionBatch::Parallel(plans) => (true, plans),
+                    ToolExecutionBatch::Serial(plan) => (false, vec![*plan]),
+                };
+
+                if parallel_allowed {
+                    let mut tool_tasks = FuturesUnordered::new();
+                    for plan in plans {
+                        if let Some(result) = plan.guard_result.clone() {
+                            let result = Ok(result);
+                            let _ = self
+                                .tx_event
+                                .send(Event::ToolCallComplete {
+                                    id: plan.id.clone(),
+                                    name: plan.name.clone(),
+                                    result: result.clone(),
+                                })
+                                .await;
+                            outcomes[plan.index] = Some(ToolExecOutcome {
+                                index: plan.index,
+                                id: plan.id,
+                                name: plan.name,
+                                input: plan.input,
+                                started_at: Instant::now(),
+                                result,
+                            });
+                            continue;
+                        }
+                        if let Some(err) = plan.blocked_error.clone() {
+                            outcomes[plan.index] = Some(ToolExecOutcome {
+                                index: plan.index,
+                                id: plan.id,
+                                name: plan.name,
+                                input: plan.input,
+                                started_at: Instant::now(),
+                                result: Err(err),
+                            });
+                            continue;
+                        }
+                        let registry = tool_registry;
+                        let lock = tool_exec_lock.clone();
+                        let mcp_pool = mcp_pool.clone();
+                        let tx_event = self.tx_event.clone();
+                        let session_id = self.session.id.clone();
+                        let started_at = Instant::now();
+
+                        tool_tasks.push(async move {
+                            let mut result = Engine::execute_tool_with_lock(
+                                lock,
+                                plan.supports_parallel,
+                                plan.interactive,
+                                tx_event.clone(),
+                                plan.name.clone(),
+                                plan.input.clone(),
+                                registry,
+                                mcp_pool,
+                                None,
+                            )
+                            .await;
+
+                            // #500: spill outsized output before fanout (mirror
+                            // of the sequential path below). Emit a
+                            // `tool.spillover` audit event so operators can
+                            // correlate large-output episodes with disk usage.
+                            if let Ok(tool_result) = result.as_mut()
+                                && let Some(path) =
+                                    crate::tools::truncate::apply_spillover_with_artifact(
+                                        tool_result,
+                                        &plan.id,
+                                        &plan.name,
+                                        &session_id,
+                                    )
+                            {
+                                emit_tool_audit(json!({
+                                    "event": "tool.spillover",
+                                    "tool_id": plan.id.clone(),
+                                    "tool_name": plan.name.clone(),
+                                    "path": path.display().to_string(),
+                                }));
+                            }
+
+                            let _ = tx_event
+                                .send(Event::ToolCallComplete {
+                                    id: plan.id.clone(),
+                                    name: plan.name.clone(),
+                                    result: result.clone(),
+                                })
+                                .await;
+
+                            ToolExecOutcome {
+                                index: plan.index,
+                                id: plan.id,
+                                name: plan.name,
+                                input: plan.input,
+                                started_at,
+                                result,
+                            }
+                        });
+                    }
+
+                    while let Some(outcome) = tool_tasks.next().await {
+                        let index = outcome.index;
+                        outcomes[index] = Some(outcome);
+                    }
+                } else {
+                    for plan in plans {
+                        let tool_id = plan.id.clone();
+                        let tool_name = plan.name.clone();
+                        let tool_input = plan.input.clone();
+                        let tool_caller = plan.caller.clone();
+
+                        if let Some(result) = plan.guard_result.clone() {
+                            let result = Ok(result);
+                            let _ = self
+                                .tx_event
+                                .send(Event::ToolCallComplete {
+                                    id: tool_id.clone(),
+                                    name: tool_name.clone(),
+                                    result: result.clone(),
+                                })
+                                .await;
+                            outcomes[plan.index] = Some(ToolExecOutcome {
+                                index: plan.index,
+                                id: tool_id,
+                                name: tool_name,
+                                input: tool_input,
+                                started_at: Instant::now(),
+                                result,
+                            });
+                            continue;
+                        }
+
+                        if let Some(err) = plan.blocked_error.clone() {
+                            let result = Err(err);
+                            let _ = self
+                                .tx_event
+                                .send(Event::ToolCallComplete {
+                                    id: tool_id.clone(),
+                                    name: tool_name.clone(),
+                                    result: result.clone(),
+                                })
+                                .await;
+                            outcomes[plan.index] = Some(ToolExecOutcome {
+                                index: plan.index,
+                                id: tool_id,
+                                name: tool_name,
+                                input: tool_input,
+                                started_at: Instant::now(),
+                                result,
+                            });
+                            continue;
+                        }
+
+                        if tool_name == MULTI_TOOL_PARALLEL_NAME {
+                            let started_at = Instant::now();
+                            let result = self
+                                .execute_parallel_tool(
+                                    tool_input.clone(),
+                                    tool_registry,
+                                    tool_exec_lock.clone(),
+                                )
+                                .await;
+
+                            let _ = self
+                                .tx_event
+                                .send(Event::ToolCallComplete {
+                                    id: tool_id.clone(),
+                                    name: tool_name.clone(),
+                                    result: result.clone(),
+                                })
+                                .await;
+
+                            outcomes[plan.index] = Some(ToolExecOutcome {
+                                index: plan.index,
+                                id: tool_id,
+                                name: tool_name,
+                                input: tool_input,
+                                started_at,
+                                result,
+                            });
+                            continue;
+                        }
+
+                        if tool_name == CODE_EXECUTION_TOOL_NAME {
+                            let started_at = Instant::now();
+                            let result =
+                                execute_code_execution_tool(&tool_input, &self.session.workspace)
+                                    .await;
+
+                            let _ = self
+                                .tx_event
+                                .send(Event::ToolCallComplete {
+                                    id: tool_id.clone(),
+                                    name: tool_name.clone(),
+                                    result: result.clone(),
+                                })
+                                .await;
+
+                            outcomes[plan.index] = Some(ToolExecOutcome {
+                                index: plan.index,
+                                id: tool_id,
+                                name: tool_name,
+                                input: tool_input,
+                                started_at,
+                                result,
+                            });
+                            continue;
+                        }
+
+                        if tool_name == JS_EXECUTION_TOOL_NAME {
+                            let started_at = Instant::now();
+                            let result =
+                                execute_js_execution_tool(&tool_input, &self.session.workspace)
+                                    .await;
+
+                            let _ = self
+                                .tx_event
+                                .send(Event::ToolCallComplete {
+                                    id: tool_id.clone(),
+                                    name: tool_name.clone(),
+                                    result: result.clone(),
+                                })
+                                .await;
+
+                            outcomes[plan.index] = Some(ToolExecOutcome {
+                                index: plan.index,
+                                id: tool_id,
+                                name: tool_name,
+                                input: tool_input,
+                                started_at,
+                                result,
+                            });
+                            continue;
+                        }
+
+                        if is_tool_search_tool(&tool_name) {
+                            let started_at = Instant::now();
+                            let result = execute_tool_search(
+                                &tool_name,
+                                &tool_input,
+                                &tool_catalog,
+                                &mut active_tool_names,
+                            );
+
+                            let _ = self
+                                .tx_event
+                                .send(Event::ToolCallComplete {
+                                    id: tool_id.clone(),
+                                    name: tool_name.clone(),
+                                    result: result.clone(),
+                                })
+                                .await;
+
+                            outcomes[plan.index] = Some(ToolExecOutcome {
+                                index: plan.index,
+                                id: tool_id,
+                                name: tool_name,
+                                input: tool_input,
+                                started_at,
+                                result,
+                            });
+                            continue;
+                        }
+
+                        if tool_name == REQUEST_USER_INPUT_NAME {
+                            let started_at = Instant::now();
+                            let result = match UserInputRequest::from_value(&tool_input) {
+                                Ok(request) => self
+                                    .await_user_input(&tool_id, request)
+                                    .await
+                                    .and_then(|response| {
+                                        ToolResult::json(&response)
+                                            .map_err(|e| ToolError::execution_failed(e.to_string()))
+                                    }),
+                                Err(err) => Err(err),
+                            };
+
+                            let _ = self
+                                .tx_event
+                                .send(Event::ToolCallComplete {
+                                    id: tool_id.clone(),
+                                    name: tool_name.clone(),
+                                    result: result.clone(),
+                                })
+                                .await;
+
+                            outcomes[plan.index] = Some(ToolExecOutcome {
+                                index: plan.index,
+                                id: tool_id,
+                                name: tool_name,
+                                input: tool_input,
+                                started_at,
+                                result,
+                            });
+                            continue;
+                        }
+
+                        // Handle approval flow: returns (result_override, context_override)
+                        let (result_override, context_override): (
+                            Option<Result<ToolResult, ToolError>>,
+                            Option<crate::tools::ToolContext>,
+                        ) = if plan.approval_required {
+                            emit_tool_audit(json!({
+                                "event": "tool.approval_required",
+                                "tool_id": tool_id.clone(),
+                                "tool_name": tool_name.clone(),
+                            }));
+                            let approval_key = crate::tools::approval_cache::build_approval_key(
+                                &tool_name,
+                                &tool_input,
+                            )
+                            .0;
+                            let approval_grouping_key =
+                                crate::tools::approval_cache::build_approval_grouping_key(
+                                    &tool_name,
+                                    &tool_input,
+                                )
+                                .0;
+                            let _ = self
+                                .tx_event
+                                .send(Event::ApprovalRequired {
+                                    id: tool_id.clone(),
+                                    tool_name: tool_name.clone(),
+                                    input: tool_input.clone(),
+                                    description: plan.approval_description.clone(),
+                                    approval_key,
+                                    approval_grouping_key,
+                                    intent_summary: if plan.read_only {
+                                        None
+                                    } else {
+                                        intent_summary.clone()
+                                    },
+                                })
+                                .await;
+
+                            match self.await_tool_approval(&tool_id).await {
+                                Ok(ApprovalResult::Approved) => {
+                                    emit_tool_audit(json!({
+                                        "event": "tool.approval_decision",
+                                        "tool_id": tool_id.clone(),
+                                        "tool_name": tool_name.clone(),
+                                        "decision": "approved",
+                                        "caller": caller_type_for_tool_use(tool_caller.as_ref()),
+                                    }));
+                                    (None, None)
+                                }
+                                Ok(ApprovalResult::Denied) => {
+                                    emit_tool_audit(json!({
+                                        "event": "tool.approval_decision",
+                                        "tool_id": tool_id.clone(),
+                                        "tool_name": tool_name.clone(),
+                                        "decision": "denied",
+                                        "caller": caller_type_for_tool_use(tool_caller.as_ref()),
+                                    }));
+                                    (
+                                        Some(Err(ToolError::permission_denied(format!(
+                                            "Tool '{tool_name}' denied by user"
+                                        )))),
+                                        None,
+                                    )
+                                }
+                                Ok(ApprovalResult::RetryWithPolicy(policy)) => {
+                                    emit_tool_audit(json!({
+                                        "event": "tool.approval_decision",
+                                        "tool_id": tool_id.clone(),
+                                        "tool_name": tool_name.clone(),
+                                        "decision": "retry_with_policy",
+                                        "policy": format!("{policy:?}"),
+                                        "caller": caller_type_for_tool_use(tool_caller.as_ref()),
+                                    }));
+                                    let elevated_context = tool_registry.map(|r| {
+                                        r.context().clone().with_elevated_sandbox_policy(policy)
+                                    });
+                                    (None, elevated_context)
+                                }
+                                Err(err) => (Some(Err(err)), None),
+                            }
+                        } else {
+                            (None, None)
+                        };
+
+                        // Per-tool snapshot for surgical undo (#384): capture workspace
+                        // state before file-modifying tools execute so `/undo` can
+                        // revert the most recent write_file/edit_file/apply_patch.
+                        if result_override.is_none()
+                            && matches!(
+                                tool_name.as_str(),
+                                "write_file" | "edit_file" | "apply_patch"
+                            )
+                        {
+                            let ws = self.session.workspace.clone();
+                            let tid = tool_id.clone();
+                            let cap = self.config.snapshots_max_workspace_bytes;
+                            let _ = tokio::task::spawn_blocking(move || {
+                                crate::core::turn::pre_tool_snapshot(&ws, &tid, cap)
                             })
                             .await;
-                        outcomes[plan.index] = Some(ToolExecOutcome {
-                            index: plan.index,
-                            id: plan.id,
-                            name: plan.name,
-                            input: plan.input,
-                            started_at: Instant::now(),
-                            result,
-                        });
-                        continue;
-                    }
-                    if let Some(err) = plan.blocked_error.clone() {
-                        outcomes[plan.index] = Some(ToolExecOutcome {
-                            index: plan.index,
-                            id: plan.id,
-                            name: plan.name,
-                            input: plan.input,
-                            started_at: Instant::now(),
-                            result: Err(err),
-                        });
-                        continue;
-                    }
-                    let registry = tool_registry;
-                    let lock = tool_exec_lock.clone();
-                    let mcp_pool = mcp_pool.clone();
-                    let tx_event = self.tx_event.clone();
-                    let started_at = Instant::now();
+                        }
 
-                    tool_tasks.push(async move {
-                        let mut result = Engine::execute_tool_with_lock(
-                            lock,
-                            plan.supports_parallel,
-                            plan.interactive,
-                            tx_event.clone(),
-                            plan.name.clone(),
-                            plan.input.clone(),
-                            registry,
-                            mcp_pool,
-                            None,
-                        )
-                        .await;
+                        let started_at = Instant::now();
+                        let mut result = if let Some(result_override) = result_override {
+                            result_override
+                        } else {
+                            Self::execute_tool_with_lock(
+                                tool_exec_lock.clone(),
+                                plan.supports_parallel,
+                                plan.interactive,
+                                self.tx_event.clone(),
+                                tool_name.clone(),
+                                tool_input.clone(),
+                                tool_registry,
+                                mcp_pool.clone(),
+                                context_override,
+                            )
+                            .await
+                        };
 
-                        // #500: spill outsized output before fanout (mirror
-                        // of the sequential path below). Emit a
-                        // `tool.spillover` audit event so operators can
-                        // correlate large-output episodes with disk usage.
+                        // #500: spill outsized tool outputs to disk before the
+                        // result fans out to the model context and the UI cell.
+                        // Both consumers see the same artifact reference block +
+                        // metadata pointing at the session-owned full file.
+                        // Emit a discrete `tool.spillover` audit event so
+                        // operators can correlate large-output episodes with
+                        // disk-usage growth in `~/.deepseek/tool_outputs/`.
                         if let Ok(tool_result) = result.as_mut()
                             && let Some(path) =
-                                crate::tools::truncate::apply_spillover(tool_result, &plan.id)
+                                crate::tools::truncate::apply_spillover_with_artifact(
+                                    tool_result,
+                                    &tool_id,
+                                    &tool_name,
+                                    &self.session.id,
+                                )
                         {
                             emit_tool_audit(json!({
                                 "event": "tool.spillover",
-                                "tool_id": plan.id.clone(),
-                                "tool_name": plan.name.clone(),
+                                "tool_id": tool_id.clone(),
+                                "tool_name": tool_name.clone(),
                                 "path": path.display().to_string(),
                             }));
                         }
 
-                        let _ = tx_event
-                            .send(Event::ToolCallComplete {
-                                id: plan.id.clone(),
-                                name: plan.name.clone(),
-                                result: result.clone(),
-                            })
-                            .await;
-
-                        ToolExecOutcome {
-                            index: plan.index,
-                            id: plan.id,
-                            name: plan.name,
-                            input: plan.input,
-                            started_at,
-                            result,
-                        }
-                    });
-                }
-
-                while let Some(outcome) = tool_tasks.next().await {
-                    let index = outcome.index;
-                    outcomes[index] = Some(outcome);
-                }
-            } else {
-                for plan in plans {
-                    let tool_id = plan.id.clone();
-                    let tool_name = plan.name.clone();
-                    let tool_input = plan.input.clone();
-                    let tool_caller = plan.caller.clone();
-
-                    if let Some(result) = plan.guard_result.clone() {
-                        let result = Ok(result);
-                        let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
-                                id: tool_id.clone(),
-                                name: tool_name.clone(),
-                                result: result.clone(),
-                            })
-                            .await;
-                        outcomes[plan.index] = Some(ToolExecOutcome {
-                            index: plan.index,
-                            id: tool_id,
-                            name: tool_name,
-                            input: tool_input,
-                            started_at: Instant::now(),
-                            result,
-                        });
-                        continue;
-                    }
-
-                    if let Some(err) = plan.blocked_error.clone() {
-                        let result = Err(err);
-                        let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
-                                id: tool_id.clone(),
-                                name: tool_name.clone(),
-                                result: result.clone(),
-                            })
-                            .await;
-                        outcomes[plan.index] = Some(ToolExecOutcome {
-                            index: plan.index,
-                            id: tool_id,
-                            name: tool_name,
-                            input: tool_input,
-                            started_at: Instant::now(),
-                            result,
-                        });
-                        continue;
-                    }
-
-                    if tool_name == MULTI_TOOL_PARALLEL_NAME {
-                        let started_at = Instant::now();
-                        let result = self
-                            .execute_parallel_tool(
-                                tool_input.clone(),
-                                tool_registry,
-                                tool_exec_lock.clone(),
-                            )
-                            .await;
-
                         let _ = self
                             .tx_event
                             .send(Event::ToolCallComplete {
@@ -1354,237 +2103,7 @@ impl Engine {
                             started_at,
                             result,
                         });
-                        continue;
                     }
-
-                    if tool_name == CODE_EXECUTION_TOOL_NAME {
-                        let started_at = Instant::now();
-                        let result =
-                            execute_code_execution_tool(&tool_input, &self.session.workspace).await;
-
-                        let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
-                                id: tool_id.clone(),
-                                name: tool_name.clone(),
-                                result: result.clone(),
-                            })
-                            .await;
-
-                        outcomes[plan.index] = Some(ToolExecOutcome {
-                            index: plan.index,
-                            id: tool_id,
-                            name: tool_name,
-                            input: tool_input,
-                            started_at,
-                            result,
-                        });
-                        continue;
-                    }
-
-                    if is_tool_search_tool(&tool_name) {
-                        let started_at = Instant::now();
-                        let result = execute_tool_search(
-                            &tool_name,
-                            &tool_input,
-                            &tool_catalog,
-                            &mut active_tool_names,
-                        );
-
-                        let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
-                                id: tool_id.clone(),
-                                name: tool_name.clone(),
-                                result: result.clone(),
-                            })
-                            .await;
-
-                        outcomes[plan.index] = Some(ToolExecOutcome {
-                            index: plan.index,
-                            id: tool_id,
-                            name: tool_name,
-                            input: tool_input,
-                            started_at,
-                            result,
-                        });
-                        continue;
-                    }
-
-                    if tool_name == REQUEST_USER_INPUT_NAME {
-                        let started_at = Instant::now();
-                        let result = match UserInputRequest::from_value(&tool_input) {
-                            Ok(request) => self.await_user_input(&tool_id, request).await.and_then(
-                                |response| {
-                                    ToolResult::json(&response)
-                                        .map_err(|e| ToolError::execution_failed(e.to_string()))
-                                },
-                            ),
-                            Err(err) => Err(err),
-                        };
-
-                        let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
-                                id: tool_id.clone(),
-                                name: tool_name.clone(),
-                                result: result.clone(),
-                            })
-                            .await;
-
-                        outcomes[plan.index] = Some(ToolExecOutcome {
-                            index: plan.index,
-                            id: tool_id,
-                            name: tool_name,
-                            input: tool_input,
-                            started_at,
-                            result,
-                        });
-                        continue;
-                    }
-
-                    // Handle approval flow: returns (result_override, context_override)
-                    let (result_override, context_override): (
-                        Option<Result<ToolResult, ToolError>>,
-                        Option<crate::tools::ToolContext>,
-                    ) = if plan.approval_required {
-                        emit_tool_audit(json!({
-                            "event": "tool.approval_required",
-                            "tool_id": tool_id.clone(),
-                            "tool_name": tool_name.clone(),
-                        }));
-                        let approval_key = crate::tools::approval_cache::build_approval_key(
-                            &tool_name,
-                            &tool_input,
-                        )
-                        .0;
-                        let _ = self
-                            .tx_event
-                            .send(Event::ApprovalRequired {
-                                id: tool_id.clone(),
-                                tool_name: tool_name.clone(),
-                                description: plan.approval_description.clone(),
-                                approval_key,
-                            })
-                            .await;
-
-                        match self.await_tool_approval(&tool_id).await {
-                            Ok(ApprovalResult::Approved) => {
-                                emit_tool_audit(json!({
-                                    "event": "tool.approval_decision",
-                                    "tool_id": tool_id.clone(),
-                                    "tool_name": tool_name.clone(),
-                                    "decision": "approved",
-                                    "caller": caller_type_for_tool_use(tool_caller.as_ref()),
-                                }));
-                                (None, None)
-                            }
-                            Ok(ApprovalResult::Denied) => {
-                                emit_tool_audit(json!({
-                                    "event": "tool.approval_decision",
-                                    "tool_id": tool_id.clone(),
-                                    "tool_name": tool_name.clone(),
-                                    "decision": "denied",
-                                    "caller": caller_type_for_tool_use(tool_caller.as_ref()),
-                                }));
-                                (
-                                    Some(Err(ToolError::permission_denied(format!(
-                                        "Tool '{tool_name}' denied by user"
-                                    )))),
-                                    None,
-                                )
-                            }
-                            Ok(ApprovalResult::RetryWithPolicy(policy)) => {
-                                emit_tool_audit(json!({
-                                    "event": "tool.approval_decision",
-                                    "tool_id": tool_id.clone(),
-                                    "tool_name": tool_name.clone(),
-                                    "decision": "retry_with_policy",
-                                    "policy": format!("{policy:?}"),
-                                    "caller": caller_type_for_tool_use(tool_caller.as_ref()),
-                                }));
-                                let elevated_context = tool_registry.map(|r| {
-                                    r.context().clone().with_elevated_sandbox_policy(policy)
-                                });
-                                (None, elevated_context)
-                            }
-                            Err(err) => (Some(Err(err)), None),
-                        }
-                    } else {
-                        (None, None)
-                    };
-
-                    // Per-tool snapshot for surgical undo (#384): capture workspace
-                    // state before file-modifying tools execute so `/undo` can
-                    // revert the most recent write_file/edit_file/apply_patch.
-                    if result_override.is_none()
-                        && matches!(
-                            tool_name.as_str(),
-                            "write_file" | "edit_file" | "apply_patch"
-                        )
-                    {
-                        let ws = self.session.workspace.clone();
-                        let tid = tool_id.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            crate::core::turn::pre_tool_snapshot(&ws, &tid)
-                        })
-                        .await;
-                    }
-
-                    let started_at = Instant::now();
-                    let mut result = if let Some(result_override) = result_override {
-                        result_override
-                    } else {
-                        Self::execute_tool_with_lock(
-                            tool_exec_lock.clone(),
-                            plan.supports_parallel,
-                            plan.interactive,
-                            self.tx_event.clone(),
-                            tool_name.clone(),
-                            tool_input.clone(),
-                            tool_registry,
-                            mcp_pool.clone(),
-                            context_override,
-                        )
-                        .await
-                    };
-
-                    // #500: spill outsized tool outputs to disk before the
-                    // result fans out to the model context and the UI cell.
-                    // Both consumers see the same truncated content + the
-                    // `spillover_path` metadata pointing at the full file.
-                    // Emit a discrete `tool.spillover` audit event so
-                    // operators can correlate large-output episodes with
-                    // disk-usage growth in `~/.deepseek/tool_outputs/`.
-                    if let Ok(tool_result) = result.as_mut()
-                        && let Some(path) =
-                            crate::tools::truncate::apply_spillover(tool_result, &tool_id)
-                    {
-                        emit_tool_audit(json!({
-                            "event": "tool.spillover",
-                            "tool_id": tool_id.clone(),
-                            "tool_name": tool_name.clone(),
-                            "path": path.display().to_string(),
-                        }));
-                    }
-
-                    let _ = self
-                        .tx_event
-                        .send(Event::ToolCallComplete {
-                            id: tool_id.clone(),
-                            name: tool_name.clone(),
-                            result: result.clone(),
-                        })
-                        .await;
-
-                    outcomes[plan.index] = Some(ToolExecOutcome {
-                        index: plan.index,
-                        id: tool_id,
-                        name: tool_name,
-                        input: tool_input,
-                        started_at,
-                        result,
-                    });
                 }
             }
 
@@ -1629,6 +2148,12 @@ impl Engine {
                             &outcome.name,
                             &output,
                         );
+                        let tool_was_executed = output
+                            .metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.get("executed"))
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(true);
                         let output_content = output.content;
 
                         tool_call.set_result(output_content.clone(), duration);
@@ -1643,10 +2168,19 @@ impl Engine {
                         // this on success — failed edits leave the file
                         // untouched, so polling for diagnostics would just
                         // surface stale state.
-                        if output.success {
+                        if output.success && tool_was_executed {
                             self.run_post_edit_lsp_hook(&outcome.name, &tool_input)
                                 .await;
                         }
+
+                        // #3026: pipe `additionalContext` from tool_call_before
+                        // hooks back to the model alongside the tool result.
+                        let output_for_context = match hook_contexts.get(&outcome.id) {
+                            Some(context) => {
+                                format!("{output_for_context}\n\n[hook context] {context}")
+                            }
+                            None => output_for_context,
+                        };
 
                         self.add_session_message(Message {
                             role: "user".to_string(),
@@ -1713,14 +2247,15 @@ impl Engine {
 
             if let Some(message) = loop_guard_halt {
                 crate::logging::warn(message.clone());
-                let _ = self.tx_event.send(Event::status(message)).await;
+                let _ = self.tx_event.send(Event::status(message.clone())).await;
+                // 设置 turn_error 以确保最终返回 TurnOutcomeStatus::Failed 而非 Completed
+                turn_error = Some(message);
                 break;
             }
 
             if self
                 .run_capacity_post_tool_checkpoint(
                     turn,
-                    mode,
                     tool_registry,
                     tool_exec_lock.clone(),
                     mcp_pool.clone(),
@@ -1752,7 +2287,6 @@ impl Engine {
             if self
                 .run_capacity_error_escalation_checkpoint(
                     turn,
-                    mode,
                     step_error_count,
                     consecutive_tool_error_steps,
                     &step_error_categories,
@@ -1775,31 +2309,258 @@ impl Engine {
         (TurnOutcomeStatus::Completed, None)
     }
 
+    async fn goal_continuation_message_if_needed(
+        &self,
+        tool_registry: Option<&crate::tools::ToolRegistry>,
+        continuations_this_turn: &mut u32,
+    ) -> Option<String> {
+        let registry = tool_registry?;
+        if !registry.contains("update_goal") {
+            return None;
+        }
+
+        let snapshot = match self.config.goal_state.lock() {
+            Ok(state) => state.snapshot(),
+            Err(err) => {
+                tracing::warn!("goal state lock poisoned during continuation check: {err}");
+                return None;
+            }
+        };
+
+        if !snapshot.is_active() {
+            return None;
+        }
+
+        let max = crate::tools::goal::MAX_GOAL_CONTINUATIONS_PER_TURN;
+        if *continuations_this_turn >= max {
+            let _ = self
+                .tx_event
+                .send(Event::status(format!(
+                    "Goal remains active after {max} continuation pass(es); ending turn to avoid a runaway loop."
+                )))
+                .await;
+            return None;
+        }
+
+        *continuations_this_turn = (*continuations_this_turn).saturating_add(1);
+        let _ = self
+            .tx_event
+            .send(Event::status(format!(
+                "Continuing active goal audit ({}/{max})",
+                *continuations_this_turn
+            )))
+            .await;
+
+        Some(crate::tools::goal::render_continuation_prompt(
+            &snapshot,
+            *continuations_this_turn,
+            max,
+        ))
+    }
+
     pub(super) fn messages_with_turn_metadata(&self) -> Vec<Message> {
-        // `<turn_meta>` is stored on user-text messages when the message is
-        // appended. Do not rewrite historical messages at request time: doing
-        // so makes the API prefix differ from the bytes sent in earlier turns
-        // and destroys DeepSeek's KV prefix cache reuse.
-        self.session.messages.clone()
+        // Keep stored history byte-stable and provider-compatible: runtime
+        // mode/approval contracts are projected as a transient user message
+        // at request time instead of being persisted as appended system
+        // messages. This preserves the stable prefix through all stored
+        // messages while avoiding strict chat templates that only allow
+        // system messages at messages[0].
+        let mut messages: Vec<Message> = self.session.messages.clone().into();
+        messages.push(self.runtime_prompt_message());
+        messages
     }
 }
 
 fn subagent_completion_runtime_message(payload: &str) -> Message {
+    // Role is "user", not "system": some OpenAI-compatible backends apply a
+    // strict chat template (e.g. vLLM serving Qwen3) that requires any system
+    // message to be messages[0]. A system message appended mid-conversation
+    // makes the template raise "System message must be at the beginning",
+    // which surfaces as a 400 BadRequest and breaks the whole sub-agent
+    // hand-off in the parent turn. The `visibility="internal"` tag already
+    // tells the model this is a runtime event rather than user input, so the
+    // role carries no semantic weight here — only template-compatibility cost.
     Message {
-        role: "system".to_string(),
+        role: "user".to_string(),
         content: vec![ContentBlock::Text {
             text: format!(
-                "<deepseek:runtime_event kind=\"subagent_completion\" visibility=\"internal\">\n\
+                "<codewhale:runtime_event kind=\"subagent_completion\" visibility=\"internal\">\n\
 This is an internal runtime event, not user input. Use the sub-agent completion \
 data below to continue coordinating the current task. Do not tell the user they \
 pasted sentinels, do not explain the sentinel protocol, and do not quote the raw \
 XML unless the user explicitly asks to debug sub-agent internals.\n\n\
 {payload}\n\
-</deepseek:runtime_event>"
+</codewhale:runtime_event>"
             ),
             cache_control: None,
         }],
     }
+}
+
+fn should_hold_turn_for_subagents(queued_completions: usize, running_children: usize) -> bool {
+    queued_completions > 0 || running_children > 0
+}
+
+fn stream_chunk_timeout_budget(config: &EngineConfig) -> (u64, Duration) {
+    let secs = config.stream_chunk_timeout.as_secs();
+    (secs, Duration::from_secs(secs))
+}
+
+#[cfg(test)]
+mod stream_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn stream_chunk_timeout_budget_uses_engine_config() {
+        let config = EngineConfig {
+            stream_chunk_timeout: Duration::from_secs(42),
+            ..EngineConfig::default()
+        };
+
+        assert_eq!(
+            stream_chunk_timeout_budget(&config),
+            (42, Duration::from_secs(42))
+        );
+    }
+}
+
+pub(super) fn command_allows_tool(allowed_tools: Option<&[String]>, tool_name: &str) -> bool {
+    let Some(allowed_tools) = allowed_tools else {
+        return true;
+    };
+    allowed_tools.contains(&tool_name.to_ascii_lowercase())
+}
+
+/// Folded outcome of all `tool_call_before` hook results for one tool call
+/// (#3026). Precedence: deny (exit code 2 or JSON) > ask > allow;
+/// `updatedInput` is last-writer-wins; `additionalContext` is concatenated.
+#[derive(Debug, Default, PartialEq)]
+struct ToolCallHookFold {
+    /// Denial reason from an exit-code-2 hook or a JSON `deny` decision.
+    deny_reason: Option<String>,
+    /// At least one hook returned a JSON `ask` decision.
+    requires_approval: bool,
+    /// Replacement tool input from the last hook that supplied one.
+    updated_input: Option<serde_json::Value>,
+    /// Concatenated `additionalContext` strings from all hooks.
+    additional_context: Option<String>,
+}
+
+fn fold_tool_call_before_results(results: &[crate::hooks::HookResult]) -> ToolCallHookFold {
+    let mut fold = ToolCallHookFold::default();
+
+    // Legacy hard deny: exit code 2 wins regardless of stdout (backwards
+    // compatible with pre-#3026 hooks).
+    if let Some(denial) = results.iter().find(|result| result.exit_code == Some(2)) {
+        let reason = denial
+            .stdout
+            .trim()
+            .lines()
+            .next()
+            .filter(|line| !line.is_empty())
+            .or_else(|| {
+                denial
+                    .stderr
+                    .trim()
+                    .lines()
+                    .next()
+                    .filter(|line| !line.is_empty())
+            })
+            .or(denial.error.as_deref())
+            .unwrap_or("ToolCallBefore hook denied tool execution");
+        fold.deny_reason = Some(reason.to_string());
+        return fold;
+    }
+
+    for result in results {
+        // Background hooks return immediately with no process result and
+        // cannot steer (the caller warns about that configuration).
+        if result.exit_code.is_none() {
+            continue;
+        }
+        let parsed = crate::hooks::parse_tool_call_before_stdout(&result.stdout);
+        match parsed.decision {
+            Some(crate::hooks::ToolCallDecision::Deny) => {
+                fold.deny_reason =
+                    Some(parsed.reason.unwrap_or_else(|| {
+                        "ToolCallBefore hook denied tool execution".to_string()
+                    }));
+                return fold;
+            }
+            Some(crate::hooks::ToolCallDecision::Ask) => fold.requires_approval = true,
+            Some(crate::hooks::ToolCallDecision::Allow) | None => {}
+        }
+        if let Some(updated) = parsed.updated_input {
+            fold.updated_input = Some(updated);
+        }
+        if let Some(context) = parsed.additional_context {
+            match &mut fold.additional_context {
+                Some(existing) => {
+                    existing.push('\n');
+                    existing.push_str(&context);
+                }
+                None => fold.additional_context = Some(context),
+            }
+        }
+    }
+    fold
+}
+
+/// Check whether `tool_name` is explicitly denied (#3027).
+/// Deny always wins over allow.
+pub(super) fn command_denies_tool(disallowed_tools: Option<&[String]>, tool_name: &str) -> bool {
+    let Some(disallowed_tools) = disallowed_tools else {
+        return false;
+    };
+    disallowed_tools.contains(&tool_name.to_ascii_lowercase())
+}
+
+fn resolve_tool_definition<'a>(
+    tool_name: &mut String,
+    tool_catalog: &'a [Tool],
+    tool_registry: Option<&crate::tools::ToolRegistry>,
+) -> Option<&'a Tool> {
+    let mut tool_def = tool_catalog
+        .iter()
+        .find(|def| def.name.as_str() == tool_name.as_str());
+
+    // Resolve hallucinated tool names before policy gates run, so aliases like
+    // ReadFile are checked against the canonical registered tool name.
+    if tool_def.is_none()
+        && let Some(registry) = tool_registry
+        && let Some(canonical) = registry.resolve(tool_name.as_str())
+    {
+        crate::logging::info(format!(
+            "Resolved hallucinated tool name '{tool_name}' -> '{canonical}'"
+        ));
+        tool_def = tool_catalog.iter().find(|d| d.name == canonical);
+        if tool_def.is_some() {
+            *tool_name = canonical.to_string();
+        }
+    }
+
+    tool_def
+}
+
+/// Issue #1727: decide whether to surface a "thinking-only, no output" status.
+///
+/// Reached when the assistant turn had no sendable content (no Text, no
+/// ToolUse — only a reasoning/thinking block). We notify the user *only* when
+/// the turn is genuinely finishing: no tool uses to dispatch, no `turn_error`
+/// already surfaced for this turn, the request wasn't cancelled, AND the turn
+/// is not about to CONTINUE — there are no pending steers and we are not
+/// holding the turn open for running sub-agents. The status must fire at the
+/// point the turn truly ends; emitting it earlier (at the persist site) would
+/// show a spurious "turn ended" notice immediately before the turn resumed
+/// for a steer or a sub-agent completion.
+fn should_emit_thinking_only_status(
+    tool_uses_empty: bool,
+    turn_error_is_none: bool,
+    cancelled: bool,
+    steers_pending: bool,
+    holding_for_subagents: bool,
+) -> bool {
+    tool_uses_empty && turn_error_is_none && !cancelled && !steers_pending && !holding_for_subagents
 }
 
 /// Resolve an `"auto"` reasoning-effort tier to a concrete value.
@@ -1861,20 +2622,186 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subagent_completion_handoff_is_internal_system_message() {
+    fn subagent_completion_handoff_is_internal_user_message() {
         let message = subagent_completion_runtime_message(
-            "Build passed\n<deepseek:subagent.done>{\"agent_id\":\"agent_a\"}</deepseek:subagent.done>",
+            "Build passed\n<codewhale:subagent.done>{\"agent_id\":\"agent_a\"}</codewhale:subagent.done>",
         );
 
-        assert_eq!(message.role, "system");
+        // Must be "user", not "system": a system message appended mid-stream
+        // trips strict chat templates (vLLM/Qwen3) into a 400 BadRequest
+        // ("System message must be at the beginning"). The internal-event
+        // framing lives in the text + visibility tag, not the role.
+        assert_eq!(message.role, "user");
         let text = match &message.content[0] {
             ContentBlock::Text { text, .. } => text,
             other => panic!("expected text block, got {other:?}"),
         };
         assert!(text.contains("internal runtime event, not user input"));
         assert!(text.contains("Do not tell the user they pasted sentinels"));
-        assert!(text.contains("<deepseek:subagent.done>"));
+        assert!(text.contains("<codewhale:subagent.done>"));
         assert!(text.contains("Build passed"));
+    }
+
+    #[test]
+    fn turn_holds_open_for_running_or_completed_subagents() {
+        assert!(should_hold_turn_for_subagents(1, 0));
+        assert!(should_hold_turn_for_subagents(0, 1));
+        assert!(!should_hold_turn_for_subagents(0, 0));
+    }
+
+    #[test]
+    fn approval_intent_summary_trims_and_bounds_text() {
+        assert_eq!(approval_intent_summary("   "), None);
+
+        let long_text = format!("  {}  ", "x".repeat(MAX_APPROVAL_INTENT_SUMMARY_CHARS + 10));
+        let summary = approval_intent_summary(&long_text).expect("summary");
+        assert!(summary.ends_with("..."));
+        assert_eq!(
+            summary.chars().count(),
+            MAX_APPROVAL_INTENT_SUMMARY_CHARS + 3
+        );
+    }
+
+    /// Regression test for issue #1727 (P0, release-blocking).
+    ///
+    /// When a model (e.g. gpt-oss via ollama's harmony→OpenAI shim) returns
+    /// ONLY a reasoning/thinking block — empty `content`, no `tool_calls` —
+    /// `has_sendable_assistant_content` is false, so no assistant message is
+    /// persisted. Previously the code also emitted NO event and fell straight
+    /// through to finishing the turn: the UI spinner stayed up forever with no
+    /// error, looking hung.
+    ///
+    /// This pins the decision: a clean turn end (no tool uses to dispatch, no
+    /// `turn_error`, not cancelled, no pending steers, not holding for
+    /// sub-agents) must surface a status. We must NOT spam the status when the
+    /// turn is ending for another reason (error already shown, cancelled),
+    /// when there are tool uses still to dispatch, or — critically (the
+    /// MEDIUM review finding) — when the turn is about to CONTINUE because a
+    /// steer is pending or sub-agents are still running. Emitting at the old
+    /// persist site fired before those continuations were known.
+    ///
+    /// Limitation: this tests the extracted pure decision, not the full async
+    /// `handle_deepseek_turn` loop (driving it would need a mock DeepSeek
+    /// client + session + channels — far beyond a surgical fix and unlike any
+    /// existing turn-loop test, which all pin pure helpers the same way). The
+    /// wiring at the `tool_uses.is_empty()` tail (capture-then-decide, with the
+    /// live steer/sub-agent signals) is reviewed by inspection — consistent
+    /// with how the other turn-loop helpers in this module are tested.
+    #[test]
+    fn thinking_only_turn_emits_status_only_on_clean_end() {
+        // Thinking-only response, turn genuinely ending (no tool uses, no
+        // error, not cancelled, no steers pending, not holding for
+        // sub-agents) → surface a status so the user isn't left staring at a
+        // hung spinner.
+        assert!(should_emit_thinking_only_status(
+            true, true, false, false, false
+        ));
+
+        // Tool uses still pending → the normal dispatch path handles it; no
+        // thinking-only status.
+        assert!(!should_emit_thinking_only_status(
+            false, true, false, false, false
+        ));
+
+        // A turn_error was already surfaced → don't double-report.
+        assert!(!should_emit_thinking_only_status(
+            true, false, false, false, false
+        ));
+
+        // Request was cancelled → cancellation status already covers it.
+        assert!(!should_emit_thinking_only_status(
+            true, true, true, false, false
+        ));
+
+        // A steer is pending → the turn will resume with the steer; emitting
+        // "turn ended" now would be a spurious notice right before the turn
+        // continues (the MEDIUM correctness finding).
+        assert!(!should_emit_thinking_only_status(
+            true, true, false, true, false
+        ));
+
+        // Sub-agents are still running / completions queued → the turn is
+        // held open and will resume; do not claim it ended.
+        assert!(!should_emit_thinking_only_status(
+            true, true, false, false, true
+        ));
+    }
+
+    /// Regression test for the OpenAI streaming batch tool_calls bug.
+    ///
+    /// Background: when an OpenAI-compatible backend (vLLM, Ollama, LM Studio,
+    /// etc.) streams a response containing multiple `tool_calls` in the same
+    /// assistant message, the streaming parser emits the events in this order:
+    ///
+    /// ```text
+    /// ContentBlockStart::ToolUse { index: 0, .. }   // tool #1
+    /// ContentBlockDelta { index: 0, .. }            // its arguments
+    /// ContentBlockStart::ToolUse { index: 1, .. }   // tool #2
+    /// ContentBlockDelta { index: 1, .. }
+    /// …
+    /// ContentBlockStart::ToolUse { index: N-1, .. }
+    /// ContentBlockDelta { index: N-1, .. }
+    /// ContentBlockStop { index: 0 }                 // ── only flushed at
+    /// ContentBlockStop { index: 1 }                 //    finish_reason
+    /// …                                             //    (see chat.rs
+    /// ContentBlockStop { index: N-1 }               //    L2050-L2064)
+    /// ```
+    ///
+    /// All Starts arrive before any Stop. The fix replaces the single
+    /// `current_tool_index: Option<usize>` slot (overwritten by each Start)
+    /// with a `HashMap<u32 block_index, usize tool_uses_idx>` that survives
+    /// every Start and routes each Stop to the right `tool_uses` entry.
+    ///
+    /// This test confirms the invariant: feed 7 Starts then 7 Stops, expect
+    /// all 7 indices to come back out in order.
+    #[test]
+    fn batch_tool_calls_preserve_all_tool_use_indices() {
+        let mut current_tool_indices: std::collections::HashMap<u32, usize> =
+            std::collections::HashMap::new();
+
+        // Simulate `ContentBlockStart::ToolUse { index: i }` for 7 tools.
+        for block_index in 0..7u32 {
+            current_tool_indices.insert(block_index, block_index as usize);
+        }
+        assert_eq!(current_tool_indices.len(), 7);
+
+        // Now drain via `ContentBlockStop { index: i }` in the same order.
+        let mut recovered: Vec<(u32, usize)> = (0..7u32)
+            .map(|block_index| {
+                let tool_idx = current_tool_indices
+                    .remove(&block_index)
+                    .expect("each block_index must route to a tool_uses entry");
+                (block_index, tool_idx)
+            })
+            .collect();
+        recovered.sort_by_key(|(block_index, _)| *block_index);
+        let expected: Vec<(u32, usize)> = (0..7u32).map(|i| (i, i as usize)).collect();
+        assert_eq!(
+            recovered, expected,
+            "every Stop must recover the tool_uses index pushed by its matching Start"
+        );
+        assert!(
+            current_tool_indices.is_empty(),
+            "all entries must drain after their Stops"
+        );
+    }
+
+    #[test]
+    fn loop_guard_block_tool_result_counts_as_failure() {
+        let result = loop_guard_block_tool_result("Blocked: repeated call".to_string());
+
+        assert!(
+            !result.success,
+            "LoopGuard blocks must count as tool failures so repeated blocked calls can trip halt handling"
+        );
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("loop_guard"))
+                .and_then(|v| v.as_str()),
+            Some("identical_tool_call")
+        );
     }
 
     #[test]
@@ -1898,5 +2825,322 @@ mod tests {
             Some("high".to_string()),
             "auto thinking should classify the user request, not stored metadata"
         );
+    }
+
+    #[test]
+    fn allowed_tools_gate_blocks_unlisted_tool() {
+        let allowed = vec!["bash".to_string(), "grep".to_string()];
+        assert!(!command_allows_tool(Some(&allowed), "read"));
+    }
+
+    #[test]
+    fn allowed_tools_gate_allows_listed_tool_case_insensitively() {
+        let allowed = vec!["bash".to_string(), "read".to_string()];
+        assert!(command_allows_tool(Some(&allowed), "Read"));
+    }
+
+    #[test]
+    fn allowed_tools_gate_allows_all_tools_when_not_set() {
+        assert!(command_allows_tool(None, "write"));
+    }
+
+    #[test]
+    fn review_regression_allowed_tools_gate_blocks_all_tools_when_empty() {
+        let allowed = Vec::new();
+        assert!(!command_allows_tool(Some(&allowed), "bash"));
+    }
+
+    #[test]
+    fn disallowed_tools_gate_blocks_listed_tool() {
+        let disallowed = vec!["exec_shell".to_string()];
+        assert!(command_denies_tool(Some(&disallowed), "exec_shell"));
+        assert!(!command_denies_tool(Some(&disallowed), "read_file"));
+    }
+
+    #[test]
+    fn disallowed_tools_gate_blocks_case_insensitively() {
+        let disallowed = vec!["exec_shell".to_string()];
+        assert!(command_denies_tool(Some(&disallowed), "Exec_Shell"));
+    }
+
+    #[test]
+    fn disallowed_tools_gate_is_inert_when_not_set() {
+        assert!(!command_denies_tool(None, "exec_shell"));
+        let empty: Vec<String> = Vec::new();
+        assert!(!command_denies_tool(Some(&empty), "exec_shell"));
+    }
+
+    #[test]
+    fn deny_wins_over_allow_for_same_tool() {
+        // The turn-loop gate chain checks the deny-list before the allow-list,
+        // so a tool present in both must still be blocked.
+        let allowed = vec!["exec_shell".to_string()];
+        let disallowed = vec!["exec_shell".to_string()];
+        assert!(command_allows_tool(Some(&allowed), "exec_shell"));
+        assert!(command_denies_tool(Some(&disallowed), "exec_shell"));
+    }
+
+    #[test]
+    fn review_regression_allowed_tools_gate_checks_canonical_tool_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let context = crate::tools::spec::ToolContext::new(tmp.path().to_path_buf());
+        let registry = crate::tools::ToolRegistryBuilder::new()
+            .with_file_tools()
+            .build(context);
+        let catalog = registry.to_api_tools();
+        let mut tool_name = "ReadFile".to_string();
+
+        let tool_def = resolve_tool_definition(&mut tool_name, &catalog, Some(&registry));
+
+        assert!(tool_def.is_some());
+        assert_eq!(tool_name, "read_file");
+        let allowed = vec!["read_file".to_string()];
+        assert!(command_allows_tool(Some(&allowed), &tool_name));
+    }
+
+    #[test]
+    fn hook_gate_denies_with_exit_code_2() {
+        use crate::hooks::{Hook, HookContext, HookEvent, HookExecutor, HooksConfig};
+
+        let deny_cmd = if cfg!(windows) { "exit /b 2" } else { "exit 2" };
+        let config = HooksConfig {
+            enabled: true,
+            hooks: vec![Hook::new(HookEvent::ToolCallBefore, deny_cmd)],
+            ..HooksConfig::default()
+        };
+        let executor = HookExecutor::new(config, std::path::PathBuf::from("."));
+        let ctx = HookContext::new()
+            .with_tool_name("exec_shell")
+            .with_tool_args(&serde_json::json!({}));
+        let results = executor.execute(HookEvent::ToolCallBefore, &ctx);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].exit_code, Some(2));
+    }
+
+    #[test]
+    fn hook_gate_allows_with_exit_code_0() {
+        use crate::hooks::{Hook, HookContext, HookEvent, HookExecutor, HooksConfig};
+
+        let allow_cmd = if cfg!(windows) { "exit /b 0" } else { "exit 0" };
+        let config = HooksConfig {
+            enabled: true,
+            hooks: vec![Hook::new(HookEvent::ToolCallBefore, allow_cmd)],
+            ..HooksConfig::default()
+        };
+        let executor = HookExecutor::new(config, std::path::PathBuf::from("."));
+        let ctx = HookContext::new()
+            .with_tool_name("read_file")
+            .with_tool_args(&serde_json::json!({}));
+        let results = executor.execute(HookEvent::ToolCallBefore, &ctx);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].exit_code, Some(0));
+        assert!(results[0].success);
+    }
+
+    #[test]
+    fn hook_gate_failure_exit_code_1_is_not_denial() {
+        use crate::hooks::{Hook, HookContext, HookEvent, HookExecutor, HooksConfig};
+
+        let fail_cmd = if cfg!(windows) { "exit /b 1" } else { "exit 1" };
+        let config = HooksConfig {
+            enabled: true,
+            hooks: vec![Hook::new(HookEvent::ToolCallBefore, fail_cmd)],
+            ..HooksConfig::default()
+        };
+        let executor = HookExecutor::new(config, std::path::PathBuf::from("."));
+        let ctx = HookContext::new()
+            .with_tool_name("write_file")
+            .with_tool_args(&serde_json::json!({}));
+        let results = executor.execute(HookEvent::ToolCallBefore, &ctx);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].exit_code, Some(1));
+        assert_ne!(results[0].exit_code, Some(2));
+    }
+
+    #[test]
+    fn hook_gate_no_hooks_returns_no_results() {
+        use crate::hooks::{HookContext, HookEvent, HookExecutor, HooksConfig};
+
+        let config = HooksConfig {
+            enabled: true,
+            hooks: vec![],
+            ..HooksConfig::default()
+        };
+        let executor = HookExecutor::new(config, std::path::PathBuf::from("."));
+        let ctx = HookContext::new().with_tool_name("grep_files");
+        let results = executor.execute(HookEvent::ToolCallBefore, &ctx);
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn hook_gate_denial_reason_can_come_from_stdout() {
+        use crate::hooks::{Hook, HookContext, HookEvent, HookExecutor, HooksConfig};
+
+        let deny_cmd = if cfg!(windows) {
+            "echo Tool blocked by security policy & exit /b 2"
+        } else {
+            "echo 'Tool blocked by security policy' && exit 2"
+        };
+        let config = HooksConfig {
+            enabled: true,
+            hooks: vec![Hook::new(HookEvent::ToolCallBefore, deny_cmd)],
+            ..HooksConfig::default()
+        };
+        let executor = HookExecutor::new(config, std::path::PathBuf::from("."));
+        let ctx = HookContext::new().with_tool_name("exec_shell");
+        let results = executor.execute(HookEvent::ToolCallBefore, &ctx);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].exit_code, Some(2));
+        assert!(results[0].stdout.contains("security"));
+    }
+
+    // ── #3026: JSON decision contract fold ─────────────────────────────────
+
+    fn hook_result(stdout: &str, exit_code: Option<i32>) -> crate::hooks::HookResult {
+        crate::hooks::HookResult {
+            name: None,
+            success: exit_code == Some(0),
+            exit_code,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            duration: Duration::from_millis(1),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn hook_fold_json_deny_blocks_with_reason() {
+        let fold = fold_tool_call_before_results(&[hook_result(
+            r#"{"decision":"deny","reason":"nope"}"#,
+            Some(0),
+        )]);
+        assert_eq!(fold.deny_reason.as_deref(), Some("nope"));
+        assert!(!fold.requires_approval);
+    }
+
+    #[test]
+    fn hook_fold_exit_code_2_denies_regardless_of_stdout() {
+        let fold =
+            fold_tool_call_before_results(&[hook_result(r#"{"decision":"allow"}"#, Some(2))]);
+        assert!(
+            fold.deny_reason.is_some(),
+            "exit code 2 must hard-deny even when stdout says allow"
+        );
+    }
+
+    #[test]
+    fn hook_fold_deny_wins_over_ask_and_allow() {
+        let fold = fold_tool_call_before_results(&[
+            hook_result(r#"{"decision":"allow"}"#, Some(0)),
+            hook_result(r#"{"decision":"ask"}"#, Some(0)),
+            hook_result(r#"{"decision":"deny","reason":"policy"}"#, Some(0)),
+        ]);
+        assert_eq!(fold.deny_reason.as_deref(), Some("policy"));
+    }
+
+    #[test]
+    fn hook_fold_ask_requires_approval() {
+        let fold = fold_tool_call_before_results(&[
+            hook_result(r#"{"decision":"allow"}"#, Some(0)),
+            hook_result(r#"{"decision":"ask"}"#, Some(0)),
+        ]);
+        assert!(fold.deny_reason.is_none());
+        assert!(fold.requires_approval);
+    }
+
+    #[test]
+    fn hook_fold_updated_input_last_writer_wins() {
+        let fold = fold_tool_call_before_results(&[
+            hook_result(r#"{"updatedInput":{"command":"first"}}"#, Some(0)),
+            hook_result(r#"{"updatedInput":{"command":"second"}}"#, Some(0)),
+        ]);
+        assert_eq!(
+            fold.updated_input,
+            Some(serde_json::json!({"command":"second"}))
+        );
+    }
+
+    #[test]
+    fn hook_fold_background_results_cannot_steer() {
+        // Background hooks return exit_code: None immediately — their stdout
+        // (if any were captured) must not deny, ask, or rewrite input.
+        let fold = fold_tool_call_before_results(&[hook_result(
+            r#"{"decision":"deny","reason":"too late"}"#,
+            None,
+        )]);
+        assert_eq!(fold, ToolCallHookFold::default());
+    }
+
+    #[test]
+    fn hook_fold_concatenates_additional_context() {
+        let fold = fold_tool_call_before_results(&[
+            hook_result(r#"{"additionalContext":"one"}"#, Some(0)),
+            hook_result(r#"{"additionalContext":"two"}"#, Some(0)),
+        ]);
+        assert_eq!(fold.additional_context.as_deref(), Some("one\ntwo"));
+    }
+
+    #[test]
+    fn hook_fold_legacy_stdout_is_passthrough() {
+        let fold = fold_tool_call_before_results(&[
+            hook_result("", Some(0)),
+            hook_result("not json at all", Some(0)),
+            hook_result(r#"{"status":"fine"}"#, Some(1)),
+        ]);
+        assert_eq!(fold, ToolCallHookFold::default());
+    }
+
+    #[test]
+    fn hook_gate_denies_with_json_decision_from_executor() {
+        use crate::hooks::{Hook, HookContext, HookEvent, HookExecutor, HooksConfig};
+
+        let deny_cmd = if cfg!(windows) {
+            r#"echo {"decision":"deny","reason":"blocked by project policy"}"#
+        } else {
+            r#"echo '{"decision":"deny","reason":"blocked by project policy"}'"#
+        };
+        let config = HooksConfig {
+            enabled: true,
+            hooks: vec![Hook::new(HookEvent::ToolCallBefore, deny_cmd)],
+            ..HooksConfig::default()
+        };
+        let executor = HookExecutor::new(config, std::path::PathBuf::from("."));
+        let ctx = HookContext::new().with_tool_name("exec_shell");
+        let results = executor.execute(HookEvent::ToolCallBefore, &ctx);
+
+        let fold = fold_tool_call_before_results(&results);
+        assert_eq!(
+            fold.deny_reason.as_deref(),
+            Some("blocked by project policy"),
+            "JSON deny with exit code 0 must block: {results:?}"
+        );
+    }
+
+    #[test]
+    fn hook_gate_ask_forces_approval_from_executor() {
+        use crate::hooks::{Hook, HookContext, HookEvent, HookExecutor, HooksConfig};
+
+        let ask_cmd = if cfg!(windows) {
+            r#"echo {"decision":"ask"}"#
+        } else {
+            r#"echo '{"decision":"ask"}'"#
+        };
+        let config = HooksConfig {
+            enabled: true,
+            hooks: vec![Hook::new(HookEvent::ToolCallBefore, ask_cmd)],
+            ..HooksConfig::default()
+        };
+        let executor = HookExecutor::new(config, std::path::PathBuf::from("."));
+        let ctx = HookContext::new().with_tool_name("write_file");
+        let results = executor.execute(HookEvent::ToolCallBefore, &ctx);
+
+        let fold = fold_tool_call_before_results(&results);
+        assert!(fold.deny_reason.is_none());
+        assert!(fold.requires_approval);
     }
 }

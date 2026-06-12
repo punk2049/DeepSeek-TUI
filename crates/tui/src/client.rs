@@ -8,14 +8,16 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::config::{ApiProvider, Config, RetryPolicy};
+use crate::config::{ApiProvider, Config, RetryPolicy, wire_model_for_provider};
 use crate::llm_client::{
-    LlmClient, LlmError, RetryConfig as LlmRetryConfig, extract_retry_after, with_retry,
+    LlmClient, LlmError, RetryConfig as LlmRetryConfig, extract_retry_after,
+    sanitize_http_error_body, with_retry,
 };
 use crate::logging;
 use crate::models::{MessageRequest, MessageResponse, ServerToolUsage, SystemPrompt, Usage};
@@ -59,7 +61,10 @@ pub(super) fn from_api_tool_name(name: &str) -> String {
                     break;
                 }
             }
-            if let Ok(code) = u32::from_str_radix(&hex, 16)
+            // Only decode if we got exactly 6 hex digits (matching encoder output).
+            // Fewer digits means a truncated/malformed sequence — pass through as-is.
+            if hex.len() == 6
+                && let Ok(code) = u32::from_str_radix(&hex, 16)
                 && let Some(decoded) = std::char::from_u32(code)
             {
                 if let Some('-') = iter.peek().copied() {
@@ -119,6 +124,31 @@ pub struct AvailableModel {
     pub created: Option<u64>,
 }
 
+/// Request payload for Xiaomi MiMo speech synthesis models.
+///
+/// MiMo-V2.5-TTS / MiMo-V2-TTS use the OpenAI-compatible
+/// `/v1/chat/completions` endpoint: the optional style/voice instruction is
+/// sent as a `user` message, while the text to synthesize is sent as an
+/// `assistant` message.
+#[derive(Debug, Clone)]
+pub struct SpeechSynthesisRequest {
+    pub model: String,
+    pub text: String,
+    pub instruction: Option<String>,
+    pub audio_format: String,
+    pub voice: Option<String>,
+}
+
+/// Decoded speech synthesis result.
+#[derive(Debug, Clone)]
+pub struct SpeechSynthesisResponse {
+    pub model: String,
+    pub audio_format: String,
+    pub audio_bytes: Vec<u8>,
+    pub transcript: Option<String>,
+    pub voice: Option<String>,
+}
+
 /// Client for DeepSeek's OpenAI-compatible APIs.
 #[must_use]
 pub struct DeepSeekClient {
@@ -130,6 +160,8 @@ pub struct DeepSeekClient {
     default_model: String,
     connection_health: Arc<AsyncMutex<ConnectionHealth>>,
     rate_limiter: Arc<AsyncMutex<TokenBucket>>,
+    path_suffix: Option<String>,
+    pub(super) stream_idle_timeout: Duration,
 }
 
 const CONNECTION_FAILURE_THRESHOLD: u32 = 2;
@@ -142,7 +174,6 @@ const ALLOW_INSECURE_HTTP_ENV: &str = "DEEPSEEK_ALLOW_INSECURE_HTTP";
 pub(super) const SSE_BACKPRESSURE_HIGH_WATERMARK: usize = 8 * 1024 * 1024; // 8 MB
 pub(super) const SSE_BACKPRESSURE_SLEEP_MS: u64 = 10;
 pub(super) const SSE_MAX_LINES_PER_CHUNK: usize = 256;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectionState {
     Healthy,
@@ -297,6 +328,8 @@ impl Clone for DeepSeekClient {
             default_model: self.default_model.clone(),
             connection_health: self.connection_health.clone(),
             rate_limiter: self.rate_limiter.clone(),
+            path_suffix: self.path_suffix.clone(),
+            stream_idle_timeout: self.stream_idle_timeout,
         }
     }
 }
@@ -338,23 +371,25 @@ fn validate_base_url_security(base_url: &str) -> Result<()> {
             .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
     {
         logging::warn(format!(
-            "Using insecure HTTP base URL because {} is set",
-            ALLOW_INSECURE_HTTP_ENV
+            "Using insecure HTTP base URL because {ALLOW_INSECURE_HTTP_ENV} is set"
         ));
         return Ok(());
     }
 
     if base_url.starts_with("http://") {
         anyhow::bail!(
-            "Refusing insecure base URL '{}'. Use HTTPS or set {}=1 to override for trusted environments.",
-            base_url,
-            ALLOW_INSECURE_HTTP_ENV
+            "Refusing insecure base URL '{base_url}'.\n\
+             \n\
+             Loopback hosts (localhost, 127.0.0.1, [::1]) are auto-allowed.\n\
+             For other trusted local hosts (LAN, llama.cpp on a private IP, etc.)\n\
+             set the env var `{ALLOW_INSECURE_HTTP_ENV}=1` in the shell that runs deepseek and re-run.\n\
+             \n\
+             Example: `{ALLOW_INSECURE_HTTP_ENV}=1 deepseek` (note the underscores).",
         );
     }
 
     anyhow::bail!(
-        "Refusing base URL '{}': only HTTPS (or explicitly allowed HTTP) URLs are supported.",
-        base_url,
+        "Refusing base URL '{base_url}': only HTTPS (or explicitly allowed HTTP) URLs are supported.",
     )
 }
 
@@ -390,15 +425,99 @@ fn is_version_segment(segment: &str) -> bool {
 }
 
 pub(super) fn api_url(base_url: &str, path: &str) -> String {
+    api_url_with_suffix(base_url, path, None)
+}
+
+pub(super) fn api_url_with_suffix(base_url: &str, path: &str, path_suffix: Option<&str>) -> String {
     let path = path.trim_start_matches('/');
     if path.starts_with("beta/") {
         return format!("{}/{}", unversioned_base_url(base_url), path);
     }
-    format!(
-        "{}/{}",
-        versioned_base_url(base_url).trim_end_matches('/'),
-        path
-    )
+    if let ("chat/completions", Some(suffix)) = (path, path_suffix) {
+        return format!(
+            "{}/{}",
+            unversioned_base_url(base_url),
+            suffix.trim_start_matches('/')
+        );
+    }
+    let mut versioned = versioned_base_url(base_url);
+    // The /beta suffix is not a real API version — it is an
+    // opt-in surface for beta features.  Only paths with an
+    // explicit `beta/` prefix should hit the beta surface;
+    // everything else (models, chat/completions, health, …)
+    // must go to the standard /v1 surface.
+    if versioned.ends_with("beta") {
+        versioned = format!("{}/v1", unversioned_base_url(base_url));
+    }
+    format!("{}/{}", versioned.trim_end_matches('/'), path)
+}
+
+fn normalize_audio_format(format: &str) -> String {
+    let normalized = format.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        "wav".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn parse_speech_audio_response(payload: &Value) -> Result<(Vec<u8>, Option<String>)> {
+    let audio = payload
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| {
+            choice
+                .get("message")
+                .and_then(|message| message.get("audio"))
+                .or_else(|| choice.get("delta").and_then(|delta| delta.get("audio")))
+        })
+        .or_else(|| payload.get("audio"))
+        .context("Speech synthesis response did not include choices[0].message.audio")?;
+
+    let data = audio
+        .get("data")
+        .and_then(Value::as_str)
+        .context("Speech synthesis response did not include audio.data")?
+        .trim();
+    let data = data
+        .split_once(',')
+        .map(|(_, base64)| base64.trim())
+        .unwrap_or(data);
+    let audio_bytes = general_purpose::STANDARD
+        .decode(data)
+        .context("Failed to decode speech audio base64 data")?;
+    let transcript = audio
+        .get("transcript")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    Ok((audio_bytes, transcript))
+}
+
+fn build_speech_synthesis_body(
+    model: &str,
+    text: &str,
+    instruction: Option<&str>,
+    audio: Value,
+) -> Value {
+    let mut messages = Vec::new();
+    if let Some(instruction) = instruction.map(str::trim).filter(|value| !value.is_empty()) {
+        messages.push(json!({
+            "role": "user",
+            "content": instruction,
+        }));
+    }
+    messages.push(json!({
+        "role": "assistant",
+        "content": text,
+    }));
+
+    json!({
+        "model": model,
+        "messages": messages,
+        "audio": audio,
+    })
 }
 
 // === DeepSeekClient ===
@@ -467,14 +586,28 @@ impl DeepSeekClient {
         validate_base_url_security(&base_url)?;
         let retry = config.retry_policy();
         let default_model = config.default_model();
+        let stream_idle_timeout = Duration::from_secs(config.stream_chunk_timeout_secs());
         let http_headers = config.http_headers();
+        let insecure_skip_tls_verify = config.insecure_skip_tls_verify();
+        let path_suffix = config
+            .provider_config_for(api_provider)
+            .and_then(|p| p.path_suffix.clone());
 
         logging::info(format!("API provider: {}", api_provider.as_str()));
         logging::info(format!("API base URL: {base_url}"));
+        if let Some(suffix) = &path_suffix {
+            logging::info(format!("API path suffix override: {suffix}"));
+        }
         if !http_headers.is_empty() {
             logging::info(format!(
                 "{} custom HTTP header(s) configured",
                 http_headers.len()
+            ));
+        }
+        if insecure_skip_tls_verify {
+            logging::warn(format!(
+                "TLS certificate verification is disabled for provider {}; prefer SSL_CERT_FILE with a trusted custom CA bundle when possible",
+                api_provider.as_str()
             ));
         }
         logging::info(format!(
@@ -482,7 +615,13 @@ impl DeepSeekClient {
             retry.enabled, retry.max_retries, retry.initial_delay, retry.max_delay
         ));
 
-        let http_client = Self::build_http_client(&api_key, &http_headers)?;
+        let http_client = Self::build_http_client(
+            &api_key,
+            &http_headers,
+            api_provider,
+            &base_url,
+            insecure_skip_tls_verify,
+        )?;
 
         Ok(Self {
             http_client,
@@ -493,16 +632,38 @@ impl DeepSeekClient {
             default_model,
             connection_health: Arc::new(AsyncMutex::new(ConnectionHealth::default())),
             rate_limiter: Arc::new(AsyncMutex::new(TokenBucket::from_env())),
+            path_suffix,
+            stream_idle_timeout,
         })
     }
 
     fn build_http_client(
         api_key: &str,
         extra_headers: &HashMap<String, String>,
+        api_provider: ApiProvider,
+        base_url: &str,
+        insecure_skip_tls_verify: bool,
     ) -> Result<reqwest::Client> {
-        let headers = build_default_headers(api_key, extra_headers)?;
-        let mut builder = reqwest::Client::builder()
+        let headers = build_default_headers(api_key, extra_headers, api_provider, base_url)?;
+        // The ChatGPT Codex backend sits behind Cloudflare bot protection that
+        // only admits the Codex CLI's user agent; present a codex_cli_rs UA on
+        // that path so the request is handled like the official client.
+        let user_agent: &str = if api_provider == ApiProvider::OpenaiCodex {
+            concat!(
+                "codex_cli_rs/0.137.0 (CodeWhale ",
+                env!("CARGO_PKG_VERSION"),
+                ")"
+            )
+        } else {
+            concat!(
+                "Mozilla/5.0 (compatible; codewhale/",
+                env!("CARGO_PKG_VERSION"),
+                "; +https://github.com/Hmbown/CodeWhale)"
+            )
+        };
+        let mut builder = crate::tls::reqwest_client_builder()
             .default_headers(headers)
+            .user_agent(user_agent)
             .connect_timeout(Duration::from_secs(30))
             .tcp_keepalive(Some(Duration::from_secs(30)))
             .http2_keep_alive_interval(Some(Duration::from_secs(15)))
@@ -517,6 +678,9 @@ impl DeepSeekClient {
         {
             builder = add_extra_root_certs(builder, &cert_path);
         }
+        if insecure_skip_tls_verify {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
         builder.build().map_err(Into::into)
     }
 
@@ -525,21 +689,63 @@ impl DeepSeekClient {
         api_key: &str,
         extra_headers: &HashMap<String, String>,
     ) -> Result<HeaderMap> {
-        build_default_headers(api_key, extra_headers)
+        build_default_headers(
+            api_key,
+            extra_headers,
+            ApiProvider::Deepseek,
+            crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+        )
+    }
+
+    #[cfg(test)]
+    fn default_headers_for_provider(
+        api_key: &str,
+        extra_headers: &HashMap<String, String>,
+        api_provider: ApiProvider,
+        base_url: &str,
+    ) -> Result<HeaderMap> {
+        build_default_headers(api_key, extra_headers, api_provider, base_url)
     }
 }
 
 fn build_default_headers(
     api_key: &str,
     extra_headers: &HashMap<String, String>,
+    api_provider: ApiProvider,
+    base_url: &str,
 ) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    if !api_key.trim().is_empty() {
+    let api_key = api_key.trim();
+    if api_provider == ApiProvider::Anthropic {
+        // #3014: the Messages API authenticates with `x-api-key` (never
+        // `Authorization: Bearer`) and pins the wire contract via
+        // `anthropic-version`.
         headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {api_key}"))?,
+            HeaderName::from_static("anthropic-version"),
+            HeaderValue::from_static("2023-06-01"),
         );
+    }
+    let auth_header_name = if !api_key.is_empty() && api_provider == ApiProvider::Anthropic {
+        Some(HeaderName::from_static("x-api-key"))
+    } else if !api_key.is_empty()
+        && api_provider == ApiProvider::XiaomiMimo
+        && (xiaomi_mimo_base_url_uses_token_plan(base_url)
+            || xiaomi_mimo_api_key_uses_token_plan(api_key))
+    {
+        Some(HeaderName::from_static("api-key"))
+    } else if !api_key.is_empty() {
+        Some(AUTHORIZATION)
+    } else {
+        None
+    };
+    if let Some(header_name) = auth_header_name.as_ref() {
+        let header_value = if *header_name == AUTHORIZATION {
+            HeaderValue::from_str(&format!("Bearer {api_key}"))?
+        } else {
+            HeaderValue::from_str(api_key)?
+        };
+        headers.insert(header_name.clone(), header_value);
     }
     for (name, value) in extra_headers {
         let name = name.trim();
@@ -548,7 +754,10 @@ fn build_default_headers(
             continue;
         }
         let header_name = HeaderName::from_bytes(name.as_bytes())?;
-        if header_name == AUTHORIZATION || header_name == CONTENT_TYPE {
+        if header_name == AUTHORIZATION
+            || header_name == CONTENT_TYPE
+            || auth_header_name.as_ref() == Some(&header_name)
+        {
             continue;
         }
         headers.insert(header_name, HeaderValue::from_str(value)?);
@@ -556,7 +765,98 @@ fn build_default_headers(
     Ok(headers)
 }
 
+fn xiaomi_mimo_base_url_uses_token_plan(base_url: &str) -> bool {
+    let normalized = base_url.trim().to_ascii_lowercase();
+    let without_scheme = normalized
+        .strip_prefix("https://")
+        .or_else(|| normalized.strip_prefix("http://"))
+        .unwrap_or(&normalized);
+    let host = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host = host.split(':').next().unwrap_or(host);
+    host.starts_with("token-plan-") && host.ends_with(".xiaomimimo.com")
+}
+
+fn xiaomi_mimo_api_key_uses_token_plan(api_key: &str) -> bool {
+    api_key.trim_start().starts_with("tp-")
+}
+
 impl DeepSeekClient {
+    /// Returns the API base URL used by this client.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Returns the active API provider for this client. Used by the turn loop
+    /// to apply provider-specific request policies (e.g. Arcee's reduced
+    /// first-turn tool surface that clears the Cloudflare WAF).
+    pub fn api_provider(&self) -> ApiProvider {
+        self.api_provider
+    }
+
+    /// Translate text to the requested target language using a focused
+    /// non-streaming chat completion call on the supplied model.
+    ///
+    /// This is a lightweight translation service — no tool calls, no
+    /// streaming, no conversation history. The dedicated translation agent
+    /// receives the source text and returns only the translated result.
+    pub async fn translate(
+        &self,
+        text: &str,
+        model: &str,
+        target_language: &str,
+    ) -> Result<String> {
+        let url = api_url_with_suffix(
+            &self.base_url,
+            "chat/completions",
+            self.path_suffix.as_deref(),
+        );
+        let model = wire_model_for_provider(self.api_provider, model);
+        let mut body = serde_json::json!({
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": format!(
+                        "You are a professional translator. Your ONLY task is to translate text to {target_language}. \
+                         Rules:\n\
+                         1. Output ONLY the translation, nothing else — no explanations, no notes, no quotes.\n\
+                         2. Preserve all code blocks (```...```), URLs, file paths, command names, \
+                         and technical terms like API names, function names, and library names untranslated.\n\
+                         3. Keep Markdown formatting (headings, lists, bold, italics, links) intact.\n\
+                         4. Translate all natural-language prose naturally and professionally.\n\
+                         5. Do NOT add any prefix, suffix, or commentary.\n\
+                         6. If the input is already in {target_language} or contains no prose to translate, \
+                         return it as-is."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": text
+                }
+            ],
+            "max_tokens": 4096,
+            "temperature": 0.1,
+            "stream": false
+        });
+        apply_reasoning_effort(&mut body, Some("off"), self.api_provider);
+
+        let response = self
+            .send_with_retry(|| self.http_client.post(&url).json(&body))
+            .await?;
+
+        let value: serde_json::Value = response.json().await?;
+        let translated = value["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("translate: unexpected API response shape"))?
+            .trim()
+            .to_string();
+
+        Ok(translated)
+    }
+
     /// List available models from the provider.
     pub async fn list_models(&self) -> Result<Vec<AvailableModel>> {
         let url = api_url(&self.base_url, "models");
@@ -564,12 +864,113 @@ impl DeepSeekClient {
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+            let raw_error_text = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+            let error_text = sanitize_http_error_body(
+                Some(self.api_provider.display_name()),
+                status.as_u16(),
+                &raw_error_text,
+            );
             anyhow::bail!("Failed to list models: HTTP {status}: {error_text}");
         }
-        let response_text = response.text().await.unwrap_or_default();
+        let response_text = response
+            .text()
+            .await
+            .context("Failed to read models response body")?;
 
         parse_models_response(&response_text)
+    }
+
+    /// Generate speech with Xiaomi MiMo TTS models.
+    ///
+    /// The spoken text is placed in an `assistant` message because Xiaomi
+    /// MiMo's TTS chat-completions surface expects that shape. The optional
+    /// `instruction` is a `user` message that controls style, voice design, or
+    /// voice-clone performance and is not spoken verbatim.
+    pub async fn synthesize_speech(
+        &self,
+        request: SpeechSynthesisRequest,
+    ) -> Result<SpeechSynthesisResponse> {
+        if self.api_provider != crate::config::ApiProvider::XiaomiMimo {
+            anyhow::bail!(
+                "speech synthesis requires provider 'xiaomi-mimo' (current: {})",
+                self.api_provider.as_str()
+            );
+        }
+
+        let model = request.model.trim().to_string();
+        if model.is_empty() {
+            anyhow::bail!("Speech model cannot be empty");
+        }
+        let text = request.text.trim().to_string();
+        if text.is_empty() {
+            anyhow::bail!("Speech text cannot be empty");
+        }
+
+        let audio_format = normalize_audio_format(&request.audio_format);
+        let model = wire_model_for_provider(self.api_provider, &model);
+        let model_lower = model.to_ascii_lowercase();
+        let instruction = request
+            .instruction
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let voice = request
+            .voice
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        if model_lower.contains("voicedesign") && instruction.is_none() {
+            anyhow::bail!(
+                "Model '{model}' requires a voice design prompt. Pass --voice-prompt or --instruction."
+            );
+        }
+        if model_lower.contains("voiceclone") && voice.is_none() {
+            anyhow::bail!(
+                "Model '{model}' requires cloned voice data. Pass --clone-voice <mp3|wav> or --voice <data-uri>."
+            );
+        }
+
+        let mut audio = json!({
+            "format": audio_format.clone(),
+        });
+        if let Some(voice) = voice.as_deref() {
+            audio["voice"] = json!(voice);
+        }
+
+        let body = build_speech_synthesis_body(&model, &text, instruction, audio);
+
+        let url = api_url(&self.base_url, "chat/completions");
+        let response = self
+            .send_with_retry(|| self.http_client.post(&url).json(&body))
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let raw_error_text = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+            let error_text = sanitize_http_error_body(
+                Some(self.api_provider.display_name()),
+                status.as_u16(),
+                &raw_error_text,
+            );
+            anyhow::bail!("Speech synthesis failed: HTTP {status}: {error_text}");
+        }
+
+        let response_text = response
+            .text()
+            .await
+            .context("Failed to read speech synthesis response body")?;
+        let payload: Value = serde_json::from_str(&response_text)
+            .context("Failed to parse speech synthesis response JSON")?;
+        let (audio_bytes, transcript) = parse_speech_audio_response(&payload)?;
+
+        Ok(SpeechSynthesisResponse {
+            model,
+            audio_format,
+            audio_bytes,
+            transcript,
+            voice,
+        })
     }
 
     async fn wait_for_rate_limit(&self) {
@@ -610,6 +1011,8 @@ impl DeepSeekClient {
         let probe = self.http_client.get(health_url).send().await;
         match probe {
             Ok(resp) if resp.status().is_success() => {
+                // Consume the response body so the connection can be returned to the pool.
+                let _ = resp.text().await;
                 self.mark_request_success().await;
                 logging::info("Recovery probe succeeded");
             }
@@ -643,12 +1046,13 @@ impl DeepSeekClient {
                     if status.is_success() {
                         return Ok(response);
                     }
-                    let retryable = status.as_u16() == 429 || status.is_server_error();
-                    if !retryable {
-                        return Ok(response);
-                    }
                     let retry_after = extract_retry_after(response.headers());
                     let body = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+                    let body = sanitize_http_error_body(
+                        Some(self.api_provider.display_name()),
+                        status.as_u16(),
+                        &body,
+                    );
                     Err(LlmError::from_http_response_with_retry_after(
                         status.as_u16(),
                         &body,
@@ -726,6 +1130,8 @@ impl LlmClient for DeepSeekClient {
         let response = self.http_client.get(health_url).send().await;
         match response {
             Ok(resp) if resp.status().is_success() => {
+                // Consume the response body so the connection can be returned to the pool.
+                let _ = resp.text().await;
                 self.mark_request_success().await;
                 Ok(true)
             }
@@ -743,6 +1149,12 @@ impl LlmClient for DeepSeekClient {
     }
 
     async fn create_message(&self, request: MessageRequest) -> Result<MessageResponse> {
+        if self.api_provider == ApiProvider::OpenaiCodex {
+            return self.handle_responses_message(request).await;
+        }
+        if self.api_provider == ApiProvider::Anthropic {
+            return self.handle_anthropic_message(request).await;
+        }
         self.create_message_chat(&request).await
     }
 
@@ -750,6 +1162,12 @@ impl LlmClient for DeepSeekClient {
         &self,
         request: MessageRequest,
     ) -> Result<crate::llm_client::StreamEventBox> {
+        if self.api_provider == ApiProvider::OpenaiCodex {
+            return self.handle_responses_stream(request).await;
+        }
+        if self.api_provider == ApiProvider::Anthropic {
+            return self.handle_anthropic_stream(request).await;
+        }
         self.handle_chat_completion_stream(request).await
     }
 }
@@ -819,13 +1237,51 @@ pub(super) fn apply_reasoning_effort(
             ApiProvider::Deepseek
             | ApiProvider::DeepseekCN
             | ApiProvider::Openrouter
+            | ApiProvider::XiaomiMimo
             | ApiProvider::Novita
-            | ApiProvider::Fireworks
+            | ApiProvider::Siliconflow
+            | ApiProvider::SiliconflowCn
             | ApiProvider::Sglang
-            | ApiProvider::Vllm => {
+            | ApiProvider::Volcengine
+            | ApiProvider::Together
+            | ApiProvider::Atlascloud => {
                 body["thinking"] = json!({ "type": "disabled" });
             }
-            ApiProvider::Openai | ApiProvider::Ollama => {}
+            ApiProvider::OpenaiCodex => {
+                // OpenAI Codex uses Responses API — thinking handled differently
+            }
+            ApiProvider::Fireworks => {}
+            // vLLM is an OpenAI-protocol server, not an Anthropic-protocol one.
+            // For Qwen3 / DeepSeek-R1 / other reasoning models hosted via vLLM,
+            // the canonical OpenAI extension to disable thinking is
+            // `chat_template_kwargs.enable_thinking`. The old
+            // `thinking: {type: disabled}` field is Anthropic-native and
+            // silently ignored by vLLM — the model still emits a full
+            // reasoning trace into the `reasoning` field (which this client
+            // doesn't surface), causing 10+ seconds of perceived "freeze"
+            // before the first content token (PR #1480 by @h3c-hexin).
+            ApiProvider::Vllm => {
+                body["chat_template_kwargs"] = json!({
+                    "enable_thinking": false,
+                });
+            }
+            ApiProvider::Openai
+            | ApiProvider::WanjieArk
+            | ApiProvider::Arcee
+            | ApiProvider::Huggingface => {}
+            ApiProvider::Moonshot => {
+                // #3024: Kimi models accept thinking enable/disable.
+                body["thinking"] = json!({ "type": "disabled" });
+            }
+            ApiProvider::Ollama => {
+                // #3024: Ollama OpenAI-compat endpoint accepts think param.
+                body["think"] = json!(false);
+            }
+            ApiProvider::Anthropic => {
+                // #3014: thinking/effort shaping happens natively inside
+                // client/anthropic.rs (adaptive thinking + output_config),
+                // not via OpenAI-dialect fields.
+            }
             ApiProvider::NvidiaNim => {
                 body["chat_template_kwargs"] = json!({
                     "thinking": false,
@@ -833,17 +1289,71 @@ pub(super) fn apply_reasoning_effort(
             }
         },
         "low" | "minimal" | "medium" | "mid" | "high" | "" => match provider {
+            // DeepSeek compatibility: low/medium both map to high
             ApiProvider::Deepseek
             | ApiProvider::DeepseekCN
-            | ApiProvider::Openrouter
-            | ApiProvider::Novita
-            | ApiProvider::Fireworks
+            | ApiProvider::Siliconflow
+            | ApiProvider::SiliconflowCn
             | ApiProvider::Sglang
-            | ApiProvider::Vllm => {
+            | ApiProvider::Volcengine
+            | ApiProvider::Atlascloud => {
                 body["reasoning_effort"] = json!("high");
                 body["thinking"] = json!({ "type": "enabled" });
             }
-            ApiProvider::Openai | ApiProvider::Ollama => {}
+            // OpenRouter/Novita/Together: pass through the actual user-chosen value.
+            // OpenRouter's unified scale is none/minimal/low/medium/high/xhigh;
+            // DeepSeek models hosted there accept those directly.
+            ApiProvider::Openrouter | ApiProvider::Novita | ApiProvider::Together => {
+                let value = match normalized.as_str() {
+                    "low" | "minimal" => "low",
+                    "medium" | "mid" => "medium",
+                    _ => "high",
+                };
+                body["reasoning_effort"] = json!(value);
+                body["thinking"] = json!({ "type": "enabled" });
+            }
+            ApiProvider::XiaomiMimo => {
+                body["thinking"] = json!({ "type": "enabled" });
+            }
+            ApiProvider::Arcee | ApiProvider::Huggingface => {
+                let value = match normalized.as_str() {
+                    "minimal" => "minimal",
+                    "low" => "low",
+                    "medium" | "mid" => "medium",
+                    _ => "high",
+                };
+                body["reasoning_effort"] = json!(value);
+            }
+            ApiProvider::Fireworks => {
+                body["reasoning_effort"] = json!("high");
+            }
+            ApiProvider::Vllm => {
+                body["chat_template_kwargs"] = json!({
+                    "enable_thinking": true,
+                });
+                // vLLM supports low/medium/high natively — pass through the
+                // user-chosen value instead of hard-coding "high".
+                let value = match normalized.as_str() {
+                    "low" | "minimal" => "low",
+                    "medium" | "mid" => "medium",
+                    _ => "high",
+                };
+                body["reasoning_effort"] = json!(value);
+            }
+            ApiProvider::Openai | ApiProvider::WanjieArk | ApiProvider::OpenaiCodex => {}
+            ApiProvider::Moonshot => {
+                // #3024: Kimi models accept thinking enable.
+                body["thinking"] = json!({ "type": "enabled" });
+            }
+            ApiProvider::Ollama => {
+                // #3024: Ollama think param.
+                body["think"] = json!(true);
+            }
+            ApiProvider::Anthropic => {
+                // #3014: thinking/effort shaping happens natively inside
+                // client/anthropic.rs (adaptive thinking + output_config),
+                // not via OpenAI-dialect fields.
+            }
             ApiProvider::NvidiaNim => {
                 body["chat_template_kwargs"] = json!({
                     "thinking": true,
@@ -854,15 +1364,49 @@ pub(super) fn apply_reasoning_effort(
         "xhigh" | "max" | "highest" => match provider {
             ApiProvider::Deepseek
             | ApiProvider::DeepseekCN
-            | ApiProvider::Openrouter
-            | ApiProvider::Novita
-            | ApiProvider::Fireworks
+            | ApiProvider::Siliconflow
+            | ApiProvider::SiliconflowCn
             | ApiProvider::Sglang
-            | ApiProvider::Vllm => {
+            | ApiProvider::Volcengine
+            | ApiProvider::Atlascloud => {
                 body["reasoning_effort"] = json!("max");
                 body["thinking"] = json!({ "type": "enabled" });
             }
-            ApiProvider::Openai | ApiProvider::Ollama => {}
+            ApiProvider::Openrouter | ApiProvider::Novita | ApiProvider::Together => {
+                body["reasoning_effort"] = json!("xhigh");
+                body["thinking"] = json!({ "type": "enabled" });
+            }
+            ApiProvider::XiaomiMimo => {
+                body["thinking"] = json!({ "type": "enabled" });
+            }
+            ApiProvider::Arcee | ApiProvider::Huggingface => {
+                body["reasoning_effort"] = json!("high");
+            }
+            ApiProvider::Fireworks => {
+                body["reasoning_effort"] = json!("max");
+            }
+            ApiProvider::Vllm => {
+                body["chat_template_kwargs"] = json!({
+                    "enable_thinking": true,
+                });
+                // vLLM only supports none/low/medium/high — downgrade
+                // "max" to "high" instead of sending an invalid value.
+                body["reasoning_effort"] = json!("high");
+            }
+            ApiProvider::Openai | ApiProvider::WanjieArk | ApiProvider::OpenaiCodex => {}
+            ApiProvider::Moonshot => {
+                // #3024: Kimi models accept thinking enable.
+                body["thinking"] = json!({ "type": "enabled" });
+            }
+            ApiProvider::Ollama => {
+                // #3024: Ollama think param.
+                body["think"] = json!(true);
+            }
+            ApiProvider::Anthropic => {
+                // #3014: thinking/effort shaping happens natively inside
+                // client/anthropic.rs (adaptive thinking + output_config),
+                // not via OpenAI-dialect fields.
+            }
             ApiProvider::NvidiaNim => {
                 body["chat_template_kwargs"] = json!({
                     "thinking": true,
@@ -886,6 +1430,9 @@ pub(super) fn parse_usage(usage: Option<&Value>) -> Usage {
         })
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let total_tokens = usage
+        .and_then(|u| u.get("total_tokens"))
+        .and_then(Value::as_u64);
     let reasoning_tokens_raw = usage
         .and_then(|u| u.get("completion_tokens_details"))
         .and_then(|details| details.get("reasoning_tokens"))
@@ -894,6 +1441,10 @@ pub(super) fn parse_usage(usage: Option<&Value>) -> Usage {
         && let Some(reasoning_tokens) = reasoning_tokens_raw
     {
         output_tokens = reasoning_tokens;
+    } else if output_tokens == 0
+        && let Some(total_tokens) = total_tokens
+    {
+        output_tokens = total_tokens.saturating_sub(input_tokens);
     }
     let cached_tokens = usage
         .and_then(|u| u.get("prompt_tokens_details"))
@@ -907,7 +1458,7 @@ pub(super) fn parse_usage(usage: Option<&Value>) -> Usage {
     let prompt_cache_miss_tokens = usage
         .and_then(|u| u.get("prompt_cache_miss_tokens"))
         .and_then(Value::as_u64)
-        .or_else(|| cached_tokens.map(|cached| input_tokens.saturating_sub(cached)))
+        .or_else(|| prompt_cache_hit_tokens.map(|hit| input_tokens.saturating_sub(u64::from(hit))))
         .map(|v| v as u32);
     let reasoning_tokens = reasoning_tokens_raw.map(|v| v as u32);
 
@@ -927,8 +1478,8 @@ pub(super) fn parse_usage(usage: Option<&Value>) -> Usage {
     });
 
     Usage {
-        input_tokens: input_tokens as u32,
-        output_tokens: output_tokens as u32,
+        input_tokens: input_tokens.min(u64::from(u32::MAX)) as u32,
+        output_tokens: output_tokens.min(u64::from(u32::MAX)) as u32,
         prompt_cache_hit_tokens,
         prompt_cache_miss_tokens,
         reasoning_tokens,
@@ -946,7 +1497,8 @@ impl DeepSeekClient {
         suffix: &str,
         max_tokens: u32,
     ) -> anyhow::Result<String> {
-        let url = api_url(&self.base_url, "beta/completions");
+        let url = api_url_with_suffix(&self.base_url, "beta/completions", None);
+        let model = wire_model_for_provider(self.api_provider, model);
         let body = json!({
             "model": model,
             "prompt": prompt,
@@ -958,10 +1510,18 @@ impl DeepSeekClient {
             .await?;
         let status = response.status();
         if !status.is_success() {
-            let error_text = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+            let raw_error_text = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+            let error_text = sanitize_http_error_body(
+                Some(self.api_provider.display_name()),
+                status.as_u16(),
+                &raw_error_text,
+            );
             anyhow::bail!("FIM API error: HTTP {status}: {error_text}");
         }
-        let response_text = response.text().await.unwrap_or_default();
+        let response_text = response
+            .text()
+            .await
+            .context("Failed to read FIM API response body")?;
         let value: serde_json::Value =
             serde_json::from_str(&response_text).context("Failed to parse FIM API response")?;
         let text = value
@@ -972,13 +1532,26 @@ impl DeepSeekClient {
     }
 }
 
+mod anthropic;
 mod chat;
+mod responses;
+
+pub(crate) use chat::{CacheWarmupKey, PromptInspection};
+
+pub(crate) fn inspect_prompt_for_request(request: &MessageRequest) -> PromptInspection {
+    chat::inspect_prompt_for_request(request)
+}
+
+pub(crate) fn build_cache_warmup_request(request: &MessageRequest) -> MessageRequest {
+    chat::build_cache_warmup_request(request)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::client::chat::{
-        build_chat_messages, build_chat_messages_for_request, count_reasoning_replay_chars,
+        build_chat_messages, build_chat_messages_for_request,
+        build_chat_messages_for_request_and_provider, count_reasoning_replay_chars,
         parse_chat_message, parse_sse_chunk, sanitize_thinking_mode_messages, tool_to_chat,
         tool_to_chat_for_base_url,
     };
@@ -986,6 +1559,103 @@ mod tests {
         ContentBlock, ContentBlockStart, Delta, Message, MessageRequest, StreamEvent, Tool,
     };
     use serde_json::json;
+
+    fn test_tool(name: &str) -> Tool {
+        Tool {
+            tool_type: None,
+            name: name.to_string(),
+            description: format!("{name} test tool"),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+            }),
+            allowed_callers: None,
+            defer_loading: Some(false),
+            input_examples: None,
+            strict: Some(true),
+            cache_control: None,
+        }
+    }
+
+    #[test]
+    fn parse_speech_audio_response_accepts_message_audio() {
+        let encoded = general_purpose::STANDARD.encode(b"hi");
+        let payload = json!({
+            "choices": [{
+                "message": {
+                    "audio": {
+                        "data": encoded,
+                        "transcript": "hi"
+                    }
+                }
+            }]
+        });
+
+        let (audio, transcript) = parse_speech_audio_response(&payload).unwrap();
+        assert_eq!(audio, b"hi");
+        assert_eq!(transcript.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn parse_speech_audio_response_accepts_data_uri() {
+        let encoded = general_purpose::STANDARD.encode(b"wav");
+        let payload = json!({
+            "audio": {
+                "data": format!("data:audio/wav;base64,{encoded}")
+            }
+        });
+
+        let (audio, transcript) = parse_speech_audio_response(&payload).unwrap();
+        assert_eq!(audio, b"wav");
+        assert_eq!(transcript, None);
+    }
+
+    #[test]
+    fn speech_synthesis_body_omits_user_message_without_instruction() {
+        let body =
+            build_speech_synthesis_body("mimo-v2.5-tts", "hello", None, json!({"format": "wav"}));
+        let messages = body["messages"].as_array().expect("messages array");
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"], "hello");
+        assert!(
+            messages
+                .iter()
+                .all(|message| message["content"].as_str() != Some(""))
+        );
+    }
+
+    #[test]
+    fn speech_synthesis_body_ignores_blank_instruction() {
+        let body = build_speech_synthesis_body(
+            "mimo-v2.5-tts",
+            "hello",
+            Some("  \t\n  "),
+            json!({"format": "wav"}),
+        );
+        let messages = body["messages"].as_array().expect("messages array");
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "assistant");
+    }
+
+    #[test]
+    fn speech_synthesis_body_includes_non_empty_instruction_first() {
+        let body = build_speech_synthesis_body(
+            "mimo-v2.5-tts-voicedesign",
+            "hello",
+            Some("warm and calm"),
+            json!({"format": "wav"}),
+        );
+        let messages = body["messages"].as_array().expect("messages array");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "warm and calm");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "hello");
+    }
 
     #[test]
     fn tool_name_roundtrip_dot() {
@@ -1042,9 +1712,11 @@ mod tests {
             api_url("https://api.deepseek.com/v1", "chat/completions"),
             "https://api.deepseek.com/v1/chat/completions"
         );
+        // Non-beta paths from a /beta base URL route to /v1.
+        // Only paths with an explicit beta/ prefix use the beta surface.
         assert_eq!(
             api_url("https://api.deepseek.com/beta", "chat/completions"),
-            "https://api.deepseek.com/beta/chat/completions"
+            "https://api.deepseek.com/v1/chat/completions"
         );
         assert_eq!(
             api_url(
@@ -1072,6 +1744,33 @@ mod tests {
     }
 
     #[test]
+    fn api_url_routes_models_and_non_beta_paths_to_v1() {
+        // The /models endpoint only exists at /v1/models, never at
+        // /beta/models. Non-beta paths from a /beta base URL must
+        // still route to /v1.
+        assert_eq!(
+            api_url("https://api.deepseek.com", "models"),
+            "https://api.deepseek.com/v1/models"
+        );
+        assert_eq!(
+            api_url("https://api.deepseek.com/v1", "models"),
+            "https://api.deepseek.com/v1/models"
+        );
+        assert_eq!(
+            api_url("https://api.deepseek.com/beta", "models"),
+            "https://api.deepseek.com/v1/models"
+        );
+        // explicit v<N> versions other than /v1 should be preserved
+        assert_eq!(
+            api_url(
+                "https://openai-compatible.example/api/coding/paas/v4",
+                "models"
+            ),
+            "https://openai-compatible.example/api/coding/paas/v4/models"
+        );
+    }
+
+    #[test]
     fn default_headers_include_custom_headers_when_configured() {
         let mut extra = HashMap::new();
         extra.insert("X-Model-Provider-Id".to_string(), "tongyi".to_string());
@@ -1093,11 +1792,115 @@ mod tests {
     }
 
     #[test]
+    fn build_http_client_accepts_default_tls_verification() {
+        let client = DeepSeekClient::build_http_client(
+            "sk-test",
+            &HashMap::new(),
+            ApiProvider::Deepseek,
+            crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+            false,
+        );
+
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn build_http_client_accepts_provider_scoped_tls_skip_verify() {
+        let client = DeepSeekClient::build_http_client(
+            "sk-test",
+            &HashMap::new(),
+            ApiProvider::Openai,
+            crate::config::DEFAULT_OPENAI_BASE_URL,
+            true,
+        );
+
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn client_stream_idle_timeout_uses_tui_config() {
+        let client = DeepSeekClient::new(&Config {
+            api_key: Some("sk-test".to_string()),
+            tui: Some(crate::config::TuiConfig {
+                stream_chunk_timeout_secs: Some(777),
+                ..crate::config::TuiConfig::default()
+            }),
+            ..Config::default()
+        })
+        .expect("client");
+
+        assert_eq!(client.stream_idle_timeout, Duration::from_secs(777));
+    }
+
+    #[test]
+    fn xiaomi_mimo_token_plan_endpoint_uses_api_key_header() {
+        let headers = DeepSeekClient::default_headers_for_provider(
+            "tp-test",
+            &HashMap::new(),
+            ApiProvider::XiaomiMimo,
+            crate::config::DEFAULT_XIAOMI_MIMO_BASE_URL,
+        )
+        .expect("headers");
+
+        assert_eq!(
+            headers.get("api-key").and_then(|value| value.to_str().ok()),
+            Some("tp-test")
+        );
+        assert!(
+            headers.get(AUTHORIZATION).is_none(),
+            "Token Plan requires api-key instead of Authorization Bearer"
+        );
+    }
+
+    #[test]
+    fn xiaomi_mimo_tp_key_uses_api_key_header_with_custom_base_url() {
+        let mut extra = HashMap::new();
+        extra.insert("api-key".to_string(), "wrong".to_string());
+        extra.insert("Authorization".to_string(), "Bearer wrong".to_string());
+        let headers = DeepSeekClient::default_headers_for_provider(
+            "tp-custom",
+            &extra,
+            ApiProvider::XiaomiMimo,
+            "https://proxy.example.test/mimo/v1",
+        )
+        .expect("headers");
+
+        assert_eq!(
+            headers.get("api-key").and_then(|value| value.to_str().ok()),
+            Some("tp-custom")
+        );
+        assert!(
+            headers.get(AUTHORIZATION).is_none(),
+            "tp-* Token Plan keys should use api-key auth even through custom gateways"
+        );
+    }
+
+    #[test]
+    fn xiaomi_mimo_pay_as_you_go_endpoint_keeps_bearer_header() {
+        let headers = DeepSeekClient::default_headers_for_provider(
+            "sk-test",
+            &HashMap::new(),
+            ApiProvider::XiaomiMimo,
+            crate::config::XIAOMI_MIMO_PAY_AS_YOU_GO_BASE_URL,
+        )
+        .expect("headers");
+
+        assert_eq!(
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer sk-test")
+        );
+        assert!(headers.get("api-key").is_none());
+    }
+
+    #[test]
     fn chat_messages_keep_current_turn_reasoning_content() {
         let message = Message {
             role: "assistant".to_string(),
             content: vec![
                 ContentBlock::Thinking {
+                    signature: None,
                     thinking: "plan".to_string(),
                 },
                 ContentBlock::Text {
@@ -1123,6 +1926,56 @@ mod tests {
     }
 
     #[test]
+    fn generic_openai_provider_drops_reasoning_content_for_non_deepseek_models() {
+        // #1542 intent (narrowed by #1739/#1694): a *genuine non-DeepSeek*
+        // model on the generic openai provider must not carry DeepSeek-only
+        // `reasoning_content`. A DeepSeek reasoning model on the openai
+        // provider (DeepSeek-compatible endpoint) is now covered separately
+        // and DOES replay reasoning_content — see
+        // `deepseek_model_on_openai_provider_still_replays_reasoning_content`.
+        let request = MessageRequest {
+            model: "qwen3-coder".to_string(),
+            messages: vec![Message {
+                role: "assistant".to_string(),
+                content: vec![
+                    ContentBlock::Thinking {
+                        signature: None,
+                        thinking: "plan".to_string(),
+                    },
+                    ContentBlock::Text {
+                        text: "done".to_string(),
+                        cache_control: None,
+                    },
+                ],
+            }],
+            max_tokens: 16,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: Some("max".to_string()),
+            stream: None,
+            temperature: None,
+            top_p: None,
+        };
+
+        let openai = build_chat_messages_for_request_and_provider(&request, ApiProvider::Openai);
+        let generic_assistant = openai
+            .iter()
+            .find(|value| value.get("role").and_then(Value::as_str) == Some("assistant"))
+            .expect("assistant message");
+        assert_eq!(
+            generic_assistant.get("content").and_then(Value::as_str),
+            Some("done")
+        );
+        assert!(
+            generic_assistant.get("reasoning_content").is_none(),
+            "generic OpenAI-compatible providers reject DeepSeek-only reasoning_content (#1542)"
+        );
+    }
+
+    #[test]
     fn chat_messages_replay_tool_round_reasoning_before_new_user_turn() {
         let messages = vec![
             Message {
@@ -1136,6 +1989,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: vec![
                     ContentBlock::Thinking {
+                        signature: None,
                         thinking: "Need to call a tool".to_string(),
                     },
                     ContentBlock::ToolUse {
@@ -1187,6 +2041,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: vec![
                     ContentBlock::Thinking {
+                        signature: None,
                         thinking: "Need to call a tool".to_string(),
                     },
                     ContentBlock::ToolUse {
@@ -1239,7 +2094,12 @@ mod tests {
     }
 
     #[test]
-    fn chat_messages_omit_prior_non_tool_reasoning_after_new_user_turn() {
+    fn chat_messages_keep_prior_non_tool_reasoning_after_new_user_turn() {
+        // The serialized JSON for a stored assistant message MUST be a pure
+        // function of that message — never of what comes after it. DeepSeek's
+        // prompt cache hashes the leading bytes of every request; flipping
+        // `reasoning_content` on/off across turns rewrites historical bytes
+        // and busts the prefix cache from that message onwards. (#583)
         let messages = vec![
             Message {
                 role: "user".to_string(),
@@ -1252,6 +2112,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: vec![
                     ContentBlock::Thinking {
+                        signature: None,
                         thinking: "Internal explanation plan".to_string(),
                     },
                     ContentBlock::Text {
@@ -1279,9 +2140,69 @@ mod tests {
             assistant.get("content").and_then(Value::as_str),
             Some("Final answer")
         );
-        assert!(
-            assistant.get("reasoning_content").is_none(),
-            "non-tool reasoning from previous turns should not be replayed"
+        assert_eq!(
+            assistant.get("reasoning_content").and_then(Value::as_str),
+            Some("Internal explanation plan"),
+            "reasoning_content must be preserved across follow-up user turns to keep DeepSeek's prefix cache warm"
+        );
+    }
+
+    #[test]
+    fn chat_messages_assistant_json_is_byte_stable_across_follow_up_user_turn() {
+        // Direct prefix-cache regression: the JSON for the assistant message
+        // built on turn N must equal the JSON for the same assistant message
+        // built on turn N+1, after a new user message has been appended.
+        let assistant = Message {
+            role: "assistant".to_string(),
+            content: vec![
+                ContentBlock::Thinking {
+                    signature: None,
+                    thinking: "I should explain step by step.".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "Here is the explanation.".to_string(),
+                    cache_control: None,
+                },
+            ],
+        };
+        let user_initial = Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "Explain it".to_string(),
+                cache_control: None,
+            }],
+        };
+        let user_follow_up = Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "Next question".to_string(),
+                cache_control: None,
+            }],
+        };
+
+        let turn_n = build_chat_messages(
+            None,
+            &[user_initial.clone(), assistant.clone()],
+            "deepseek-v4-pro",
+        );
+        let turn_n_plus_1 = build_chat_messages(
+            None,
+            &[user_initial, assistant, user_follow_up],
+            "deepseek-v4-pro",
+        );
+
+        let assistant_n = turn_n
+            .iter()
+            .find(|v| v.get("role").and_then(Value::as_str) == Some("assistant"))
+            .expect("assistant present in turn N");
+        let assistant_n1 = turn_n_plus_1
+            .iter()
+            .find(|v| v.get("role").and_then(Value::as_str) == Some("assistant"))
+            .expect("assistant present in turn N+1");
+
+        assert_eq!(
+            assistant_n, assistant_n1,
+            "assistant message JSON must be byte-identical across turns or DeepSeek's prefix cache breaks"
         );
     }
 
@@ -1337,6 +2258,312 @@ mod tests {
     }
 
     #[test]
+    fn prompt_builder_keeps_system_first_and_current_user_input_last() {
+        let request = MessageRequest {
+            model: "deepseek-v4-pro".to_string(),
+            messages: vec![
+                Message {
+                    role: "assistant".to_string(),
+                    content: vec![ContentBlock::Text {
+                        text: "Previous answer".to_string(),
+                        cache_control: None,
+                    }],
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: vec![
+                        ContentBlock::Text {
+                            text: "<turn_meta>\nCurrent local date: 2026-05-08\n</turn_meta>"
+                                .to_string(),
+                            cache_control: None,
+                        },
+                        ContentBlock::Text {
+                            text: "Current user question".to_string(),
+                            cache_control: None,
+                        },
+                    ],
+                },
+            ],
+            max_tokens: 1024,
+            system: Some(SystemPrompt::Text(
+                "Stable mode, project rules, and tool policy".to_string(),
+            )),
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: Some("max".to_string()),
+            stream: None,
+            temperature: None,
+            top_p: None,
+        };
+
+        let out = build_chat_messages_for_request(&request);
+
+        assert_eq!(out[0].get("role").and_then(Value::as_str), Some("system"));
+        assert_eq!(
+            out[0].get("content").and_then(Value::as_str),
+            Some("Stable mode, project rules, and tool policy")
+        );
+        let last = out.last().expect("latest user message");
+        assert_eq!(last.get("role").and_then(Value::as_str), Some("user"));
+        assert!(
+            last.get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.ends_with("Current user question")),
+            "current-turn user input must be at the tail of the wire prompt: {last:?}"
+        );
+    }
+
+    #[test]
+    fn prompt_inspect_reports_stable_layers_and_dynamic_user_task() {
+        let request = MessageRequest {
+            model: "deepseek-v4-pro".to_string(),
+            messages: vec![
+                Message {
+                    role: "assistant".to_string(),
+                    content: vec![ContentBlock::Text {
+                        text: "Prior answer".to_string(),
+                        cache_control: None,
+                    }],
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: vec![ContentBlock::Text {
+                        text: "Current task".to_string(),
+                        cache_control: None,
+                    }],
+                },
+            ],
+            max_tokens: 1024,
+            system: Some(SystemPrompt::Text(
+                "Base policy\n\n<project_instructions source=\"AGENTS.md\">\nRules\n</project_instructions>\n\n## Project Context Pack\n\n<project_context_pack>\n{}\n</project_context_pack>\n\n## Environment\n\n- lang: en"
+                    .to_string(),
+            )),
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: Some("max".to_string()),
+            stream: None,
+            temperature: None,
+            top_p: None,
+        };
+
+        let inspection = inspect_prompt_for_request(&request);
+
+        assert_eq!(inspection.base_static_prefix_hash.len(), 64);
+        assert_eq!(inspection.full_request_prefix_hash.len(), 64);
+        assert!(inspection.layers.iter().any(|layer| {
+            layer.name == "Global system prefix"
+                && layer.stability.label() == "static"
+                && layer.char_len == "Base policy".chars().count()
+                && layer.sha256.len() == 64
+        }));
+        assert!(inspection.layers.iter().any(|layer| {
+            layer.name == "Project context" && layer.stability.label() == "static"
+        }));
+        assert!(inspection.layers.iter().any(|layer| {
+            layer.name == "Project context pack" && layer.stability.label() == "static"
+        }));
+        assert!(inspection.layers.iter().any(|layer| {
+            layer.name == "Message #1 assistant" && layer.stability.label() == "history"
+        }));
+        assert!(
+            inspection.layers.last().is_some_and(
+                |layer| layer.name == "User task" && layer.stability.label() == "dynamic"
+            )
+        );
+    }
+
+    #[test]
+    fn prompt_inspect_keeps_static_base_hash_across_different_user_tasks() {
+        fn request_with_user_task(task: &str) -> MessageRequest {
+            MessageRequest {
+                model: "deepseek-v4-pro".to_string(),
+                messages: vec![
+                    Message {
+                        role: "assistant".to_string(),
+                        content: vec![ContentBlock::Text {
+                            text: "Prior answer".to_string(),
+                            cache_control: None,
+                        }],
+                    },
+                    Message {
+                        role: "user".to_string(),
+                        content: vec![ContentBlock::Text {
+                            text: task.to_string(),
+                            cache_control: None,
+                        }],
+                    },
+                ],
+                max_tokens: 1024,
+                system: Some(SystemPrompt::Text(
+                    "Base policy\n\n## Environment\n\n- shell: powershell\n\n## Skills\n\n- rust\n\n## Context Management\n\nKeep concise\n\n## Compact\n\nTemplate"
+                        .to_string(),
+                )),
+                tools: None,
+                tool_choice: None,
+                metadata: None,
+                thinking: None,
+                reasoning_effort: Some("max".to_string()),
+                stream: None,
+                temperature: None,
+                top_p: None,
+            }
+        }
+
+        let first = inspect_prompt_for_request(&request_with_user_task("First task"));
+        let second = inspect_prompt_for_request(&request_with_user_task("Second task"));
+        let mut changed_history_request = request_with_user_task("Second task");
+        changed_history_request.messages[0] = Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "Different prior answer".to_string(),
+                cache_control: None,
+            }],
+        };
+        let changed_history = inspect_prompt_for_request(&changed_history_request);
+
+        assert_eq!(
+            first.base_static_prefix_hash,
+            second.base_static_prefix_hash
+        );
+        assert_eq!(
+            first.full_request_prefix_hash, second.full_request_prefix_hash,
+            "full request prefix excludes the final dynamic user task"
+        );
+        assert_ne!(
+            second.full_request_prefix_hash, changed_history.full_request_prefix_hash,
+            "full request prefix can change when session history changes"
+        );
+        assert!(
+            second.layers.last().is_some_and(
+                |layer| layer.name == "User task" && layer.stability.label() == "dynamic"
+            ),
+            "current user task must remain the final layer"
+        );
+        assert!(second.layers.iter().any(|layer| {
+            layer.name == "Message #1 assistant" && layer.stability.label() == "history"
+        }));
+        assert!(!second.layers.iter().any(
+            |layer| layer.name.starts_with("Message #") && layer.stability.label() == "static"
+        ));
+    }
+
+    #[test]
+    fn prompt_inspect_tracks_tool_catalog_in_static_prefix_hash() {
+        let request = MessageRequest {
+            model: "deepseek-v4-pro".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "Current task".to_string(),
+                    cache_control: None,
+                }],
+            }],
+            max_tokens: 1024,
+            system: Some(SystemPrompt::Text("Base policy".to_string())),
+            tools: Some(vec![test_tool("read_file")]),
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: Some("max".to_string()),
+            stream: None,
+            temperature: None,
+            top_p: None,
+        };
+
+        let first = inspect_prompt_for_request(&request);
+        let mut changed_tools = request.clone();
+        changed_tools.tools = Some(vec![test_tool("read_file"), test_tool("grep_files")]);
+        let second = inspect_prompt_for_request(&changed_tools);
+
+        assert!(
+            first.layers.iter().any(|layer| {
+                layer.name == "Tool catalog" && layer.stability.label() == "static"
+            })
+        );
+        assert_ne!(
+            first.base_static_prefix_hash, second.base_static_prefix_hash,
+            "tool schema changes must be visible to cache-inspect base prefix diagnostics"
+        );
+        assert_ne!(
+            first.full_request_prefix_hash, second.full_request_prefix_hash,
+            "tool schema changes must be visible to full reusable-prefix diagnostics"
+        );
+    }
+
+    #[test]
+    fn cache_warmup_request_reuses_stable_prefix_and_fixed_user_tail() {
+        let request = MessageRequest {
+            model: "deepseek-v4-pro".to_string(),
+            messages: vec![
+                Message {
+                    role: "assistant".to_string(),
+                    content: vec![ContentBlock::Text {
+                        text: "Stable prior answer".to_string(),
+                        cache_control: None,
+                    }],
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: vec![ContentBlock::Text {
+                        text: "Dynamic latest user task".to_string(),
+                        cache_control: None,
+                    }],
+                },
+            ],
+            max_tokens: 1024,
+            system: Some(SystemPrompt::Text(
+                "Base policy\n\n<project_instructions source=\"AGENTS.md\">\nStable project rules\n</project_instructions>\n\n## Previous Session Relay\n\nDynamic relay"
+                    .to_string(),
+            )),
+            tools: Some(vec![test_tool("read_file")]),
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: Some("max".to_string()),
+            stream: Some(true),
+            temperature: Some(0.7),
+            top_p: None,
+        };
+
+        let warmup = build_cache_warmup_request(&request);
+
+        assert_eq!(warmup.max_tokens, 8);
+        assert_eq!(warmup.temperature, Some(0.0));
+        assert_eq!(warmup.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(warmup.tools.as_ref().map(Vec::len), Some(1));
+        assert_eq!(warmup.tool_choice, Some(json!("none")));
+        assert_eq!(warmup.messages.len(), 2);
+        assert_eq!(warmup.messages[0].role, "assistant");
+        assert_eq!(warmup.messages[1].role, "user");
+        assert_eq!(
+            warmup.messages[1].content,
+            vec![ContentBlock::Text {
+                text: "请只回复 OK".to_string(),
+                cache_control: None,
+            }]
+        );
+
+        let wire = build_chat_messages_for_request(&warmup);
+        let system = wire
+            .first()
+            .and_then(|value| value.get("content"))
+            .and_then(Value::as_str)
+            .expect("warmup system prompt");
+        assert!(system.contains("Stable project rules"));
+        assert!(!system.contains("Dynamic relay"));
+        assert!(
+            !wire
+                .iter()
+                .any(|value| value.to_string().contains("Dynamic latest user task")),
+            "warmup must not include the dynamic latest user task"
+        );
+    }
+
+    #[test]
     fn reasoning_effort_uses_deepseek_top_level_thinking_parameter() {
         let mut body = json!({});
         apply_reasoning_effort(&mut body, Some("max"), ApiProvider::Deepseek);
@@ -1363,6 +2590,69 @@ mod tests {
         );
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("extra_body").is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_off_is_omitted_for_strict_openai_like_providers() {
+        for provider in [
+            ApiProvider::Openai,
+            ApiProvider::WanjieArk,
+            ApiProvider::Arcee,
+            ApiProvider::Huggingface,
+            ApiProvider::Fireworks,
+        ] {
+            let mut body = json!({});
+            apply_reasoning_effort(&mut body, Some("off"), provider);
+
+            assert_eq!(
+                body,
+                json!({}),
+                "provider {provider:?} should not receive unsupported reasoning-off fields"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_atlascloud_speaks_deepseek_dialect() {
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("high"), ApiProvider::Atlascloud);
+        assert_eq!(
+            body,
+            json!({ "reasoning_effort": "high", "thinking": { "type": "enabled" } })
+        );
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("max"), ApiProvider::Atlascloud);
+        assert_eq!(
+            body,
+            json!({ "reasoning_effort": "max", "thinking": { "type": "enabled" } })
+        );
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("off"), ApiProvider::Atlascloud);
+        assert_eq!(body, json!({ "thinking": { "type": "disabled" } }));
+    }
+
+    #[test]
+    fn reasoning_effort_moonshot_toggles_thinking() {
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("high"), ApiProvider::Moonshot);
+        assert_eq!(body, json!({ "thinking": { "type": "enabled" } }));
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("off"), ApiProvider::Moonshot);
+        assert_eq!(body, json!({ "thinking": { "type": "disabled" } }));
+    }
+
+    #[test]
+    fn reasoning_effort_ollama_toggles_think_flag() {
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("high"), ApiProvider::Ollama);
+        assert_eq!(body, json!({ "think": true }));
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("off"), ApiProvider::Ollama);
+        assert_eq!(body, json!({ "think": false }));
     }
 
     #[test]
@@ -1401,6 +2691,94 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_effort_uses_openai_compatible_shape_for_fireworks() {
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("max"), ApiProvider::Fireworks);
+
+        assert_eq!(
+            body.get("reasoning_effort").and_then(Value::as_str),
+            Some("max")
+        );
+        assert!(
+            body.get("thinking").is_none(),
+            "Fireworks strict-validates OpenAI-compatible requests and rejects top-level thinking"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_uses_arcee_reasoning_effort_without_thinking_object() {
+        for (input, expected) in [
+            ("minimal", "minimal"),
+            ("low", "low"),
+            ("mid", "medium"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("max", "high"),
+        ] {
+            let mut body = json!({});
+            apply_reasoning_effort(&mut body, Some(input), ApiProvider::Arcee);
+
+            assert_eq!(
+                body.get("reasoning_effort").and_then(Value::as_str),
+                Some(expected)
+            );
+            assert!(
+                body.get("thinking").is_none(),
+                "Arcee documents reasoning_effort rather than a DeepSeek thinking object"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_maps_openrouter_scale_without_deepseek_max_label() {
+        for (input, expected) in [
+            ("low", "low"),
+            ("minimal", "low"),
+            ("medium", "medium"),
+            ("mid", "medium"),
+            ("high", "high"),
+            ("max", "xhigh"),
+            ("xhigh", "xhigh"),
+        ] {
+            let mut body = json!({});
+            apply_reasoning_effort(&mut body, Some(input), ApiProvider::Openrouter);
+
+            assert_eq!(
+                body.get("reasoning_effort").and_then(Value::as_str),
+                Some(expected),
+                "OpenRouter effort mapping for {input}"
+            );
+            assert_eq!(
+                body.pointer("/thinking/type").and_then(Value::as_str),
+                Some("enabled")
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_uses_xiaomi_mimo_thinking_parameter_only() {
+        for input in ["low", "medium", "max", "xhigh"] {
+            let mut body = json!({});
+            apply_reasoning_effort(&mut body, Some(input), ApiProvider::XiaomiMimo);
+
+            assert_eq!(
+                body.pointer("/thinking/type").and_then(Value::as_str),
+                Some("enabled"),
+                "MiMo thinking mapping for {input}"
+            );
+            assert!(body.get("reasoning_effort").is_none());
+        }
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("off"), ApiProvider::XiaomiMimo);
+        assert_eq!(
+            body.pointer("/thinking/type").and_then(Value::as_str),
+            Some("disabled")
+        );
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
     fn chat_parser_accepts_nvidia_nim_reasoning_field() -> Result<()> {
         let response = parse_chat_message(&json!({
             "id": "chatcmpl-test",
@@ -1421,7 +2799,7 @@ mod tests {
 
         assert!(matches!(
             response.content.first(),
-            Some(ContentBlock::Thinking { thinking }) if thinking == "thinking via NIM"
+            Some(ContentBlock::Thinking { thinking, .. }) if thinking == "thinking via NIM"
         ));
         assert!(matches!(
             response.content.get(1),
@@ -1538,10 +2916,32 @@ mod tests {
     }
 
     #[test]
+    fn chat_tool_wire_shape_omits_anthropic_only_metadata() {
+        let tool = Tool {
+            tool_type: Some("function".to_string()),
+            name: "mcp_read_resource".to_string(),
+            description: "Read resource".to_string(),
+            input_schema: json!({"type": "object", "properties": {}}),
+            allowed_callers: Some(vec!["direct".to_string()]),
+            defer_loading: Some(false),
+            input_examples: Some(vec![json!({"uri": "file://example"})]),
+            strict: None,
+            cache_control: None,
+        };
+
+        let encoded = tool_to_chat_for_base_url(&tool, "https://api.fireworks.ai/inference/v1");
+
+        assert!(encoded.get("allowed_callers").is_none());
+        assert!(encoded.get("defer_loading").is_none());
+        assert!(encoded.get("input_examples").is_none());
+    }
+
+    #[test]
     fn chat_messages_drop_thinking_only_assistant_for_non_reasoning_model() {
         let message = Message {
             role: "assistant".to_string(),
             content: vec![ContentBlock::Thinking {
+                signature: None,
                 thinking: "plan".to_string(),
             }],
         };
@@ -1685,6 +3085,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: vec![
                     ContentBlock::Thinking {
+                        signature: None,
                         thinking: "Need to inspect the directory".to_string(),
                     },
                     ContentBlock::ToolUse {
@@ -1725,6 +3126,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: vec![
                     ContentBlock::Thinking {
+                        signature: None,
                         thinking: "Need to search".to_string(),
                     },
                     ContentBlock::ToolUse {
@@ -1814,6 +3216,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: vec![
                     ContentBlock::Thinking {
+                        signature: None,
                         thinking: "Need to list files".to_string(),
                     },
                     ContentBlock::ToolUse {
@@ -2009,6 +3412,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_usage_derives_completion_tokens_from_total_tokens_when_needed() {
+        let usage = parse_usage(Some(&json!({
+            "prompt_tokens": 100,
+            "total_tokens": 125,
+            "prompt_cache_hit_tokens": 70,
+            "prompt_cache_miss_tokens": 30
+        })));
+
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 25);
+        assert_eq!(usage.prompt_cache_hit_tokens, Some(70));
+        assert_eq!(usage.prompt_cache_miss_tokens, Some(30));
+    }
+
+    #[test]
     fn parse_usage_reads_v4_prompt_tokens_details_cached_tokens() {
         let usage = parse_usage(Some(&json!({
             "prompt_tokens": 4000,
@@ -2020,6 +3438,22 @@ mod tests {
 
         assert_eq!(usage.input_tokens, 4000);
         assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.prompt_cache_hit_tokens, Some(3000));
+        assert_eq!(usage.prompt_cache_miss_tokens, Some(1000));
+    }
+
+    #[test]
+    fn parse_usage_infers_cache_miss_from_selected_hit_source() {
+        let usage = parse_usage(Some(&json!({
+            "prompt_tokens": 4000,
+            "completion_tokens": 20,
+            "prompt_cache_hit_tokens": 3000,
+            "prompt_tokens_details": {
+                "cached_tokens": 1000
+            }
+        })));
+
+        assert_eq!(usage.input_tokens, 4000);
         assert_eq!(usage.prompt_cache_hit_tokens, Some(3000));
         assert_eq!(usage.prompt_cache_miss_tokens, Some(1000));
     }
@@ -2053,9 +3487,13 @@ mod tests {
             ]
         });
 
-        let approx_tokens =
-            sanitize_thinking_mode_messages(&mut body, "deepseek-v4-pro", Some("max"))
-                .expect("multi-turn thinking-mode conversation should report replay tokens");
+        let approx_tokens = sanitize_thinking_mode_messages(
+            &mut body,
+            "deepseek-v4-pro",
+            Some("max"),
+            ApiProvider::Deepseek,
+        )
+        .expect("multi-turn thinking-mode conversation should report replay tokens");
         // ~4 chars/token; 46 bytes of reasoning -> 11 tokens.
         assert_eq!(approx_tokens, 11);
 
@@ -2088,7 +3526,12 @@ mod tests {
                 { "role": "user", "content": "hi" }
             ]
         });
-        let result = sanitize_thinking_mode_messages(&mut body, "deepseek-v4-flash", None);
+        let result = sanitize_thinking_mode_messages(
+            &mut body,
+            "deepseek-v4-flash",
+            None,
+            ApiProvider::Deepseek,
+        );
         // reasoning_effort is None → no thinking injection, result is None
         assert!(result.is_none());
     }
@@ -2111,11 +3554,56 @@ mod tests {
             ]
         });
 
-        sanitize_thinking_mode_messages(&mut body, "deepseek-v4-pro", Some("max"));
+        sanitize_thinking_mode_messages(
+            &mut body,
+            "deepseek-v4-pro",
+            Some("max"),
+            ApiProvider::Deepseek,
+        );
 
         let chars = count_reasoning_replay_chars(&body);
         // "(reasoning omitted)" is 19 bytes.
         assert_eq!(chars, 19);
+    }
+
+    #[test]
+    fn sanitize_thinking_mode_skips_generic_openai_provider() {
+        // #1542 intent (narrowed by #1739/#1694): the sanitizer only skips for
+        // a *genuine non-DeepSeek* model on the generic openai provider. A
+        // DeepSeek reasoning model on the openai provider still gets sanitized
+        // (see chat.rs `deepseek_model_on_openai_provider_still_replays_*`).
+        let mut body = json!({
+            "model": "qwen3-coder",
+            "messages": [
+                { "role": "user", "content": "hi" },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{ "id": "1", "type": "function" }]
+                }
+            ]
+        });
+
+        let result = sanitize_thinking_mode_messages(
+            &mut body,
+            "qwen3-coder",
+            Some("max"),
+            ApiProvider::Openai,
+        );
+
+        assert!(result.is_none());
+        let assistant = body["messages"]
+            .as_array()
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message["role"] == "assistant")
+            })
+            .expect("assistant message");
+        assert!(
+            assistant.get("reasoning_content").is_none(),
+            "generic OpenAI-compatible provider payload must not get reasoning_content (#1542)"
+        );
     }
 
     #[test]
@@ -2134,7 +3622,12 @@ mod tests {
             ]
         });
 
-        sanitize_thinking_mode_messages(&mut body, "deepseek-v4-pro", Some("max"));
+        sanitize_thinking_mode_messages(
+            &mut body,
+            "deepseek-v4-pro",
+            Some("max"),
+            ApiProvider::Deepseek,
+        );
 
         let messages = body["messages"].as_array().unwrap();
         let assistant = messages
@@ -2185,6 +3678,10 @@ mod tests {
 
     #[test]
     fn base_url_security_rejects_insecure_non_local_http() {
+        let _lock = ALLOW_INSECURE_HTTP_ENV_LOCK.lock().unwrap();
+        let _guard = AllowInsecureHttpEnvGuard::capture();
+        unsafe { std::env::remove_var(ALLOW_INSECURE_HTTP_ENV) };
+
         let err = validate_base_url_security("http://api.deepseek.com")
             .expect_err("non-local insecure HTTP should be rejected");
         assert!(err.to_string().contains("Refusing insecure base URL"));
@@ -2192,8 +3689,44 @@ mod tests {
 
     #[test]
     fn base_url_security_allows_localhost_http() {
+        let _lock = ALLOW_INSECURE_HTTP_ENV_LOCK.lock().unwrap();
+        let _guard = AllowInsecureHttpEnvGuard::capture();
+        unsafe { std::env::remove_var(ALLOW_INSECURE_HTTP_ENV) };
+
         assert!(validate_base_url_security("http://localhost:8080").is_ok());
         assert!(validate_base_url_security("http://127.0.0.1:8080").is_ok());
+    }
+
+    #[test]
+    fn base_url_security_allows_non_local_http_with_explicit_opt_in() {
+        let _lock = ALLOW_INSECURE_HTTP_ENV_LOCK.lock().unwrap();
+        let _guard = AllowInsecureHttpEnvGuard::capture();
+        unsafe { std::env::set_var(ALLOW_INSECURE_HTTP_ENV, "1") };
+
+        assert!(validate_base_url_security("http://192.168.0.110:8000/v1").is_ok());
+    }
+
+    /// Serialize tests that mutate `DEEPSEEK_ALLOW_INSECURE_HTTP`; env vars are
+    /// process-global and would otherwise leak across security checks.
+    static ALLOW_INSECURE_HTTP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct AllowInsecureHttpEnvGuard {
+        prior: Option<std::ffi::OsString>,
+    }
+    impl AllowInsecureHttpEnvGuard {
+        fn capture() -> Self {
+            Self {
+                prior: std::env::var_os(ALLOW_INSECURE_HTTP_ENV),
+            }
+        }
+    }
+    impl Drop for AllowInsecureHttpEnvGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => unsafe { std::env::set_var(ALLOW_INSECURE_HTTP_ENV, v) },
+                None => unsafe { std::env::remove_var(ALLOW_INSECURE_HTTP_ENV) },
+            }
+        }
     }
 
     #[test]
@@ -2291,8 +3824,72 @@ mod tests {
             unsafe { std::env::set_var("DEEPSEEK_FORCE_HTTP1", value) };
             assert!(
                 !force_http1_from_env(),
-                "{value:?} should NOT be parsed as truthy",
+                "{value:?} should NOT be parsed as truthy"
             );
         }
+    }
+
+    #[test]
+    fn api_url_with_suffix_strips_version_before_chat_suffix() {
+        assert_eq!(
+            api_url_with_suffix(
+                "https://api.example.com/v1",
+                "chat/completions",
+                Some("/chat/completions")
+            ),
+            "https://api.example.com/chat/completions"
+        );
+        assert_eq!(
+            api_url_with_suffix(
+                "https://api.example.com/beta",
+                "chat/completions",
+                Some("/chat/completions")
+            ),
+            "https://api.example.com/chat/completions"
+        );
+    }
+
+    #[test]
+    fn api_url_with_suffix_handles_leading_slash() {
+        assert_eq!(
+            api_url_with_suffix(
+                "https://api.example.com/v1",
+                "chat/completions",
+                Some("chat/completions")
+            ),
+            "https://api.example.com/chat/completions"
+        );
+    }
+
+    #[test]
+    fn api_url_with_suffix_ignores_suffix_for_models() {
+        assert_eq!(
+            api_url_with_suffix(
+                "https://api.example.com/v1",
+                "models",
+                Some("/chat/completions")
+            ),
+            "https://api.example.com/v1/models"
+        );
+    }
+
+    #[test]
+    fn api_url_with_suffix_ignores_suffix_for_beta_paths() {
+        assert_eq!(
+            api_url_with_suffix(
+                "https://api.example.com/v1",
+                "beta/completions",
+                Some("/chat/completions")
+            ),
+            "https://api.example.com/beta/completions"
+        );
+    }
+
+    #[test]
+    fn api_url_with_suffix_default_behavior_without_suffix() {
+        assert_eq!(
+            api_url_with_suffix("https://api.deepseek.com", "chat/completions", None),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
     }
 }

@@ -1,8 +1,12 @@
 //! Core commands: help, clear, exit, model
 
 use std::fmt::Write;
+use std::path::PathBuf;
 
-use crate::config::{COMMON_DEEPSEEK_MODELS, normalize_model_name};
+use crate::config::{
+    ApiProvider, COMMON_DEEPSEEK_MODELS, normalize_custom_model_id,
+    normalize_model_name_for_provider, provider_passes_model_through,
+};
 use crate::localization::{MessageId, tr};
 use crate::tui::app::{App, AppAction, AppMode, ReasoningEffort};
 use crate::tui::views::{HelpView, ModalKind, SubAgentsView, subagent_view_agents};
@@ -45,6 +49,28 @@ pub fn help(app: &mut App, topic: Option<&str>) -> CommandResult {
 
 /// Clear conversation history
 pub fn clear(app: &mut App) -> CommandResult {
+    let todos_cleared = reset_conversation_state(app);
+    app.current_session_id = None;
+    let locale = app.ui_locale;
+    let message = if todos_cleared {
+        tr(locale, MessageId::ClearConversation).to_string()
+    } else {
+        tr(locale, MessageId::ClearConversationBusy).to_string()
+    };
+    CommandResult::with_message_and_action(
+        message,
+        AppAction::SyncSession {
+            session_id: None,
+            messages: Vec::new(),
+            system_prompt: None,
+            model: app.model.clone(),
+            workspace: app.workspace.clone(),
+        },
+    )
+}
+
+/// Reset the active conversation without choosing the next session id.
+pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
     app.clear_history();
     app.mark_history_updated();
     app.api_messages.clear();
@@ -54,8 +80,14 @@ pub fn clear(app: &mut App) -> CommandResult {
     app.queued_draft = None;
     app.session.total_tokens = 0;
     app.session.total_conversation_tokens = 0;
+    app.session.reset_token_breakdown();
     app.session.session_cost = 0.0;
     app.session.session_cost_cny = 0.0;
+    app.session.subagent_cost = 0.0;
+    app.session.subagent_cost_cny = 0.0;
+    app.session.subagent_cost_event_seqs.clear();
+    app.session.displayed_cost_high_water = 0.0;
+    app.session.displayed_cost_high_water_cny = 0.0;
     let todos_cleared = app.clear_todos();
     app.tool_log.clear();
     app.tool_cells.clear();
@@ -68,23 +100,13 @@ pub fn clear(app: &mut App) -> CommandResult {
     app.session.last_completion_tokens = None;
     app.session.last_prompt_cache_hit_tokens = None;
     app.session.last_prompt_cache_miss_tokens = None;
+    app.session.last_reasoning_replay_tokens = None;
     app.session.turn_cache_history.clear();
-    app.current_session_id = None;
-    let locale = app.ui_locale;
-    let message = if todos_cleared {
-        tr(locale, MessageId::ClearConversation).to_string()
-    } else {
-        tr(locale, MessageId::ClearConversationBusy).to_string()
-    };
-    CommandResult::with_message_and_action(
-        message,
-        AppAction::SyncSession {
-            messages: Vec::new(),
-            system_prompt: None,
-            model: app.model.clone(),
-            workspace: app.workspace.clone(),
-        },
-    )
+    app.session.last_cache_inspection = None;
+    app.session.last_warmup_key = None;
+    app.session.last_tool_catalog = None;
+    app.session.last_base_url = None;
+    todos_cleared
 }
 
 /// Exit the application
@@ -112,18 +134,48 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
                 app.session.last_prompt_tokens = None;
                 app.session.last_completion_tokens = None;
             }
+            app.provider_models
+                .insert(app.api_provider.as_str().to_string(), "auto".to_string());
+            let persist_warning =
+                provider_model_selection_persist_warning(app.api_provider, "auto");
+            let mut message = tr(app.ui_locale, MessageId::ModelChanged)
+                .replace("{old}", &old_model)
+                .replace("{new}", "auto");
+            if let Some(warning) = persist_warning {
+                message.push_str(&warning);
+            }
             return CommandResult::with_message_and_action(
-                tr(app.ui_locale, MessageId::ModelChanged)
-                    .replace("{old}", &old_model)
-                    .replace("{new}", "auto"),
+                message,
                 AppAction::UpdateCompaction(app.compaction_config()),
             );
         }
-        let Some(model_id) = normalize_model_name(name) else {
-            return CommandResult::error(format!(
-                "Invalid model '{name}'. Expected auto or a DeepSeek model ID. Common models: {}",
-                COMMON_DEEPSEEK_MODELS.join(", ")
-            ));
+        let model_id = if app.accepts_custom_model_ids() {
+            let Some(model_id) = normalize_custom_model_id(name) else {
+                return CommandResult::error(format!(
+                    "Invalid model '{name}'. Expected a non-empty model ID."
+                ));
+            };
+            model_id
+        } else {
+            let Some(model_id) = normalize_model_name_for_provider(app.api_provider, name) else {
+                if let Some((provider, model_id)) = saved_provider_model_match(app, name) {
+                    return CommandResult::with_message_and_action(
+                        format!(
+                            "Switching provider to {} for model {model_id}.",
+                            provider.as_str()
+                        ),
+                        AppAction::SwitchProvider {
+                            provider,
+                            model: Some(model_id),
+                        },
+                    );
+                }
+                return CommandResult::error(format!(
+                    "Invalid model '{name}'. Expected auto, a model for the active provider, or a saved provider model. Common DeepSeek models: {}",
+                    COMMON_DEEPSEEK_MODELS.join(", ")
+                ));
+            };
+            model_id
         };
         let old_model = app.model_display_label();
         let model_changed = app.auto_model || app.model != model_id;
@@ -137,14 +189,64 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
             app.session.last_prompt_tokens = None;
             app.session.last_completion_tokens = None;
         }
+        app.provider_models
+            .insert(app.api_provider.as_str().to_string(), model_id.clone());
+        let persist_warning = provider_model_selection_persist_warning(app.api_provider, &model_id);
+        let mut message = tr(app.ui_locale, MessageId::ModelChanged)
+            .replace("{old}", &old_model)
+            .replace("{new}", &model_id);
+        if let Some(warning) = persist_warning {
+            message.push_str(&warning);
+        }
         CommandResult::with_message_and_action(
-            tr(app.ui_locale, MessageId::ModelChanged)
-                .replace("{old}", &old_model)
-                .replace("{new}", &model_id),
+            message,
             AppAction::UpdateCompaction(app.compaction_config()),
         )
     } else {
         CommandResult::action(AppAction::OpenModelPicker)
+    }
+}
+
+fn provider_model_selection_persist_warning(provider: ApiProvider, model: &str) -> Option<String> {
+    crate::settings::Settings::persist_provider_model_selection(provider, model)
+        .err()
+        .map(|err| format!(" (not persisted: {err})"))
+}
+
+fn saved_provider_model_match(app: &App, name: &str) -> Option<(ApiProvider, String)> {
+    let requested = normalize_custom_model_id(name)?;
+    let mut saved = app
+        .provider_models
+        .iter()
+        .filter_map(|(provider_name, model)| {
+            let provider = ApiProvider::parse(provider_name)?;
+            (provider != app.api_provider).then_some((provider, model.as_str()))
+        })
+        .collect::<Vec<_>>();
+    saved.sort_by_key(|(provider, _)| provider.as_str());
+
+    for (provider, saved_model) in saved {
+        let Some(saved_model) = normalize_model_for_provider_selection(provider, saved_model)
+        else {
+            continue;
+        };
+        let requested_model = normalize_model_for_provider_selection(provider, &requested)
+            .unwrap_or_else(|| requested.clone());
+        if saved_model.eq_ignore_ascii_case(&requested_model)
+            || saved_model.eq_ignore_ascii_case(&requested)
+        {
+            return Some((provider, saved_model));
+        }
+    }
+
+    None
+}
+
+fn normalize_model_for_provider_selection(provider: ApiProvider, model: &str) -> Option<String> {
+    if provider_passes_model_through(provider) {
+        normalize_custom_model_id(model)
+    } else {
+        normalize_model_name_for_provider(provider, model)
     }
 }
 
@@ -169,7 +271,7 @@ pub fn profile_switch(_app: &mut App, arg: Option<&str>) -> CommandResult {
         Some(name) if !name.trim().is_empty() => name.trim().to_string(),
         _ => {
             return CommandResult::error(
-                "Usage: /profile <name>\n\nSwitch to a named config profile. Profiles are defined in ~/.deepseek/config.toml under [profiles] sections.",
+                "Usage: /profile <name>\n\nSwitch to a named config profile. Profiles are defined in ~/.codewhale/config.toml under [profiles] sections.",
             );
         }
     };
@@ -179,6 +281,50 @@ pub fn profile_switch(_app: &mut App, arg: Option<&str>) -> CommandResult {
             profile: profile_name,
         },
     )
+}
+
+pub fn workspace_switch(app: &mut App, arg: Option<&str>) -> CommandResult {
+    let Some(raw_path) = arg.map(str::trim).filter(|path| !path.is_empty()) else {
+        return CommandResult::message(format!("Current workspace: {}", app.workspace.display()));
+    };
+
+    let expanded = match expand_workspace_path(raw_path) {
+        Ok(path) => path,
+        Err(message) => return CommandResult::error(message),
+    };
+    let candidate = if expanded.is_absolute() {
+        expanded
+    } else {
+        app.workspace.join(expanded)
+    };
+
+    if !candidate.exists() {
+        return CommandResult::error(format!("Workspace does not exist: {}", candidate.display()));
+    }
+    if !candidate.is_dir() {
+        return CommandResult::error(format!(
+            "Workspace is not a directory: {}",
+            candidate.display()
+        ));
+    }
+
+    let workspace = candidate.canonicalize().unwrap_or(candidate);
+    CommandResult::with_message_and_action(
+        format!("Switching workspace to {}...", workspace.display()),
+        AppAction::SwitchWorkspace { workspace },
+    )
+}
+
+fn expand_workspace_path(path: &str) -> Result<PathBuf, String> {
+    if path == "~" {
+        return dirs::home_dir().ok_or_else(|| "Could not resolve home directory".to_string());
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home =
+            dirs::home_dir().ok_or_else(|| "Could not resolve home directory".to_string())?;
+        return Ok(home.join(rest));
+    }
+    Ok(PathBuf::from(path))
 }
 
 /// Show `DeepSeek` dashboard and docs links
@@ -306,15 +452,72 @@ pub fn home_dashboard(app: &mut App) -> CommandResult {
     CommandResult::message(stats)
 }
 
+/// Toggle output translation to the current system language on/off.
+///
+/// When enabled, the model is instructed to respond in the current locale and an
+/// interception layer translates any remaining English output before it
+/// reaches the user.
+pub fn translate(app: &mut App) -> CommandResult {
+    app.translation_enabled = !app.translation_enabled;
+    let locale = app.ui_locale;
+    if app.translation_enabled {
+        CommandResult::message(tr(locale, MessageId::CmdTranslateOn))
+    } else {
+        CommandResult::message(tr(locale, MessageId::CmdTranslateOff))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::PromptInspection;
     use crate::config::Config;
     use crate::models::Message;
     use crate::tui::app::{App, AppMode, TuiOptions, TurnCacheRecord};
     use crate::tui::history::HistoryCell;
+    use std::ffi::OsString;
     use std::path::PathBuf;
     use std::time::Instant;
+    use tempfile::{TempDir, tempdir};
+
+    struct SettingsPathGuard {
+        _tmp: TempDir,
+        previous: Option<OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl SettingsPathGuard {
+        fn new() -> Self {
+            let lock = crate::test_support::lock_test_env();
+            let tmp = TempDir::new().expect("settings tempdir");
+            let config_path = tmp.path().join(".deepseek").join("config.toml");
+            std::fs::create_dir_all(config_path.parent().expect("config parent"))
+                .expect("config dir");
+            let previous = std::env::var_os("DEEPSEEK_CONFIG_PATH");
+            // Safety: test-only environment mutation guarded by a global mutex.
+            unsafe {
+                std::env::set_var("DEEPSEEK_CONFIG_PATH", &config_path);
+            }
+            Self {
+                _tmp: tmp,
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for SettingsPathGuard {
+        fn drop(&mut self) {
+            // Safety: test-only environment mutation guarded by a global mutex.
+            unsafe {
+                if let Some(previous) = self.previous.take() {
+                    std::env::set_var("DEEPSEEK_CONFIG_PATH", previous);
+                } else {
+                    std::env::remove_var("DEEPSEEK_CONFIG_PATH");
+                }
+            }
+        }
+    }
 
     fn create_test_app() -> App {
         let options = TuiOptions {
@@ -341,6 +544,9 @@ mod tests {
         let mut app = App::new(options, &Config::default());
         app.ui_locale = crate::localization::Locale::En;
         app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.model = "deepseek-v4-pro".to_string();
+        app.auto_model = false;
+        app.model_ids_passthrough = false;
         app
     }
 
@@ -428,6 +634,18 @@ mod tests {
         app.session.total_conversation_tokens = 100;
         app.tool_log.push("test".to_string());
         app.current_session_id = Some("existing-session".to_string());
+        app.session_artifacts
+            .push(crate::artifacts::ArtifactRecord {
+                id: "art_call_big".to_string(),
+                kind: crate::artifacts::ArtifactKind::ToolOutput,
+                session_id: "existing-session".to_string(),
+                tool_call_id: "call-big".to_string(),
+                tool_name: "exec_shell".to_string(),
+                created_at: chrono::Utc::now(),
+                byte_size: 128,
+                preview: "tool output".to_string(),
+                storage_path: PathBuf::from("/tmp/tool_outputs/call-big.txt"),
+            });
 
         let result = clear(&mut app);
         assert!(result.message.is_some());
@@ -437,6 +655,7 @@ mod tests {
         assert!(app.tool_log.is_empty());
         assert!(app.tool_cells.is_empty());
         assert!(app.tool_details_by_cell.is_empty());
+        assert!(app.session_artifacts.is_empty());
         assert!(app.current_session_id.is_none());
         assert!(matches!(result.action, Some(AppAction::SyncSession { .. })));
     }
@@ -448,8 +667,23 @@ mod tests {
         app.session.total_conversation_tokens = 123;
         app.session.session_cost = 0.42;
         app.session.session_cost_cny = 3.05;
+        app.session.subagent_cost = 0.11;
+        app.session.subagent_cost_cny = 0.80;
+        app.session.subagent_cost_event_seqs.insert(7);
+        app.session.displayed_cost_high_water = 0.53;
+        app.session.displayed_cost_high_water_cny = 3.85;
         app.session.last_prompt_cache_hit_tokens = Some(70);
         app.session.last_prompt_cache_miss_tokens = Some(30);
+        app.session.last_reasoning_replay_tokens = Some(12);
+        app.session.last_warmup_key = None;
+        app.session.last_tool_catalog = Some(Vec::new());
+        app.session.last_base_url = Some("https://api.deepseek.com".to_string());
+        app.session.last_cache_inspection = Some(PromptInspection {
+            base_static_prefix_hash: "base".to_string(),
+            full_request_prefix_hash: "full".to_string(),
+            tool_catalog_hash: String::new(),
+            layers: Vec::new(),
+        });
         app.push_turn_cache_record(TurnCacheRecord {
             input_tokens: 100,
             output_tokens: 25,
@@ -465,9 +699,19 @@ mod tests {
         assert_eq!(app.session.total_conversation_tokens, 0);
         assert_eq!(app.session.session_cost, 0.0);
         assert_eq!(app.session.session_cost_cny, 0.0);
+        assert_eq!(app.session.subagent_cost, 0.0);
+        assert_eq!(app.session.subagent_cost_cny, 0.0);
+        assert!(app.session.subagent_cost_event_seqs.is_empty());
+        assert_eq!(app.session.displayed_cost_high_water, 0.0);
+        assert_eq!(app.session.displayed_cost_high_water_cny, 0.0);
         assert_eq!(app.session.last_prompt_cache_hit_tokens, None);
         assert_eq!(app.session.last_prompt_cache_miss_tokens, None);
+        assert_eq!(app.session.last_reasoning_replay_tokens, None);
         assert!(app.session.turn_cache_history.is_empty());
+        assert_eq!(app.session.last_cache_inspection, None);
+        assert_eq!(app.session.last_warmup_key, None);
+        assert_eq!(app.session.last_tool_catalog, None);
+        assert_eq!(app.session.last_base_url, None);
     }
 
     #[test]
@@ -478,7 +722,64 @@ mod tests {
     }
 
     #[test]
+    fn workspace_without_arg_shows_current_workspace() {
+        let mut app = create_test_app();
+        let result = workspace_switch(&mut app, None);
+        let msg = result.message.expect("workspace should be shown");
+        assert!(msg.contains("Current workspace:"));
+        assert!(msg.contains("/tmp/test-workspace"));
+        assert!(result.action.is_none());
+    }
+
+    #[test]
+    fn workspace_existing_absolute_dir_returns_switch_action() {
+        let mut app = create_test_app();
+        let dir = tempdir().expect("temp dir");
+        let result = workspace_switch(&mut app, Some(dir.path().to_str().unwrap()));
+        assert!(matches!(
+            result.action,
+            Some(AppAction::SwitchWorkspace { workspace }) if workspace == dir.path().canonicalize().unwrap()
+        ));
+    }
+
+    #[test]
+    fn workspace_relative_dir_resolves_from_current_workspace() {
+        let root = tempdir().expect("temp dir");
+        let child = root.path().join("child");
+        std::fs::create_dir(&child).expect("child dir");
+        let mut app = create_test_app();
+        app.workspace = root.path().to_path_buf();
+
+        let result = workspace_switch(&mut app, Some("child"));
+        assert!(matches!(
+            result.action,
+            Some(AppAction::SwitchWorkspace { workspace }) if workspace == child.canonicalize().unwrap()
+        ));
+    }
+
+    #[test]
+    fn workspace_rejects_missing_path() {
+        let mut app = create_test_app();
+        let result = workspace_switch(&mut app, Some("definitely-missing"));
+        assert!(result.is_error);
+        assert!(result.message.unwrap().contains("does not exist"));
+    }
+
+    #[test]
+    fn workspace_rejects_file_path() {
+        let root = tempdir().expect("temp dir");
+        let file = root.path().join("file.txt");
+        std::fs::write(&file, "not a directory").expect("test file");
+        let mut app = create_test_app();
+
+        let result = workspace_switch(&mut app, Some(file.to_str().unwrap()));
+        assert!(result.is_error);
+        assert!(result.message.unwrap().contains("not a directory"));
+    }
+
+    #[test]
     fn test_model_change_updates_state() {
+        let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
         let old_model = app.model.clone();
         let result = model(&mut app, Some("deepseek-v4-flash"));
@@ -496,8 +797,37 @@ mod tests {
     }
 
     #[test]
-    fn model_switch_clears_turn_cache_history() {
+    fn model_command_persists_active_provider_model() {
+        let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
+
+        let result = model(&mut app, Some("deepseek-v4-flash"));
+
+        assert!(result.message.is_some());
+        assert_eq!(
+            app.provider_models.get("deepseek").map(String::as_str),
+            Some("deepseek-v4-flash")
+        );
+        let settings = crate::settings::Settings::load().expect("load settings");
+        assert_eq!(settings.default_provider.as_deref(), Some("deepseek"));
+        assert_eq!(settings.default_model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(
+            settings
+                .provider_models
+                .as_ref()
+                .and_then(|models| models.get("deepseek"))
+                .map(String::as_str),
+            Some("deepseek-v4-flash")
+        );
+    }
+
+    #[test]
+    fn model_switch_clears_turn_cache_history() {
+        let _settings = SettingsPathGuard::new();
+        let mut app = create_test_app();
+        // Keep the assertion independent of the developer's saved default model.
+        app.auto_model = false;
+        app.model = "deepseek-v4-pro".to_string();
         app.push_turn_cache_record(TurnCacheRecord {
             input_tokens: 100,
             output_tokens: 25,
@@ -515,7 +845,10 @@ mod tests {
 
     #[test]
     fn model_reset_same_model_keeps_turn_cache_history() {
+        let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
+        app.auto_model = false;
+        app.model = "deepseek-v4-pro".to_string();
         app.push_turn_cache_record(TurnCacheRecord {
             input_tokens: 100,
             output_tokens: 25,
@@ -533,6 +866,7 @@ mod tests {
 
     #[test]
     fn test_model_auto_enables_auto_thinking() {
+        let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
         app.reasoning_effort = ReasoningEffort::Off;
 
@@ -548,6 +882,7 @@ mod tests {
 
     #[test]
     fn test_model_change_accepts_future_deepseek_model() {
+        let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
         let result = model(&mut app, Some("deepseek-v4"));
         assert!(result.message.is_some());
@@ -561,16 +896,70 @@ mod tests {
     }
 
     #[test]
+    fn test_model_change_accepts_custom_id_for_openai_compatible_provider() {
+        let _settings = SettingsPathGuard::new();
+        let mut app = create_test_app();
+        app.api_provider = crate::config::ApiProvider::Openai;
+        app.model_ids_passthrough = true;
+
+        let result = model(&mut app, Some("opencode-go/glm-5.1"));
+
+        assert!(result.message.is_some());
+        assert_eq!(app.model, "opencode-go/glm-5.1");
+        assert!(!app.auto_model);
+        assert!(matches!(
+            result.action,
+            Some(AppAction::UpdateCompaction(_))
+        ));
+    }
+
+    #[test]
+    fn test_model_change_accepts_custom_id_for_custom_base_url() {
+        let _settings = SettingsPathGuard::new();
+        let mut app = create_test_app();
+        app.model_ids_passthrough = true;
+
+        let result = model(&mut app, Some("opencode-go/kimi-k2.6"));
+
+        assert!(result.message.is_some());
+        assert_eq!(app.model, "opencode-go/kimi-k2.6");
+        assert!(matches!(
+            result.action,
+            Some(AppAction::UpdateCompaction(_))
+        ));
+    }
+
+    #[test]
     fn test_model_change_rejects_invalid_model() {
         let mut app = create_test_app();
         let result = model(&mut app, Some("gpt-4"));
         assert!(result.message.is_some());
         let msg = result.message.unwrap();
         assert!(msg.contains("Invalid model"));
-        assert!(msg.contains("DeepSeek model ID"));
+        assert!(msg.contains("active provider"));
         assert!(msg.contains("deepseek-v4-pro"));
         assert!(msg.contains("deepseek-v4-flash"));
         assert!(result.action.is_none());
+    }
+
+    #[test]
+    fn model_command_switches_to_saved_provider_model() {
+        let mut app = create_test_app();
+        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.provider_models
+            .insert("moonshot".to_string(), "kimi-k2.6".to_string());
+
+        let result = model(&mut app, Some("kimi-k2.6"));
+
+        match result.action {
+            Some(AppAction::SwitchProvider { provider, model }) => {
+                assert_eq!(provider, crate::config::ApiProvider::Moonshot);
+                assert_eq!(model.as_deref(), Some("kimi-k2.6"));
+            }
+            other => panic!("expected SwitchProvider action, got {other:?}"),
+        }
+        assert_eq!(app.api_provider, crate::config::ApiProvider::Deepseek);
+        assert_eq!(app.model, "deepseek-v4-pro");
     }
 
     #[test]
@@ -620,7 +1009,7 @@ mod tests {
         let result = home_dashboard(&mut app);
         assert!(result.message.is_some());
         let msg = result.message.unwrap();
-        assert!(msg.contains("DeepSeek TUI Home Dashboard"));
+        assert!(msg.contains("codewhale Home Dashboard"));
         assert!(msg.contains("Model:"));
         assert!(msg.contains("Mode:"));
         assert!(msg.contains("Workspace:"));
@@ -669,7 +1058,7 @@ mod tests {
             !msg.lines()
                 .any(|line| line.trim_start().starts_with("/set "))
         );
-        assert!(!msg.contains("/deepseek"));
+        assert!(!msg.contains("/codewhale"));
     }
 
     #[test]

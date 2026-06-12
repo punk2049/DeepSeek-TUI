@@ -12,27 +12,25 @@ pub use install::{
     InstallSource, InstalledSkill, RegistryDocument, RegistryEntry, RegistryFetchResult,
     SkillSyncOutcome, SyncResult, UpdateResult, default_cache_skills_dir,
 };
-pub use system::install_system_skills;
+pub use system::{install_system_skills, is_bundled_skill_name};
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 
 use crate::logging;
 
-const MAX_SKILL_DESCRIPTION_CHARS: usize = 512;
+const MAX_SKILL_DESCRIPTION_CHARS: usize = 280;
 const MAX_AVAILABLE_SKILLS_CHARS: usize = 12_000;
 
 // === Defaults ===
 
-#[allow(dead_code)]
 #[must_use]
 pub fn default_skills_dir() -> PathBuf {
     dirs::home_dir().map_or_else(
-        || PathBuf::from("/tmp/deepseek/skills"),
-        |p| p.join(".deepseek").join("skills"),
+        || PathBuf::from("/tmp/codewhale/skills"),
+        |p| p.join(".codewhale").join("skills"),
     )
 }
 
@@ -40,16 +38,6 @@ pub fn default_skills_dir() -> PathBuf {
 #[must_use]
 pub fn agents_global_skills_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|p| p.join(".agents").join("skills"))
-}
-
-/// Global Claude-compatible skills directory (`~/.claude/skills`). The
-/// SKILL.md frontmatter convention is shared across the broader Claude
-/// ecosystem, so picking up the global path lets users inherit skills
-/// they already installed for other Claude-compatible tools without
-/// re-authoring them in DeepSeek's native layout (#902).
-#[must_use]
-pub fn claude_global_skills_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|p| p.join(".claude").join("skills"))
 }
 
 // === Types ===
@@ -103,12 +91,18 @@ impl SkillRegistry {
     #[must_use]
     pub fn discover(dir: &Path) -> Self {
         let mut registry = Self::default();
-        if !dir.exists() {
+        let Ok(canonical_dir) = fs::canonicalize(dir) else {
+            return registry;
+        };
+        if !canonical_dir.is_dir() {
             return registry;
         }
 
         let mut visited = HashSet::new();
         Self::discover_recursive(dir, 0, &mut registry, &mut visited);
+        registry
+            .skills
+            .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
         registry
     }
 
@@ -242,23 +236,133 @@ impl SkillRegistry {
             let body = &rest[end + 3..];
 
             let mut metadata = HashMap::new();
-            for raw in frontmatter.lines() {
+            let lines: Vec<&str> = frontmatter.lines().collect();
+            let mut i = 0;
+            while i < lines.len() {
+                let raw = lines[i];
                 let line = raw.trim();
                 if line.is_empty() || line.starts_with('#') {
+                    i += 1;
                     continue;
                 }
                 if let Some((key, value)) = line.split_once(':') {
                     let value = value.trim();
-                    let unquoted = if (value.starts_with('"')
-                        && value.ends_with('"')
-                        && value.len() >= 2)
-                        || (value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2)
-                    {
-                        &value[1..value.len() - 1]
+                    // Check for YAML block scalar indicators: > (folded), | (literal),
+                    // optionally with chomping: >-, >+, |-, |+
+                    let is_block_scalar = matches!(value, ">" | "|" | ">-" | ">+" | "|-" | "|+");
+                    if is_block_scalar {
+                        let is_folded = value.starts_with('>');
+                        let chomp = if value.ends_with('-') {
+                            "strip"
+                        } else if value.ends_with('+') {
+                            "keep"
+                        } else {
+                            "clip"
+                        };
+                        // Determine the base indentation from the key line
+                        let base_indent = raw.len() - raw.trim_start().len();
+                        let mut block_lines: Vec<&str> = Vec::new();
+                        let mut content_indent: Option<usize> = None;
+                        i += 1;
+                        while i < lines.len() {
+                            let raw_line = lines[i];
+                            if raw_line.trim().is_empty() {
+                                // Empty lines are part of the block
+                                block_lines.push("");
+                                i += 1;
+                                continue;
+                            }
+                            let line_indent = raw_line.len() - raw_line.trim_start().len();
+                            if line_indent > base_indent {
+                                // Track content indent from the first non-empty
+                                // line so we strip only that one level of
+                                // leading whitespace, preserving any deeper
+                                // relative indentation (YAML §8.1.2).
+                                if content_indent.is_none() {
+                                    content_indent = Some(line_indent);
+                                }
+                                block_lines.push(raw_line);
+                                i += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        let content_indent = content_indent.unwrap_or(base_indent);
+                        // Strip only the content indent from each non-empty
+                        // line so nested indentation survives.
+                        let block_lines: Vec<&str> = block_lines
+                            .iter()
+                            .map(|raw| {
+                                if raw.is_empty() {
+                                    ""
+                                } else {
+                                    let indent = raw.len() - raw.trim_start().len();
+                                    let strip = std::cmp::min(indent, content_indent);
+                                    &raw[strip..]
+                                }
+                            })
+                            .collect();
+                        // Apply chomping to trailing empty lines before folding.
+                        // Chomping operates on the raw block_lines (before join), so
+                        // strip / keep / clip behave per the YAML spec.
+                        let block_lines = if matches!(chomp, "strip") {
+                            // strip: remove all trailing empty lines
+                            let mut lines = block_lines;
+                            while lines.last().is_some_and(|s| s.is_empty()) {
+                                lines.pop();
+                            }
+                            lines
+                        } else if matches!(chomp, "keep") {
+                            // keep: no modification
+                            block_lines
+                        } else {
+                            // clip: keep at most one trailing empty line
+                            let mut lines = block_lines;
+                            while lines.len() >= 2
+                                && lines[lines.len() - 1].is_empty()
+                                && lines[lines.len() - 2].is_empty()
+                            {
+                                lines.pop();
+                            }
+                            lines
+                        };
+                        let description = if is_folded {
+                            // Folded: join non-empty lines with spaces; empty
+                            // lines become paragraph breaks.
+                            let mut result = String::new();
+                            let mut pending_space = false;
+                            for line in &block_lines {
+                                if line.is_empty() {
+                                    result.push('\n');
+                                    pending_space = false;
+                                } else {
+                                    if pending_space {
+                                        result.push(' ');
+                                    }
+                                    result.push_str(line);
+                                    pending_space = true;
+                                }
+                            }
+                            result
+                        } else {
+                            // Literal: join with newlines.
+                            block_lines.join("\n")
+                        };
+                        metadata.insert(key.trim().to_ascii_lowercase(), description);
                     } else {
-                        value
-                    };
-                    metadata.insert(key.trim().to_ascii_lowercase(), unquoted.to_string());
+                        let unquoted = match value {
+                            v if (v.starts_with('"') && v.ends_with('"') && v.len() >= 2)
+                                || (v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2) =>
+                            {
+                                &v[1..v.len() - 1]
+                            }
+                            _ => value,
+                        };
+                        metadata.insert(key.trim().to_ascii_lowercase(), unquoted.to_string());
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
                 }
             }
 
@@ -328,40 +432,6 @@ impl SkillRegistry {
     }
 }
 
-/// Render a compact model-visible skills block.
-///
-/// The full `SKILL.md` body is intentionally not included here. This mirrors
-/// Resolve the active skills directory given a workspace, mirroring the
-/// hierarchy `App::new` walks: `<workspace>/.agents/skills` →
-/// `<workspace>/skills` → [`agents_global_skills_dir`] (`~/.agents/skills`,
-/// when present) → [`default_skills_dir`] (`~/.deepseek/skills`).
-/// Returns the first directory that exists, or the global default
-/// (which itself falls back to `/tmp/deepseek/skills` if the user
-/// has no home directory).
-///
-/// Kept for callers that want a single canonical directory (e.g.
-/// "where do I install a new skill?"). For session-time discovery
-/// that should pick up cross-tool skill folders too, use
-/// [`skills_directories`] / [`discover_in_workspace`] (#432).
-#[must_use]
-#[allow(dead_code)] // Intentionally kept for the "single canonical install dir" surface; live callers use discover_in_workspace.
-pub fn resolve_skills_dir(workspace: &Path) -> PathBuf {
-    let agents = workspace.join(".agents").join("skills");
-    if agents.exists() {
-        return agents;
-    }
-    let local = workspace.join("skills");
-    if local.exists() {
-        return local;
-    }
-    if let Some(global_agents) = agents_global_skills_dir()
-        && global_agents.exists()
-    {
-        return global_agents;
-    }
-    default_skills_dir()
-}
-
 /// Resolve every candidate skills directory for a workspace, in
 /// precedence order — most specific first. Used for session-time
 /// skill discovery so the model sees skills that originated in
@@ -375,36 +445,49 @@ pub fn resolve_skills_dir(workspace: &Path) -> PathBuf {
 /// 3. `<workspace>/.opencode/skills` — OpenCode interop.
 /// 4. `<workspace>/.claude/skills` — Claude Code interop.
 /// 5. `<workspace>/.cursor/skills` — Cursor interop.
-/// 6. [`agents_global_skills_dir`] — agentskills.io global.
-/// 7. [`claude_global_skills_dir`] — Claude-ecosystem global (#902).
-/// 8. [`default_skills_dir`] — DeepSeek global, user-installed.
+/// 6. `<workspace>/.codewhale/skills` — CodeWhale workspace skills.
+/// 7. [`agents_global_skills_dir`] — agentskills.io global.
+/// 8. `~/.claude/skills` — Claude-ecosystem global (#902).
+/// 9. `~/.codewhale/skills` — CodeWhale global, primary install target.
+/// 10. `~/.deepseek/skills` — legacy DeepSeek global fallback.
 ///
 /// Only directories that exist on disk are returned — callers don't
 /// need to filter further. Returns an empty vec when nothing is
 /// installed (the system-prompt skills block is then suppressed).
 #[must_use]
 pub fn skills_directories(workspace: &Path) -> Vec<PathBuf> {
+    let home = dirs::home_dir();
+    skills_directories_with_home(workspace, home.as_deref())
+}
+
+fn skills_directories_with_home(workspace: &Path, home_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut candidates = vec![
         workspace.join(".agents").join("skills"),
         workspace.join("skills"),
         workspace.join(".opencode").join("skills"),
         workspace.join(".claude").join("skills"),
         workspace.join(".cursor").join("skills"),
+        workspace.join(".codewhale").join("skills"),
     ];
-    if let Some(global_agents) = agents_global_skills_dir() {
-        candidates.push(global_agents);
+    if let Some(home) = home_dir {
+        candidates.push(home.join(".agents").join("skills"));
+        candidates.push(home.join(".claude").join("skills"));
+        candidates.push(home.join(".codewhale").join("skills"));
+        candidates.push(home.join(".deepseek").join("skills"));
+    } else {
+        candidates.push(PathBuf::from("/tmp/codewhale/skills"));
     }
-    if let Some(global_claude) = claude_global_skills_dir() {
-        candidates.push(global_claude);
-    }
-    candidates.push(default_skills_dir());
     existing_skill_dirs(candidates)
 }
 
 fn existing_skill_dirs(candidates: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
     let mut out = Vec::new();
+    let mut seen = HashSet::new();
     for path in candidates {
-        if path.is_dir() && !out.iter().any(|p: &PathBuf| p == &path) {
+        let Ok(canonical_path) = fs::canonicalize(&path) else {
+            continue;
+        };
+        if canonical_path.is_dir() && seen.insert(canonical_path) {
             out.push(path);
         }
     }
@@ -437,15 +520,44 @@ pub fn discover_in_workspace(workspace: &Path) -> SkillRegistry {
 }
 
 /// Discover skills from the workspace search set plus the configured install
-/// directory. Workspace/global directories keep their normal precedence; a
-/// custom configured directory is appended when it is outside that set.
+/// directory. Workspace-local directories keep their normal precedence; a
+/// custom configured directory is inserted before global defaults when it is
+/// outside that set so explicit configuration cannot be buried by large global
+/// libraries.
 #[must_use]
 pub fn discover_for_workspace_and_dir(workspace: &Path, skills_dir: &Path) -> SkillRegistry {
     let mut dirs = skills_directories(workspace);
-    if skills_dir.is_dir() && !dirs.iter().any(|p| p == skills_dir) {
-        dirs.push(skills_dir.to_path_buf());
+    insert_configured_skills_dir(&mut dirs, workspace, skills_dir);
+    discover_from_directories(dirs)
+}
+
+fn insert_configured_skills_dir(dirs: &mut Vec<PathBuf>, workspace: &Path, skills_dir: &Path) {
+    if !skills_dir.is_dir() || dirs.iter().any(|p| paths_refer_to_same_dir(p, skills_dir)) {
+        return;
     }
 
+    let workspace_root = fs::canonicalize(workspace).ok();
+    let insert_at = workspace_root
+        .as_ref()
+        .and_then(|root| {
+            dirs.iter()
+                .position(|dir| fs::canonicalize(dir).map_or(true, |dir| !dir.starts_with(root)))
+        })
+        .unwrap_or(dirs.len());
+    dirs.insert(insert_at, skills_dir.to_path_buf());
+}
+
+fn paths_refer_to_same_dir(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+pub(crate) fn discover_from_directories(dirs: impl IntoIterator<Item = PathBuf>) -> SkillRegistry {
     let mut merged = SkillRegistry::default();
     for dir in dirs {
         let registry = SkillRegistry::discover(&dir);
@@ -459,6 +571,17 @@ pub fn discover_for_workspace_and_dir(workspace: &Path, skills_dir: &Path) -> Sk
         }
     }
     merged
+}
+
+#[cfg(test)]
+pub(crate) fn discover_for_workspace_and_dir_with_home(
+    workspace: &Path,
+    skills_dir: &Path,
+    home_dir: Option<&Path>,
+) -> SkillRegistry {
+    let mut dirs = skills_directories_with_home(workspace, home_dir);
+    insert_configured_skills_dir(&mut dirs, workspace, skills_dir);
+    discover_from_directories(dirs)
 }
 
 /// Render the system-prompt skills block from every workspace
@@ -478,9 +601,21 @@ pub fn render_available_skills_context_for_workspace(workspace: &Path) -> Option
 /// Single-directory variant — use
 /// [`render_available_skills_context_for_workspace`] when scanning
 /// a workspace for cross-tool skill folders (#432).
+#[cfg(test)]
 #[must_use]
-pub fn render_available_skills_context(skills_dir: &Path) -> Option<String> {
+fn render_available_skills_context(skills_dir: &Path) -> Option<String> {
     let registry = SkillRegistry::discover(skills_dir);
+    render_skills_block(&registry)
+}
+
+/// Union variant: merge skills discovered in the `workspace` (cross-tool skill
+/// folders) and an explicitly-configured `skills_dir`.
+#[must_use]
+pub fn render_available_skills_context_for_workspace_and_dir(
+    workspace: &Path,
+    skills_dir: &Path,
+) -> Option<String> {
+    let registry = discover_for_workspace_and_dir(workspace, skills_dir);
     render_skills_block(&registry)
 }
 
@@ -488,9 +623,6 @@ fn render_skills_block(registry: &SkillRegistry) -> Option<String> {
     if registry.is_empty() {
         return None;
     }
-
-    let mut skills = registry.list().to_vec();
-    skills.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mut out = String::new();
     out.push_str("## Skills\n");
@@ -503,7 +635,7 @@ instructions when using a specific skill.\n\n",
     out.push_str("### Available skills\n");
 
     let mut omitted = 0usize;
-    for skill in skills {
+    for skill in registry.list() {
         // Use the real on-disk path captured at discovery — the directory
         // name can differ from the frontmatter `name` for community
         // installs, in which case `<dir>/<name>/SKILL.md` would not exist
@@ -544,12 +676,10 @@ instructions when using a specific skill.\n\n",
 
     out.push_str(
         "\n### How to use skills\n\
-- Discovery: The list above is the skills available in this session. Skill bodies live on disk at the listed paths.\n\
-- Trigger rules: If the user names a skill (with `$SkillName`, `/skill <name>`, or plain text) OR the task clearly matches a skill description above, use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.\n\
-- Missing/blocked: If a named skill is missing or its `SKILL.md` cannot be read, say so briefly and continue with the best fallback.\n\
-- Progressive disclosure: After deciding to use a skill, read only that skill's `SKILL.md`. When it references relative paths such as `scripts/foo.py`, resolve them relative to the skill directory.\n\
-- Context hygiene: Load only the specific referenced files needed for the task. Avoid bulk-loading unrelated skill resources.\n\
-- Safety: Do not execute scripts from a community skill unless the user explicitly asks or the skill has been trusted for script use.\n",
+- Skill bodies live on disk at the listed paths. When a skill is relevant, open only that skill's `SKILL.md` and the specific companion files it references.\n\
+- Trigger rules: use a skill when the user names it (`$SkillName`, `/skill <name>`, or plain text) or the task clearly matches its description. Do not carry skills across turns unless re-mentioned.\n\
+- Missing/blocked: if a named skill is missing or cannot be read, say so briefly and continue with the best fallback.\n\
+- Safety: do not execute scripts from a community skill unless the user explicitly asks or the skill has been trusted for script use.\n",
     );
 
     Some(out)
@@ -567,44 +697,6 @@ fn truncate_for_prompt(value: &str, max_chars: usize) -> String {
         .collect::<String>();
     truncated.push('…');
     truncated
-}
-
-// === CLI Helpers ===
-
-#[allow(dead_code)] // CLI utility for future use
-pub fn list(skills_dir: &Path) -> Result<()> {
-    if !skills_dir.exists() {
-        println!("No skills directory found at {}", skills_dir.display());
-        return Ok(());
-    }
-
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(skills_dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            entries.push(entry.file_name().to_string_lossy().to_string());
-        }
-    }
-
-    if entries.is_empty() {
-        println!("No skills found in {}", skills_dir.display());
-        return Ok(());
-    }
-
-    entries.sort();
-    for entry in entries {
-        println!("{entry}");
-    }
-    Ok(())
-}
-
-#[allow(dead_code)] // CLI utility for future use
-pub fn show(skills_dir: &Path, name: &str) -> Result<()> {
-    let path = skills_dir.join(name).join("SKILL.md");
-    let contents =
-        fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
-    println!("{contents}");
-    Ok(())
 }
 
 #[cfg(test)]
@@ -763,6 +855,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn render_skills_block_preserves_registry_precedence_under_prompt_budget() {
+        let tmpdir = TempDir::new().unwrap();
+        let mut registry = super::SkillRegistry::default();
+        registry.skills.push(super::Skill {
+            name: "workspace-priority".to_string(),
+            description: "must survive truncation".to_string(),
+            body: "body".to_string(),
+            path: tmpdir
+                .path()
+                .join(".claude")
+                .join("skills")
+                .join("workspace-priority")
+                .join("SKILL.md"),
+        });
+
+        let big_desc = "y".repeat(super::MAX_SKILL_DESCRIPTION_CHARS - 20);
+        for i in 0..200 {
+            registry.skills.push(super::Skill {
+                name: format!("aaa-global-{i:03}"),
+                description: big_desc.clone(),
+                body: "body".to_string(),
+                path: tmpdir
+                    .path()
+                    .join(".deepseek")
+                    .join("skills")
+                    .join(format!("aaa-global-{i:03}"))
+                    .join("SKILL.md"),
+            });
+        }
+
+        let rendered = super::render_skills_block(&registry).expect("skill context");
+        assert!(
+            rendered.contains("workspace-priority"),
+            "higher-precedence workspace skills must not be reordered behind globals:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("additional skills omitted from this prompt budget"),
+            "fixture should exceed prompt budget"
+        );
+    }
+
     fn write_skill(dir: &std::path::Path, name: &str, description: &str, body: &str) {
         let skill_dir = dir.join(name);
         std::fs::create_dir_all(&skill_dir).unwrap();
@@ -821,15 +955,6 @@ mod tests {
             Some(&cursor),
             "cursor must come after claude"
         );
-    }
-
-    #[test]
-    fn claude_global_skills_dir_returns_home_relative_path() {
-        // Smoke test for the #902 helper. We don't assert the exact path
-        // because dirs::home_dir() is host-dependent; we just pin the
-        // suffix shape so a future refactor can't silently rename it.
-        let path = super::claude_global_skills_dir().expect("home dir resolves on test host");
-        assert!(path.ends_with(".claude/skills") || path.ends_with(r".claude\skills"));
     }
 
     #[test]
@@ -1010,6 +1135,69 @@ mod tests {
         let rendered =
             super::render_available_skills_context_for_workspace(workspace).expect("non-empty");
         assert!(rendered.contains("from-claude"));
+    }
+
+    #[test]
+    fn discover_for_workspace_and_dir_merges_workspace_and_configured_sources() {
+        let tmpdir = TempDir::new().unwrap();
+        let workspace = tmpdir.path().join("workspace");
+        let home = tmpdir.path().join("home");
+        let configured_dir = tmpdir.path().join("configured-skills");
+        std::fs::create_dir_all(&workspace).unwrap();
+        write_skill(
+            &workspace.join(".claude").join("skills"),
+            "workspace-skill",
+            "workspace visible skill",
+            "body",
+        );
+        write_skill(
+            &configured_dir,
+            "configured-skill",
+            "configured visible skill",
+            "body",
+        );
+
+        let registry = super::discover_for_workspace_and_dir_with_home(
+            &workspace,
+            &configured_dir,
+            Some(&home),
+        );
+        let names: Vec<&str> = registry.list().iter().map(|s| s.name.as_str()).collect();
+
+        assert!(names.contains(&"workspace-skill"));
+        assert!(names.contains(&"configured-skill"));
+    }
+
+    #[test]
+    fn explicit_configured_skills_dir_precedes_global_defaults() {
+        let tmpdir = TempDir::new().unwrap();
+        let workspace = tmpdir.path().join("workspace");
+        let home = tmpdir.path().join("home");
+        let configured_dir = tmpdir.path().join("configured-skills");
+        std::fs::create_dir_all(&workspace).unwrap();
+        write_skill(
+            &home.join(".agents").join("skills"),
+            "shared-skill",
+            "global skill",
+            "global body",
+        );
+        write_skill(
+            &configured_dir,
+            "shared-skill",
+            "configured skill",
+            "configured body",
+        );
+
+        let registry = super::discover_for_workspace_and_dir_with_home(
+            &workspace,
+            &configured_dir,
+            Some(&home),
+        );
+        let skill = registry
+            .get("shared-skill")
+            .expect("shared skill discovered");
+
+        assert_eq!(skill.description, "configured skill");
     }
 
     /// Regression for the GitHub issue where users organize skills under
@@ -1196,6 +1384,282 @@ mod tests {
         assert!(
             names.contains(&"git-conventions"),
             "hidden root must still be walked: {names:?}"
+        );
+    }
+
+    /// Mirrors the qa_pty `skills_menu_shows_local_and_global_skills`
+    /// scenario without the PTY harness: a workspace-level skill in
+    /// `.agents/skills/` and a global skill in `~/.codewhale/skills/`
+    /// must both be discoverable.
+    #[test]
+    fn discover_finds_both_workspace_and_global_skills() {
+        let tmpdir = TempDir::new().unwrap();
+        let workspace = tmpdir.path().join("workspace");
+        let home = tmpdir.path().join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        write_skill(
+            &workspace.join(".agents").join("skills"),
+            "workspace-beta",
+            "Workspace beta skill",
+            "body",
+        );
+        write_skill(
+            &home.join(".deepseek").join("skills"),
+            "global-alpha",
+            "Global alpha skill",
+            "body",
+        );
+
+        let skills_dir = workspace.join(".agents").join("skills");
+        let registry =
+            super::discover_for_workspace_and_dir_with_home(&workspace, &skills_dir, Some(&home));
+
+        let names: Vec<&str> = registry.list().iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"workspace-beta"),
+            "workspace-beta from .agents/skills must be discovered: {names:?}",
+        );
+        assert!(
+            names.contains(&"global-alpha"),
+            "global-alpha from ~/.deepseek/skills must be discovered: {names:?}",
+        );
+    }
+
+    // ── Block scalar parsing (YAML `>` and `|`) ────────────────
+
+    /// `>` (folded block scalar): subsequent indented lines are folded
+    /// into a single line joined by spaces.
+    #[test]
+    fn parse_skill_folded_block_scalar() {
+        let tmpdir = TempDir::new().unwrap();
+        create_skill_dir(
+            &tmpdir,
+            "folded-skill",
+            "---\nname: folded-skill\ndescription: >\n  line one chinese\n  line two chinese\n---\nbody",
+        );
+        let rendered =
+            crate::skills::render_available_skills_context(&tmpdir.path().join("skills"))
+                .expect("skill context");
+        assert!(
+            rendered.contains("line one chinese line two chinese"),
+            "folded block scalar should join lines with space, got:\n{rendered}"
+        );
+    }
+
+    /// `|` (literal block scalar): subsequent indented lines preserve
+    /// newlines.
+    #[test]
+    fn parse_skill_literal_block_scalar() {
+        let tmpdir = TempDir::new().unwrap();
+        create_skill_dir(
+            &tmpdir,
+            "literal-skill",
+            "---\nname: literal-skill\ndescription: |\n  line one\n  line two\n---\nbody",
+        );
+        let rendered =
+            crate::skills::render_available_skills_context(&tmpdir.path().join("skills"))
+                .expect("skill context");
+        // `truncate_for_prompt` collapses whitespace, so the newlines
+        // become spaces. The key assertion is that the content is
+        // captured (not just `|`).
+        assert!(
+            rendered.contains("line one line two"),
+            "literal block scalar should preserve content, got:\n{rendered}"
+        );
+    }
+
+    /// `>-` (folded with strip chomping): same as `>` but trailing
+    /// whitespace is stripped.
+    #[test]
+    fn parse_skill_folded_strip_block_scalar() {
+        let tmpdir = TempDir::new().unwrap();
+        create_skill_dir(
+            &tmpdir,
+            "strip-skill",
+            "---\nname: strip-skill\ndescription: >-\n  alpha\n  beta\n\n---\nbody",
+        );
+        let rendered =
+            crate::skills::render_available_skills_context(&tmpdir.path().join("skills"))
+                .expect("skill context");
+        assert!(
+            rendered.contains("alpha beta"),
+            "strip-chomped folded block should join lines, got:\n{rendered}"
+        );
+    }
+
+    /// Regression: a single-line description (no block scalar) must
+    /// still parse correctly after the parser rewrite.
+    #[test]
+    fn parse_skill_single_line_description_still_works() {
+        let tmpdir = TempDir::new().unwrap();
+        create_skill_dir(
+            &tmpdir,
+            "plain-skill",
+            "---\nname: plain-skill\ndescription: A simple description\n---\nbody",
+        );
+        let rendered =
+            crate::skills::render_available_skills_context(&tmpdir.path().join("skills"))
+                .expect("skill context");
+        assert!(
+            rendered.contains("- plain-skill: A simple description"),
+            "single-line description should still work, got:\n{rendered}"
+        );
+    }
+
+    /// Direct unit test on the parsed Skill struct (not through rendering)
+    /// so we assert the exact description value.
+    #[test]
+    fn parse_skill_direct_folded_result() {
+        let skill = super::SkillRegistry::parse_skill(
+            std::path::Path::new(""),
+            "---\nname: test\ndescription: >\n  this is a test\n  used to verify parsing\n---\nbody",
+        )
+        .expect("should parse");
+        assert_eq!(skill.name, "test");
+        assert_eq!(skill.description, "this is a test used to verify parsing");
+    }
+
+    // ── Chomping behaviour ────────────────────────────────────
+
+    /// `>-` (strip): trailing empty lines are stripped. Paragraph
+    /// breaks (empty line between text lines) are still folded to a
+    /// single space in a block-scalar join (no newline — the simplified
+    /// parser treats intra-block empty lines as paragraph breaks that
+    /// become a single space in the folded output).
+    #[test]
+    fn parse_skill_strip_chomp_strips_trailing_empties() {
+        let skill = super::SkillRegistry::parse_skill(
+            std::path::Path::new(""),
+            "---\nname: s\ndescription: >-\n  hello\n  world\n\n\n---\nbody",
+        )
+        .expect("should parse");
+        // Trailing empty lines stripped: no whitespace at end, just folded text.
+        assert_eq!(skill.description, "hello world");
+    }
+
+    /// `>+` (keep): trailing empty lines are preserved. Each trailing
+    /// empty line in the block becomes a newline in the description.
+    #[test]
+    fn parse_skill_keep_chomp_preserves_trailing_empties() {
+        let skill = super::SkillRegistry::parse_skill(
+            std::path::Path::new(""),
+            "---\nname: s\ndescription: >+\n  hello\n  world\n\n\n---\nbody",
+        )
+        .expect("should parse");
+        // Two trailing empty lines should become two newlines.
+        assert_eq!(skill.description, "hello world\n\n");
+    }
+
+    /// `>` (clip): trailing empty lines exceeding one are clipped.
+    /// The result should have at most one trailing newline.
+    #[test]
+    fn parse_skill_clip_chomp_clips_excess_trailing_empties() {
+        let skill = super::SkillRegistry::parse_skill(
+            std::path::Path::new(""),
+            "---\nname: s\ndescription: >\n  hello\n  world\n\n\n---\nbody",
+        )
+        .expect("should parse");
+        // clip: 3 trailing empty lines → at most 1 trailing newline.
+        assert_eq!(skill.description, "hello world\n");
+    }
+
+    /// `>` with no trailing empty lines: clip should not add anything.
+    #[test]
+    fn parse_skill_clip_chomp_no_trailing_empties() {
+        let skill = super::SkillRegistry::parse_skill(
+            std::path::Path::new(""),
+            "---\nname: s\ndescription: >\n  hello\n  world\n---\nbody",
+        )
+        .expect("should parse");
+        assert_eq!(skill.description, "hello world");
+    }
+
+    /// `>` with exactly one trailing empty line: clip keeps it.
+    #[test]
+    fn parse_skill_clip_chomp_one_trailing_empty() {
+        let skill = super::SkillRegistry::parse_skill(
+            std::path::Path::new(""),
+            "---\nname: s\ndescription: >\n  hello\n  world\n\n---\nbody",
+        )
+        .expect("should parse");
+        assert_eq!(skill.description, "hello world\n");
+    }
+
+    /// `>-` strip vs `>+` keep: same block content, different
+    /// trailing newline handling.
+    #[test]
+    fn parse_skill_strip_vs_keep_trailing() {
+        let content = "---\nname: s\ndescription: >{}\n  hello\n  world\n\n\n---\nbody";
+        let strip_skill = super::SkillRegistry::parse_skill(
+            std::path::Path::new(""),
+            &content.replace("{}", "-"),
+        )
+        .expect("strip parse");
+        let keep_skill = super::SkillRegistry::parse_skill(
+            std::path::Path::new(""),
+            &content.replace("{}", "+"),
+        )
+        .expect("keep parse");
+        // strip drops trailing empties; keep preserves them.
+        assert_eq!(strip_skill.description, "hello world");
+        assert_eq!(keep_skill.description, "hello world\n\n");
+    }
+
+    /// `|-` literal strip: trailing newlines are stripped.
+    #[test]
+    fn parse_skill_literal_strip_strips_trailing_newlines() {
+        let skill = super::SkillRegistry::parse_skill(
+            std::path::Path::new(""),
+            "---\nname: s\ndescription: |-\n  line one\n  line two\n\n\n---\nbody",
+        )
+        .expect("should parse");
+        // literal: newlines preserved between non-empty lines.
+        // strip: trailing empty lines removed.
+        assert_eq!(skill.description, "line one\nline two");
+    }
+
+    /// `|+` literal keep: trailing newlines are preserved.
+    #[test]
+    fn parse_skill_literal_keep_preserves_trailing_newlines() {
+        let skill = super::SkillRegistry::parse_skill(
+            std::path::Path::new(""),
+            "---\nname: s\ndescription: |+\n  line one\n  line two\n\n\n---\nbody",
+        )
+        .expect("should parse");
+        // literal: newlines preserved between non-empty lines.
+        // keep: trailing empty lines are preserved as newlines.
+        assert_eq!(skill.description, "line one\nline two\n\n");
+    }
+
+    /// Nested relative indentation is preserved in literal (`|`) block
+    /// scalars: only the content-level indent (from the first non-empty
+    /// line) is stripped, and any deeper indent stays as-is.
+    #[test]
+    fn parse_skill_literal_preserves_relative_indentation() {
+        let skill = super::SkillRegistry::parse_skill(
+            std::path::Path::new(""),
+            "---\nname: s\ndescription: |\n  Usage:\n    $ deepseek --model auto\n    $ deepseek doctor\n---\nbody",
+        )
+        .expect("should parse");
+        assert_eq!(
+            skill.description,
+            "Usage:\n  $ deepseek --model auto\n  $ deepseek doctor"
+        );
+    }
+
+    /// Folded (`>`) block scalars also preserve relative indentation
+    /// within lines (the extra spaces survive the fold).
+    #[test]
+    fn parse_skill_folded_preserves_relative_indentation() {
+        let skill = super::SkillRegistry::parse_skill(
+            std::path::Path::new(""),
+            "---\nname: s\ndescription: >\n  See also:\n    the config file\n    the env var\n---\nbody",
+        )
+        .expect("should parse");
+        assert_eq!(
+            skill.description,
+            "See also:   the config file   the env var"
         );
     }
 }

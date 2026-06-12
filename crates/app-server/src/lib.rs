@@ -2,40 +2,72 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
-use axum::extract::State;
+use anyhow::{Result, bail};
+use axum::extract::{Request, State};
+use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use deepseek_agent::ModelRegistry;
-use deepseek_config::{CliRuntimeOverrides, ConfigStore};
-use deepseek_core::Runtime;
-use deepseek_execpolicy::ExecPolicyEngine;
-use deepseek_hooks::{HookDispatcher, JsonlHookSink, StdoutHookSink};
-use deepseek_mcp::McpManager;
-use deepseek_protocol::{
+use codewhale_agent::ModelRegistry;
+use codewhale_config::{CliRuntimeOverrides, ConfigStore};
+use codewhale_core::Runtime;
+use codewhale_hooks::{HookDispatcher, JsonlHookSink, StdoutHookSink, UnixSocketHookSink};
+use codewhale_mcp::McpManager;
+use codewhale_protocol::{
     AppRequest, AppResponse, PromptRequest, PromptResponse, ThreadRequest, ThreadResponse,
 };
-use deepseek_state::StateStore;
-use deepseek_tools::{ToolCall, ToolRegistry};
+use codewhale_state::StateStore;
+use codewhale_tools::{ToolCall, ToolRegistry};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
+use uuid::Uuid;
 
-#[derive(Debug, Clone)]
+const DEFAULT_CORS_ORIGINS: &[&str] = &[
+    "http://localhost",
+    "http://localhost:1420",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1",
+    "http://127.0.0.1:1420",
+    "tauri://localhost",
+];
+
+#[derive(Clone)]
 pub struct AppServerOptions {
     pub listen: SocketAddr,
     pub config_path: Option<PathBuf>,
+    pub auth_token: Option<String>,
+    pub insecure_no_auth: bool,
+    pub cors_origins: Vec<String>,
+}
+
+impl std::fmt::Debug for AppServerOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppServerOptions")
+            .field("listen", &self.listen)
+            .field("config_path", &self.config_path)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("insecure_no_auth", &self.insecure_no_auth)
+            .field("cors_origins", &self.cors_origins)
+            .finish()
+    }
 }
 
 #[derive(Clone)]
 struct AppState {
     config_path: Option<PathBuf>,
-    config: Arc<RwLock<deepseek_config::ConfigToml>>,
+    config: Arc<RwLock<codewhale_config::ConfigToml>>,
     runtime: Arc<Mutex<Runtime>>,
     registry: ModelRegistry,
+    auth_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +101,12 @@ struct StdioDispatchResult {
     should_exit: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppTransport {
+    Http,
+    Stdio,
+}
+
 #[derive(Debug, Deserialize)]
 struct ConfigGetParams {
     key: String,
@@ -92,26 +130,37 @@ struct ThreadMessageParams {
 }
 
 pub async fn run(options: AppServerOptions) -> Result<()> {
-    let state = build_state(options.config_path.clone())?;
-
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/thread", post(thread_handler))
-        .route("/app", post(app_handler))
-        .route("/prompt", post(prompt_handler))
-        .route("/tool", post(tool_handler))
-        .route("/jobs", get(jobs_handler))
-        .route("/mcp/startup", post(mcp_startup_handler))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+    let auth_token = resolve_auth_token(&options)?;
+    let state = build_state(options.config_path.clone(), auth_token)?;
+    let app = app_router(state, &options.cors_origins);
 
     let listener = tokio::net::TcpListener::bind(options.listen).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }
 
+fn app_router(state: AppState, cors_origins: &[String]) -> Router {
+    let protected_routes = Router::new()
+        .route("/thread", post(thread_handler))
+        .route("/app", post(app_handler))
+        .route("/prompt", post(prompt_handler))
+        .route("/tool", post(tool_handler))
+        .route("/jobs", get(jobs_handler))
+        .route("/mcp/startup", post(mcp_startup_handler))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_app_server_token,
+        ));
+
+    Router::new()
+        .route("/healthz", get(healthz))
+        .merge(protected_routes)
+        .layer(cors_layer(cors_origins))
+        .with_state(state)
+}
+
 pub async fn run_stdio(config_path: Option<PathBuf>) -> Result<()> {
-    let state = build_state(config_path)?;
+    let state = build_state(config_path, None)?;
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin).lines();
@@ -227,14 +276,19 @@ async fn tool_handler(
     let cwd = req
         .cwd
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    match runtime
-        .invoke_tool(
-            req.call,
-            deepseek_execpolicy::AskForApproval::OnRequest,
-            &cwd,
-        )
-        .await
-    {
+    // Resolve approval policy from config instead of hardcoding.
+    let approval_mode = {
+        let cfg = state.config.read().await;
+        cfg.approval_policy
+            .as_deref()
+            .and_then(|p| match p.trim().to_ascii_lowercase().as_str() {
+                "auto" | "yolo" => Some(codewhale_execpolicy::AskForApproval::UnlessTrusted),
+                "never" | "deny" => Some(codewhale_execpolicy::AskForApproval::Never),
+                _ => None,
+            })
+            .unwrap_or(codewhale_execpolicy::AskForApproval::OnRequest)
+    };
+    match runtime.invoke_tool(req.call, approval_mode, &cwd).await {
         Ok(value) => Json(value),
         Err(err) => Json(json!({ "ok": false, "error": err.to_string() })),
     }
@@ -258,12 +312,13 @@ async fn app_handler(
     State(state): State<AppState>,
     Json(req): Json<AppRequest>,
 ) -> Json<AppResponse> {
-    Json(process_app_request(&state, req).await)
+    Json(process_app_request(&state, req, AppTransport::Http).await)
 }
 
-fn build_state(config_path: Option<PathBuf>) -> Result<AppState> {
+fn build_state(config_path: Option<PathBuf>, auth_token: Option<String>) -> Result<AppState> {
     let store = ConfigStore::load(config_path.clone())?;
     let config = store.config.clone();
+    let exec_policy = store.exec_policy_engine();
     let registry = ModelRegistry::default();
 
     let state_db_path = config_path
@@ -279,13 +334,22 @@ fn build_state(config_path: Option<PathBuf>) -> Result<AppState> {
         .unwrap_or_else(|| PathBuf::from(".deepseek/events.jsonl"));
     hooks.add_sink(Arc::new(JsonlHookSink::new(hook_log_path)));
 
+    if let Some(socket_path) = config
+        .hook_sinks
+        .as_ref()
+        .and_then(|sinks| sinks.unix_socket_path.as_ref())
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        hooks.add_sink(Arc::new(UnixSocketHookSink::new(socket_path.clone())));
+    }
+
     let runtime = Runtime::new(
         config.clone(),
         registry.clone(),
         state_store,
         Arc::new(ToolRegistry::default()),
         Arc::new(McpManager::default()),
-        ExecPolicyEngine::new(Vec::new(), Vec::new()),
+        exec_policy,
         hooks,
     );
 
@@ -294,7 +358,93 @@ fn build_state(config_path: Option<PathBuf>) -> Result<AppState> {
         config: Arc::new(RwLock::new(config)),
         runtime: Arc::new(Mutex::new(runtime)),
         registry,
+        auth_token,
     })
+}
+
+fn resolve_auth_token(options: &AppServerOptions) -> Result<Option<String>> {
+    let configured = options.auth_token.as_ref().map(|token| token.trim());
+    if let Some(token) = configured
+        && token.is_empty()
+    {
+        bail!("app-server auth token cannot be empty");
+    }
+
+    if options.insecure_no_auth {
+        if !options.listen.ip().is_loopback() {
+            bail!("refusing unauthenticated app-server bind on non-loopback address");
+        }
+        eprintln!("warning: app-server HTTP auth disabled by --insecure-no-auth");
+        return Ok(None);
+    }
+
+    let token = configured
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("cwapp_{}", Uuid::new_v4().simple()));
+    if options.auth_token.is_some() {
+        eprintln!("app-server auth: bearer token required for HTTP routes.");
+    } else {
+        eprintln!("app-server auth: generated bearer token for this process.");
+        eprintln!("  Authorization: Bearer {token}");
+        eprintln!("  Pass --auth-token or set CODEWHALE_APP_SERVER_TOKEN for a stable token.");
+    }
+    Ok(Some(token))
+}
+
+fn cors_layer(extra_origins: &[String]) -> CorsLayer {
+    let mut origins: Vec<HeaderValue> = DEFAULT_CORS_ORIGINS
+        .iter()
+        .filter_map(|origin| HeaderValue::from_str(origin).ok())
+        .collect();
+    for raw in extra_origins {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match HeaderValue::from_str(trimmed) {
+            Ok(value) if !origins.contains(&value) => origins.push(value),
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("warning: ignoring invalid app-server CORS origin `{trimmed}`: {err}")
+            }
+        }
+    }
+
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+}
+
+async fn require_app_server_token(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(expected) = state.auth_token.as_deref() else {
+        return next.run(req).await;
+    };
+    let authorized = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|raw| raw.strip_prefix("Bearer "))
+        .is_some_and(|token| token == expected);
+
+    if authorized {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": {
+                    "message": "app-server bearer token required",
+                    "status": StatusCode::UNAUTHORIZED.as_u16(),
+                }
+            })),
+        )
+            .into_response()
+    }
 }
 
 fn params_or_object(params: Value) -> Value {
@@ -585,7 +735,8 @@ async fn dispatch_stdio_request(
             }
         }
         "app/capabilities" => {
-            let response = process_app_request(state, AppRequest::Capabilities).await;
+            let response =
+                process_app_request(state, AppRequest::Capabilities, AppTransport::Stdio).await;
             StdioDispatchResult {
                 result: serde_json::to_value(response)
                     .map_err(|err| JsonRpcError::internal(err.to_string()))?,
@@ -594,7 +745,7 @@ async fn dispatch_stdio_request(
         }
         "app/request" => {
             let request: AppRequest = parse_params(params)?;
-            let response = process_app_request(state, request).await;
+            let response = process_app_request(state, request, AppTransport::Stdio).await;
             StdioDispatchResult {
                 result: serde_json::to_value(response)
                     .map_err(|err| JsonRpcError::internal(err.to_string()))?,
@@ -603,8 +754,12 @@ async fn dispatch_stdio_request(
         }
         "app/config/get" => {
             let parsed: ConfigGetParams = parse_params(params_or_object(params))?;
-            let response =
-                process_app_request(state, AppRequest::ConfigGet { key: parsed.key }).await;
+            let response = process_app_request(
+                state,
+                AppRequest::ConfigGet { key: parsed.key },
+                AppTransport::Stdio,
+            )
+            .await;
             StdioDispatchResult {
                 result: serde_json::to_value(response)
                     .map_err(|err| JsonRpcError::internal(err.to_string()))?,
@@ -619,6 +774,7 @@ async fn dispatch_stdio_request(
                     key: parsed.key,
                     value: parsed.value,
                 },
+                AppTransport::Stdio,
             )
             .await;
             StdioDispatchResult {
@@ -629,8 +785,12 @@ async fn dispatch_stdio_request(
         }
         "app/config/unset" => {
             let parsed: ConfigGetParams = parse_params(params_or_object(params))?;
-            let response =
-                process_app_request(state, AppRequest::ConfigUnset { key: parsed.key }).await;
+            let response = process_app_request(
+                state,
+                AppRequest::ConfigUnset { key: parsed.key },
+                AppTransport::Stdio,
+            )
+            .await;
             StdioDispatchResult {
                 result: serde_json::to_value(response)
                     .map_err(|err| JsonRpcError::internal(err.to_string()))?,
@@ -638,7 +798,8 @@ async fn dispatch_stdio_request(
             }
         }
         "app/config/list" => {
-            let response = process_app_request(state, AppRequest::ConfigList).await;
+            let response =
+                process_app_request(state, AppRequest::ConfigList, AppTransport::Stdio).await;
             StdioDispatchResult {
                 result: serde_json::to_value(response)
                     .map_err(|err| JsonRpcError::internal(err.to_string()))?,
@@ -646,7 +807,8 @@ async fn dispatch_stdio_request(
             }
         }
         "app/models" => {
-            let response = process_app_request(state, AppRequest::Models).await;
+            let response =
+                process_app_request(state, AppRequest::Models, AppTransport::Stdio).await;
             StdioDispatchResult {
                 result: serde_json::to_value(response)
                     .map_err(|err| JsonRpcError::internal(err.to_string()))?,
@@ -654,7 +816,8 @@ async fn dispatch_stdio_request(
             }
         }
         "app/thread_loaded_list" | "app/thread-loaded-list" => {
-            let response = process_app_request(state, AppRequest::ThreadLoadedList).await;
+            let response =
+                process_app_request(state, AppRequest::ThreadLoadedList, AppTransport::Stdio).await;
             StdioDispatchResult {
                 result: serde_json::to_value(response)
                     .map_err(|err| JsonRpcError::internal(err.to_string()))?,
@@ -685,7 +848,11 @@ async fn dispatch_stdio_request(
     Ok(outcome)
 }
 
-async fn process_app_request(state: &AppState, req: AppRequest) -> AppResponse {
+async fn process_app_request(
+    state: &AppState,
+    req: AppRequest,
+    transport: AppTransport,
+) -> AppResponse {
     match req {
         AppRequest::Capabilities => AppResponse {
             ok: true,
@@ -700,9 +867,13 @@ async fn process_app_request(state: &AppState, req: AppRequest) -> AppResponse {
         },
         AppRequest::ConfigGet { key } => {
             let cfg = state.config.read().await;
+            let value = match transport {
+                AppTransport::Http => cfg.get_display_value(&key),
+                AppTransport::Stdio => cfg.get_value(&key),
+            };
             AppResponse {
                 ok: true,
-                data: json!({ "key": key, "value": cfg.get_value(&key) }),
+                data: json!({ "key": key, "value": value }),
                 events: Vec::new(),
             }
         }
@@ -713,7 +884,9 @@ async fn process_app_request(state: &AppState, req: AppRequest) -> AppResponse {
             let message = result.err().map(|e| e.to_string());
             let snapshot = cfg.clone();
             drop(cfg);
-            let _ = persist_config(state, snapshot).await;
+            if let Err(e) = persist_config(state, snapshot).await {
+                tracing::error!("Failed to persist config after set: {e}");
+            }
             AppResponse {
                 ok,
                 data: json!({ "key": key, "value": value, "error": message }),
@@ -727,7 +900,9 @@ async fn process_app_request(state: &AppState, req: AppRequest) -> AppResponse {
             let message = result.err().map(|e| e.to_string());
             let snapshot = cfg.clone();
             drop(cfg);
-            let _ = persist_config(state, snapshot).await;
+            if let Err(e) = persist_config(state, snapshot).await {
+                tracing::error!("Failed to persist config after unset: {e}");
+            }
             AppResponse {
                 ok,
                 data: json!({ "key": key, "error": message }),
@@ -750,8 +925,8 @@ async fn process_app_request(state: &AppState, req: AppRequest) -> AppResponse {
         AppRequest::ThreadLoadedList => {
             let mut runtime = state.runtime.lock().await;
             let response = runtime
-                .handle_thread(deepseek_protocol::ThreadRequest::List(
-                    deepseek_protocol::ThreadListParams {
+                .handle_thread(codewhale_protocol::ThreadRequest::List(
+                    codewhale_protocol::ThreadListParams {
                         include_archived: false,
                         limit: Some(50),
                     },
@@ -773,11 +948,340 @@ async fn process_app_request(state: &AppState, req: AppRequest) -> AppResponse {
     }
 }
 
-async fn persist_config(state: &AppState, config: deepseek_config::ConfigToml) -> Result<()> {
+async fn persist_config(state: &AppState, config: codewhale_config::ConfigToml) -> Result<()> {
     if state.config_path.is_none() {
         return Ok(());
     }
     let mut store = ConfigStore::load(state.config_path.clone())?;
     store.config = config;
     store.save()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use codewhale_protocol::AppRequest;
+    use std::fs;
+    use tower::ServiceExt;
+
+    fn app_with_config(auth_token: Option<&str>) -> (Router, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        fs::write(&config_path, "api_key = \"sk-deepseek-secret\"\n").expect("write config");
+        let state = build_state(
+            Some(config_path),
+            auth_token.map(std::string::ToString::to_string),
+        )
+        .expect("state");
+        (app_router(state, &[]), tmp)
+    }
+
+    async fn response_body_json(response: Response) -> Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        serde_json::from_slice(&bytes).expect("json response")
+    }
+
+    #[tokio::test]
+    async fn http_app_routes_require_bearer_token_when_auth_enabled() {
+        let (app, _tmp) = app_with_config(Some("test-token"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/app")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&AppRequest::ConfigGet {
+                            key: "api_key".to_string(),
+                        })
+                        .expect("request json"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn http_config_get_redacts_sensitive_values_after_auth() {
+        let (app, _tmp) = app_with_config(Some("test-token"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/app")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&AppRequest::ConfigGet {
+                            key: "api_key".to_string(),
+                        })
+                        .expect("request json"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body_json(response).await;
+        assert_eq!(body["data"]["value"], "sk-d***cret");
+    }
+
+    #[tokio::test]
+    async fn cors_does_not_allow_arbitrary_origins() {
+        let (app, _tmp) = app_with_config(Some("test-token"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/healthz")
+                    .header(header::ORIGIN, "https://attacker.example")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn build_state_loads_permissions_into_runtime_policy() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        fs::write(&config_path, "api_key = \"sk-deepseek-secret\"\n").expect("write config");
+        fs::write(
+            tmp.path().join("permissions.toml"),
+            r#"
+            [[rules]]
+            tool = "exec_shell"
+            command = "cargo test"
+            "#,
+        )
+        .expect("write permissions");
+
+        let state = build_state(Some(config_path), None).expect("state");
+        let runtime = state.runtime.lock().await;
+        let decision = runtime
+            .exec_policy
+            .check(codewhale_execpolicy::ExecPolicyContext {
+                command: "cargo test --workspace",
+                cwd: "/workspace",
+                tool: Some("exec_shell"),
+                path: None,
+                ask_for_approval: codewhale_execpolicy::AskForApproval::UnlessTrusted,
+                sandbox_mode: Some("workspace-write"),
+            })
+            .expect("policy check");
+
+        assert!(decision.allow);
+        assert!(decision.requires_approval);
+        assert_eq!(
+            decision.matched_rule.as_deref(),
+            Some("tool=exec_shell command=cargo test")
+        );
+    }
+
+    #[test]
+    fn non_loopback_bind_without_auth_fails_fast() {
+        let options = AppServerOptions {
+            listen: "0.0.0.0:8787".parse().expect("socket addr"),
+            config_path: None,
+            auth_token: None,
+            insecure_no_auth: true,
+            cors_origins: Vec::new(),
+        };
+
+        let err = resolve_auth_token(&options).expect_err("non-loopback unauth should fail");
+        assert!(
+            err.to_string()
+                .contains("refusing unauthenticated app-server bind")
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_transport_keeps_raw_config_get_for_legacy_clients() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        fs::write(&config_path, "").expect("write config");
+        let state = build_state(Some(config_path), None).expect("state");
+        {
+            let mut cfg = state.config.write().await;
+            cfg.api_key = Some("sk-deepseek-secret".to_string());
+        }
+
+        let response = process_app_request(
+            &state,
+            AppRequest::ConfigGet {
+                key: "api_key".to_string(),
+            },
+            AppTransport::Stdio,
+        )
+        .await;
+
+        assert_eq!(response.data["value"], "sk-deepseek-secret");
+    }
+
+    // ── resolve_auth_token ─────────────────────────────────────────────
+
+    #[test]
+    fn auth_token_empty_string_fails() {
+        let options = AppServerOptions {
+            listen: "127.0.0.1:0".parse().expect("addr"),
+            config_path: None,
+            auth_token: Some("  ".to_string()),
+            insecure_no_auth: false,
+            cors_origins: Vec::new(),
+        };
+        let err = resolve_auth_token(&options).expect_err("empty token should fail");
+        assert!(err.to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn auth_token_generated_when_none_provided() {
+        let options = AppServerOptions {
+            listen: "127.0.0.1:0".parse().expect("addr"),
+            config_path: None,
+            auth_token: None,
+            insecure_no_auth: false,
+            cors_origins: Vec::new(),
+        };
+        let token = resolve_auth_token(&options).unwrap();
+        assert!(token.is_some());
+        assert!(token.unwrap().starts_with("cwapp_"));
+    }
+
+    #[test]
+    fn auth_token_explicit_is_preserved() {
+        let options = AppServerOptions {
+            listen: "127.0.0.1:0".parse().expect("addr"),
+            config_path: None,
+            auth_token: Some("my-secret".to_string()),
+            insecure_no_auth: false,
+            cors_origins: Vec::new(),
+        };
+        let token = resolve_auth_token(&options).unwrap();
+        assert_eq!(token.as_deref(), Some("my-secret"));
+    }
+
+    #[test]
+    fn insecure_no_auth_on_loopback_returns_none() {
+        let options = AppServerOptions {
+            listen: "127.0.0.1:0".parse().expect("addr"),
+            config_path: None,
+            auth_token: None,
+            insecure_no_auth: true,
+            cors_origins: Vec::new(),
+        };
+        let token = resolve_auth_token(&options).unwrap();
+        assert!(token.is_none());
+    }
+
+    // ── cors_layer ─────────────────────────────────────────────────────
+
+    #[test]
+    fn cors_layer_includes_default_origins() {
+        let layer = cors_layer(&[]);
+        // Just verify it doesn't panic and creates successfully
+        let _ = layer;
+    }
+
+    #[test]
+    fn cors_layer_adds_extra_origins() {
+        let extras = vec!["https://example.com".to_string()];
+        let layer = cors_layer(&extras);
+        let _ = layer;
+    }
+
+    #[test]
+    fn cors_layer_skips_empty_origins() {
+        let extras = vec!["".to_string(), "  ".to_string()];
+        let layer = cors_layer(&extras);
+        let _ = layer;
+    }
+
+    // ── JsonRpc helpers ────────────────────────────────────────────────
+
+    #[test]
+    fn params_or_object_returns_object_for_null() {
+        let result = params_or_object(Value::Null);
+        assert_eq!(result, json!({}));
+    }
+
+    #[test]
+    fn params_or_object_passthrough_for_non_null() {
+        let input = json!({"key": "value"});
+        let result = params_or_object(input.clone());
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn jsonrpc_result_format() {
+        let result = jsonrpc_result(Some(json!(1)), json!({"ok": true}));
+        assert_eq!(result["jsonrpc"], "2.0");
+        assert_eq!(result["id"], 1);
+        assert_eq!(result["result"]["ok"], true);
+    }
+
+    #[test]
+    fn jsonrpc_result_null_id() {
+        let result = jsonrpc_result(None, json!(null));
+        assert_eq!(result["id"], Value::Null);
+    }
+
+    #[test]
+    fn jsonrpc_error_format() {
+        let err = jsonrpc_error(Some(json!(2)), JsonRpcError::internal("oops"));
+        assert_eq!(err["jsonrpc"], "2.0");
+        assert_eq!(err["id"], 2);
+        assert_eq!(err["error"]["code"], -32603);
+        assert_eq!(err["error"]["message"], "oops");
+    }
+
+    #[test]
+    fn jsonrpc_error_codes() {
+        assert_eq!(JsonRpcError::parse_error("").code, -32700);
+        assert_eq!(JsonRpcError::invalid_request("").code, -32600);
+        assert_eq!(JsonRpcError::method_not_found("x").code, -32601);
+        assert_eq!(JsonRpcError::invalid_params("").code, -32602);
+        assert_eq!(JsonRpcError::internal("").code, -32603);
+    }
+
+    // ── AppServerOptions ───────────────────────────────────────────────
+
+    #[test]
+    fn app_server_options_debug_does_not_leak_token() {
+        let options = AppServerOptions {
+            listen: "127.0.0.1:8080".parse().expect("addr"),
+            config_path: None,
+            auth_token: Some("secret-token".to_string()),
+            insecure_no_auth: false,
+            cors_origins: vec!["https://example.com".to_string()],
+        };
+        let debug = format!("{options:?}");
+        assert!(!debug.contains("secret-token"));
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("8080"));
+    }
+
+    // ── Default CORS origins ──────────────────────────────────────────
+
+    #[test]
+    fn default_cors_origins_include_common_dev_ports() {
+        assert!(DEFAULT_CORS_ORIGINS.contains(&"http://localhost:3000"));
+        assert!(DEFAULT_CORS_ORIGINS.contains(&"http://localhost:5173"));
+        assert!(DEFAULT_CORS_ORIGINS.contains(&"tauri://localhost"));
+    }
 }

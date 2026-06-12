@@ -16,10 +16,9 @@
 //!   `2` / `a` approves for the session.
 //! - **Destructive** (`RiskLevel::Destructive`) — file writes, shell,
 //!   patches, MCP actions, unclassified tools, and any "fetch arbitrary
-//!   content" surface. The first approve press *stages* a decision and
-//!   the second matching press commits — muscle-memory `Enter` cannot
-//!   accidentally land on an approval. Any non-approve key clears the
-//!   staging and keeps the user in selection mode.
+//!   content" surface. The takeover keeps the destructive badge and
+//!   impact summary visible, then lets `Enter` commit the highlighted
+//!   option or `y` / `a` / `d` commit directly.
 //!
 //! The decision events emitted upstream are unchanged
 //! (`ViewEvent::ApprovalDecision`), so `ui.rs` and the engine handle
@@ -102,8 +101,8 @@ pub enum ToolCategory {
 /// Stakes-based variant for the takeover modal.
 ///
 /// `RiskLevel::Benign` lets a single keystroke commit the approval.
-/// `RiskLevel::Destructive` requires an explicit second confirmation
-/// keypress so muscle-memory `Enter` never lands on an irreversible op.
+/// `RiskLevel::Destructive` keeps stronger warning copy and styling
+/// around approvals that can touch files, shell, or remote state.
 ///
 /// Routing rules live in [`classify_risk`] — when in doubt, route to
 /// `Destructive`.
@@ -130,11 +129,29 @@ pub struct ApprovalRequest {
     pub impacts: Vec<String>,
     /// Tool parameters (for display)
     pub params: Value,
-    /// Fingerprint key for per‑call approval caching (§5.A).
+    /// Exact-argument fingerprint, used to scope *denials* (#1617).
     pub approval_key: String,
+    /// Lossy / arity-aware fingerprint, used to scope *approvals* so an
+    /// "approve for session" covers later flag variants (v0.8.37).
+    pub approval_grouping_key: String,
+    /// The model's explanation of intent before invoking write tools (#2381).
+    /// Displayed in the approval view so users understand *why* the change
+    /// is being made before reviewing *what* will change.
+    pub intent_summary: Option<String>,
+}
+
+/// Key approval details rendered prominently in the approval card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalDetail {
+    pub label: String,
+    pub value: String,
+    /// Preformatted shell lines for commands that benefit from safe wrapping
+    /// or a compact write-file preview. `value` remains the original command.
+    pub shell_lines: Option<Vec<String>>,
 }
 
 impl ApprovalRequest {
+    #[cfg(test)]
     pub fn new(
         id: &str,
         tool_name: &str,
@@ -142,8 +159,21 @@ impl ApprovalRequest {
         params: &Value,
         approval_key: &str,
     ) -> Self {
+        Self::new_with_intent(id, tool_name, description, params, approval_key, None)
+    }
+
+    pub fn new_with_intent(
+        id: &str,
+        tool_name: &str,
+        description: &str,
+        params: &Value,
+        approval_key: &str,
+        intent_summary: Option<&str>,
+    ) -> Self {
         let category = get_tool_category(tool_name);
         let risk = classify_risk(tool_name, category, params);
+        let approval_grouping_key =
+            crate::tools::approval_cache::build_approval_grouping_key(tool_name, params).0;
 
         Self {
             id: id.to_string(),
@@ -154,6 +184,15 @@ impl ApprovalRequest {
             impacts: build_impact_summary(tool_name, category, params),
             params: params.clone(),
             approval_key: approval_key.to_string(),
+            approval_grouping_key,
+            intent_summary: intent_summary.and_then(|summary| {
+                let summary = summary.trim();
+                if summary.is_empty() {
+                    None
+                } else {
+                    Some(summary.to_string())
+                }
+            }),
         }
     }
 
@@ -178,6 +217,18 @@ impl ApprovalRequest {
             _ => self.impacts.clone(),
         }
     }
+
+    /// Extract the most important params for the approval card.
+    #[must_use]
+    pub fn prominent_detail_items(&self, locale: Locale) -> Vec<ApprovalDetail> {
+        build_prominent_details(self.category, &self.params)
+            .into_iter()
+            .map(|mut detail| {
+                detail.label = localize_detail_label(&detail.label, locale).to_string();
+                detail
+            })
+            .collect()
+    }
 }
 
 /// Get the category for a tool by name
@@ -186,7 +237,16 @@ pub fn get_tool_category(name: &str) -> ToolCategory {
         ToolCategory::FileWrite
     } else if matches!(name, "web_run" | "web_search" | "fetch_url") {
         ToolCategory::Network
-    } else if name == "exec_shell" {
+    } else if matches!(
+        name,
+        "exec_shell"
+            | "task_shell_start"
+            | "task_shell_wait"
+            | "exec_shell_wait"
+            | "exec_shell_interact"
+            | "exec_wait"
+            | "exec_interact"
+    ) {
         ToolCategory::Shell
     } else if name.starts_with("list_mcp_")
         || name.starts_with("read_mcp_")
@@ -222,13 +282,12 @@ pub fn get_tool_category(name: &str) -> ToolCategory {
 /// The bias is conservative: a category we don't recognise routes to
 /// `Destructive`, and any shell command that `command_safety` flags as
 /// `Dangerous` is forced to `Destructive` even when the rest of the
-/// request looks calm. The split lets the modal swap muscle-memory
-/// approval for an explicit two-key confirmation on anything that can
-/// touch state outside this turn.
+/// request looks calm. The split lets the modal render stronger warning
+/// copy on anything that can touch state outside this turn.
 #[must_use]
 pub fn classify_risk(tool_name: &str, category: ToolCategory, params: &Value) -> RiskLevel {
     match category {
-        // Read paths and discovery — never staged.
+        // Read paths and discovery.
         ToolCategory::Safe | ToolCategory::McpRead => RiskLevel::Benign,
         // Query-only network is benign; opening a URL pulls arbitrary
         // remote content, so it stays destructive.
@@ -285,13 +344,12 @@ fn param_preview(params: &Value, keys: &[&str], max_len: usize) -> Option<String
     None
 }
 
-fn mcp_server_hint(tool_name: &str) -> Option<String> {
+fn mcp_target_hint(tool_name: &str) -> Option<String> {
     let remainder = tool_name.strip_prefix("mcp_")?;
-    let (server, _) = remainder.split_once('_')?;
-    if server.is_empty() {
+    if remainder.is_empty() {
         None
     } else {
-        Some(server.to_string())
+        Some(remainder.to_string())
     }
 }
 
@@ -334,16 +392,16 @@ fn build_impact_summary(tool_name: &str, category: ToolCategory, params: &Value)
         ToolCategory::McpRead => {
             let mut impacts =
                 vec!["Reads from an MCP server without an obvious local write.".to_string()];
-            if let Some(server) = mcp_server_hint(tool_name) {
-                impacts.push(format!("Server: {server}"));
+            if let Some(target) = mcp_target_hint(tool_name) {
+                impacts.push(format!("MCP target: {target}"));
             }
             impacts
         }
         ToolCategory::McpAction => {
             let mut impacts =
                 vec!["Calls an MCP server action that may have side effects.".to_string()];
-            if let Some(server) = mcp_server_hint(tool_name) {
-                impacts.push(format!("Server: {server}"));
+            if let Some(target) = mcp_target_hint(tool_name) {
+                impacts.push(format!("MCP target: {target}"));
             }
             impacts
         }
@@ -416,15 +474,15 @@ fn build_impact_summary_zh_hans(
         }
         ToolCategory::McpRead => {
             let mut impacts = vec!["从 MCP 服务器读取信息，不应产生本地写入。".to_string()];
-            if let Some(server) = mcp_server_hint(tool_name) {
-                impacts.push(format!("服务器：{server}"));
+            if let Some(target) = mcp_target_hint(tool_name) {
+                impacts.push(format!("MCP 目标：{target}"));
             }
             impacts
         }
         ToolCategory::McpAction => {
             let mut impacts = vec!["调用可能产生副作用的 MCP 服务器操作。".to_string()];
-            if let Some(server) = mcp_server_hint(tool_name) {
-                impacts.push(format!("服务器：{server}"));
+            if let Some(target) = mcp_target_hint(tool_name) {
+                impacts.push(format!("MCP 目标：{target}"));
             }
             impacts
         }
@@ -442,9 +500,288 @@ fn build_impact_summary_zh_hans(
     }
 }
 
-/// Indices into the option list shared by both variants. Visible to
-/// the widget module so it can render the staged-confirmation banner
-/// without re-deriving the variant from the request.
+fn build_prominent_details(category: ToolCategory, params: &Value) -> Vec<ApprovalDetail> {
+    let mut details = Vec::new();
+    match category {
+        ToolCategory::Shell => {
+            if let Some(command) = param_text(params, &["command", "cmd"]) {
+                details.push(ApprovalDetail {
+                    label: "Command".to_string(),
+                    shell_lines: Some(format_shell_command_for_approval(&command)),
+                    value: command,
+                });
+            }
+            if let Some(workdir) = param_preview(params, &["workdir", "cwd"], 96) {
+                details.push(ApprovalDetail {
+                    label: "Dir".to_string(),
+                    value: workdir,
+                    shell_lines: None,
+                });
+            }
+        }
+        ToolCategory::FileWrite => {
+            if let Some(path) = param_preview(params, &["path", "target", "destination"], 200) {
+                details.push(ApprovalDetail {
+                    label: "File".to_string(),
+                    value: path,
+                    shell_lines: None,
+                });
+            }
+        }
+        ToolCategory::Safe => {
+            if let Some(path) = param_preview(params, &["path", "ref_id", "uri"], 200) {
+                details.push(ApprovalDetail {
+                    label: "Path".to_string(),
+                    value: path,
+                    shell_lines: None,
+                });
+            }
+        }
+        ToolCategory::Network => {
+            if let Some(target) =
+                param_preview(params, &["url", "q", "query", "location", "repo"], 200)
+            {
+                details.push(ApprovalDetail {
+                    label: "Target".to_string(),
+                    value: target,
+                    shell_lines: None,
+                });
+            }
+        }
+        ToolCategory::McpRead | ToolCategory::McpAction | ToolCategory::Unknown => {
+            if let Some(input) = param_preview(
+                params,
+                &["command", "cmd", "path", "url", "q", "query", "ref_id"],
+                200,
+            ) {
+                details.push(ApprovalDetail {
+                    label: "Input".to_string(),
+                    value: input,
+                    shell_lines: None,
+                });
+            }
+        }
+    }
+    details
+}
+
+fn param_text(params: &Value, keys: &[&str]) -> Option<String> {
+    let Value::Object(map) = params else {
+        return None;
+    };
+
+    for key in keys {
+        let Some(value) = map.get(*key) else {
+            continue;
+        };
+        match value {
+            Value::String(text) => return Some(text.clone()),
+            Value::Number(number) => return Some(number.to_string()),
+            Value::Bool(flag) => return Some(flag.to_string()),
+            other => return Some(other.to_string()),
+        }
+    }
+
+    None
+}
+
+fn localize_detail_label(label: &str, locale: Locale) -> &str {
+    match locale {
+        Locale::ZhHans => match label {
+            "Command" => "命令",
+            "Dir" => "目录",
+            "File" => "文件",
+            "Path" => "路径",
+            "Target" => "目标",
+            "Input" => "输入",
+            _ => label,
+        },
+        _ => label,
+    }
+}
+
+pub(crate) fn format_shell_command_for_approval(command: &str) -> Vec<String> {
+    if let Some(preview) = parse_printf_write_file_command(command) {
+        return format_printf_write_file_preview(preview);
+    }
+
+    let mut out = Vec::new();
+    for raw_line in command.lines() {
+        split_shell_display_line(raw_line, &mut out);
+    }
+    if out.is_empty() && !command.trim().is_empty() {
+        out.push(command.trim().to_string());
+    }
+    out
+}
+
+fn split_shell_display_line(line: &str, out: &mut Vec<String>) {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut current = String::new();
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            current.push(ch);
+            escaped = true;
+            continue;
+        }
+
+        if matches!(ch, '"' | '\'') {
+            if quote == Some(ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(ch);
+            }
+            current.push(ch);
+            continue;
+        }
+
+        if quote.is_none() {
+            match ch {
+                '&' if chars.peek() == Some(&'&') => {
+                    chars.next();
+                    push_shell_clause(out, &mut current, Some("&&"));
+                    continue;
+                }
+                '|' if chars.peek() == Some(&'|') => {
+                    chars.next();
+                    push_shell_clause(out, &mut current, Some("||"));
+                    continue;
+                }
+                '|' => {
+                    push_shell_clause(out, &mut current, Some("|"));
+                    continue;
+                }
+                ';' => {
+                    push_shell_clause(out, &mut current, Some(";"));
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        current.push(ch);
+    }
+
+    push_shell_clause(out, &mut current, None);
+}
+
+fn push_shell_clause(out: &mut Vec<String>, current: &mut String, operator: Option<&str>) {
+    let trimmed = current.trim();
+    if trimmed.is_empty() {
+        if let Some(operator) = operator {
+            out.push(operator.to_string());
+        }
+    } else if let Some(operator) = operator {
+        out.push(format!("{trimmed} {operator}"));
+    } else {
+        out.push(trimmed.to_string());
+    }
+    current.clear();
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrintfWriteFilePreview {
+    target: String,
+    lines: Vec<String>,
+}
+
+fn parse_printf_write_file_command(command: &str) -> Option<PrintfWriteFilePreview> {
+    let (before_redirect, after_redirect) = split_unquoted_redirect(command)?;
+    let before_redirect = before_redirect.trim();
+    if !before_redirect.starts_with("printf") {
+        return None;
+    }
+
+    let tokens = shlex::split(before_redirect)?;
+    if tokens.first()?.as_str() != "printf" {
+        return None;
+    }
+    let target_parts = shlex::split(after_redirect.trim())?;
+    if target_parts.len() != 1 {
+        return None;
+    }
+    let target = target_parts
+        .into_iter()
+        .next()?
+        .trim_matches(|ch| ch == '"' || ch == '\'')
+        .to_string();
+    if target.is_empty() {
+        return None;
+    }
+
+    let args = &tokens[1..];
+    if args.is_empty() {
+        return None;
+    }
+    let values = if args.len() >= 2 && args[0].contains('%') {
+        &args[1..]
+    } else {
+        args
+    };
+    let mut lines = Vec::new();
+    for value in values {
+        let normalized = value.replace("\\n", "\n");
+        for line in normalized.lines() {
+            lines.push(line.to_string());
+        }
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+
+    Some(PrintfWriteFilePreview { target, lines })
+}
+
+fn format_printf_write_file_preview(preview: PrintfWriteFilePreview) -> Vec<String> {
+    const MAX_PREVIEW_LINES: usize = 12;
+    let mut out = vec![format!("printf > {}", preview.target)];
+    let total = preview.lines.len();
+    for line in preview.lines.into_iter().take(MAX_PREVIEW_LINES) {
+        out.push(format!("  {line}"));
+    }
+    if total > MAX_PREVIEW_LINES {
+        out.push(format!("  ... (+{} more lines)", total - MAX_PREVIEW_LINES));
+    }
+    out
+}
+
+fn split_unquoted_redirect(command: &str) -> Option<(&str, &str)> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (idx, ch) in command.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if matches!(ch, '"' | '\'') {
+            if quote == Some(ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(ch);
+            }
+            continue;
+        }
+        if quote.is_none() && ch == '>' {
+            return Some((&command[..idx], &command[idx + ch.len_utf8()..]));
+        }
+    }
+    None
+}
+
+/// Indices into the option list shared by both variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalOption {
     ApproveOnce,
@@ -480,16 +817,6 @@ impl ApprovalOption {
             ApprovalOption::Abort => ReviewDecision::Abort,
         }
     }
-
-    /// Whether this option needs an explicit second-key confirmation in
-    /// the destructive variant. Deny/Abort are never staged.
-    fn requires_confirm(self, risk: RiskLevel) -> bool {
-        matches!(risk, RiskLevel::Destructive)
-            && matches!(
-                self,
-                ApprovalOption::ApproveOnce | ApprovalOption::ApproveAlways
-            )
-    }
 }
 
 /// Approval overlay state managed by the modal view stack
@@ -498,12 +825,10 @@ pub struct ApprovalView {
     request: ApprovalRequest,
     selected: usize,
     locale: Locale,
-    /// When `Some`, the destructive variant has staged this approval and
-    /// is waiting for the user to press the same key (or `Enter`) again.
-    /// Any other key clears the staging.
-    pending_confirm: Option<ApprovalOption>,
     timeout: Option<Duration>,
     requested_at: Instant,
+    /// Whether the approval card is collapsed to a single-line banner.
+    pub(crate) collapsed: bool,
 }
 
 impl ApprovalView {
@@ -517,30 +842,25 @@ impl ApprovalView {
             request,
             selected: 0,
             locale,
-            pending_confirm: None,
             timeout: None,
             requested_at: Instant::now(),
+            collapsed: false,
         }
     }
 
     fn select_prev(&mut self) {
         self.selected = self.selected.saturating_sub(1);
-        // Moving the selection abandons any staged confirmation; the
-        // user is reconsidering.
-        self.pending_confirm = None;
     }
 
     fn select_next(&mut self) {
         self.selected = (self.selected + 1).min(ApprovalOption::ORDER.len() - 1);
-        self.pending_confirm = None;
     }
 
     fn current_option(&self) -> ApprovalOption {
         ApprovalOption::from_index(self.selected)
     }
 
-    /// Test-only accessor — the widget reads decisions through
-    /// `commit_or_stage` instead of polling.
+    /// Test-only accessor for the selected option's decision.
     #[cfg(test)]
     fn current_decision(&self) -> ReviewDecision {
         self.current_option().decision()
@@ -557,33 +877,13 @@ impl ApprovalView {
         self.request.risk
     }
 
-    /// The staged option, if any. `None` in the benign variant or when
-    /// no approve key has been pressed yet.
-    pub(crate) fn pending_confirm(&self) -> Option<ApprovalOption> {
-        self.pending_confirm
-    }
-
     pub(crate) fn locale(&self) -> Locale {
         self.locale
     }
 
-    /// Try to commit (or stage) the given option respecting the
-    /// variant's confirmation policy. Returns the action the modal
-    /// stack should apply.
-    fn commit_or_stage(&mut self, option: ApprovalOption) -> ViewAction {
-        if option.requires_confirm(self.request.risk) {
-            // Two-step destructive flow: first press stages, second
-            // press of the same option commits.
-            if self.pending_confirm == Some(option) {
-                self.pending_confirm = None;
-                return self.emit_decision(option.decision(), false);
-            }
-            self.pending_confirm = Some(option);
-            self.selected = option.index();
-            return ViewAction::None;
-        }
-        // Benign variant or non-approve options commit immediately.
-        self.pending_confirm = None;
+    /// Commit the given option and close the approval modal.
+    fn commit_option(&mut self, option: ApprovalOption) -> ViewAction {
+        self.selected = option.index();
         self.emit_decision(option.decision(), false)
     }
 
@@ -594,6 +894,7 @@ impl ApprovalView {
             decision,
             timed_out,
             approval_key: self.request.approval_key.clone(),
+            approval_grouping_key: self.request.approval_grouping_key.clone(),
         })
     }
 
@@ -625,6 +926,10 @@ impl ModalView for ApprovalView {
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
         match key.code {
+            KeyCode::Tab => {
+                self.collapsed = !self.collapsed;
+                ViewAction::None
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.select_prev();
                 ViewAction::None
@@ -633,29 +938,23 @@ impl ModalView for ApprovalView {
                 self.select_next();
                 ViewAction::None
             }
-            KeyCode::Enter => self.commit_or_stage(self.current_option()),
+            KeyCode::Enter => self.commit_option(self.current_option()),
             // Direct shortcuts; '1' / '2' map to the first two options
-            // so a numeric pad still works for benign approve flows.
-            KeyCode::Char('y') | KeyCode::Char('1') => {
-                self.commit_or_stage(ApprovalOption::ApproveOnce)
+            // so a numeric pad still works for approve flows.
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('1') => {
+                self.commit_option(ApprovalOption::ApproveOnce)
             }
-            KeyCode::Char('a') | KeyCode::Char('2') => {
-                self.commit_or_stage(ApprovalOption::ApproveAlways)
+            KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('2') => {
+                self.commit_option(ApprovalOption::ApproveAlways)
             }
-            KeyCode::Char('n') | KeyCode::Char('d') | KeyCode::Char('3') => {
-                self.commit_or_stage(ApprovalOption::Deny)
-            }
-            KeyCode::Char('v') | KeyCode::Char('V') => {
-                self.pending_confirm = None;
-                self.emit_params_pager()
-            }
+            KeyCode::Char('n')
+            | KeyCode::Char('N')
+            | KeyCode::Char('d')
+            | KeyCode::Char('D')
+            | KeyCode::Char('3') => self.commit_option(ApprovalOption::Deny),
+            KeyCode::Char('v') | KeyCode::Char('V') => self.emit_params_pager(),
             KeyCode::Esc => self.emit_decision(ReviewDecision::Abort, false),
-            _ => {
-                // Any unrecognised key cancels a staged confirmation —
-                // the user is no longer aiming at "approve".
-                self.pending_confirm = None;
-                ViewAction::None
-            }
+            _ => ViewAction::None,
         }
     }
 
@@ -727,6 +1026,7 @@ pub enum ElevationOption {
 
 impl ElevationOption {
     /// Get the display label for this option.
+    #[cfg(test)]
     pub fn label(&self) -> &'static str {
         match self {
             ElevationOption::WithNetwork => "Allow outbound network",
@@ -737,6 +1037,7 @@ impl ElevationOption {
     }
 
     /// Get a short description.
+    #[cfg(test)]
     pub fn description(&self) -> &'static str {
         match self {
             ElevationOption::WithNetwork => {
@@ -833,13 +1134,15 @@ impl ElevationRequest {
 pub struct ElevationView {
     request: ElevationRequest,
     selected: usize,
+    locale: Locale,
 }
 
 impl ElevationView {
-    pub fn new(request: ElevationRequest) -> Self {
+    pub fn new(request: ElevationRequest, locale: Locale) -> Self {
         Self {
             request,
             selected: 0,
+            locale,
         }
     }
 
@@ -914,7 +1217,7 @@ impl ModalView for ElevationView {
     }
 
     fn render(&self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
-        let elevation_widget = ElevationWidget::new(&self.request, self.selected);
+        let elevation_widget = ElevationWidget::new(&self.request, self.selected, self.locale);
         elevation_widget.render(area, buf);
     }
 }
@@ -982,6 +1285,15 @@ mod tests {
     #[test]
     fn test_get_tool_category_shell_tools() {
         assert_eq!(get_tool_category("exec_shell"), ToolCategory::Shell);
+        assert_eq!(get_tool_category("task_shell_start"), ToolCategory::Shell);
+        assert_eq!(get_tool_category("task_shell_wait"), ToolCategory::Shell);
+        assert_eq!(get_tool_category("exec_shell_wait"), ToolCategory::Shell);
+        assert_eq!(
+            get_tool_category("exec_shell_interact"),
+            ToolCategory::Shell
+        );
+        assert_eq!(get_tool_category("exec_wait"), ToolCategory::Shell);
+        assert_eq!(get_tool_category("exec_interact"), ToolCategory::Shell);
         assert_eq!(
             get_tool_category("mcp_linear_save_issue"),
             ToolCategory::McpAction
@@ -1014,13 +1326,13 @@ mod tests {
 
     #[test]
     fn risk_query_only_network_is_benign_but_fetch_is_destructive() {
-        // web_search is read-only enough to skip the two-key dance.
+        // web_search is read-only enough to use the benign variant.
         let cat = ToolCategory::Network;
         assert_eq!(
             classify_risk("web_search", cat, &json!({"q": "rust"})),
             RiskLevel::Benign
         );
-        // fetch_url pulls arbitrary remote content; never staged.
+        // fetch_url pulls arbitrary remote content, so it stays destructive.
         assert_eq!(
             classify_risk("fetch_url", cat, &json!({"url": "https://example.com"})),
             RiskLevel::Destructive
@@ -1138,6 +1450,93 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mcp_impact_summary_preserves_full_target_for_underscored_names() {
+        let request = ApprovalRequest::new(
+            "test-id",
+            "mcp_my_db_execute_sql",
+            "Call an MCP tool",
+            &json!({}),
+            "tool:mcp_my_db_execute_sql",
+        );
+
+        assert!(
+            request
+                .impacts
+                .iter()
+                .any(|line| line == "MCP target: my_db_execute_sql")
+        );
+        assert!(!request.impacts.iter().any(|line| line == "Server: my"));
+
+        let zh_impacts = request.impacts_for_locale(Locale::ZhHans);
+        assert!(
+            zh_impacts
+                .iter()
+                .any(|line| line == "MCP 目标：my_db_execute_sql")
+        );
+        assert!(!zh_impacts.iter().any(|line| line == "服务器：my"));
+    }
+
+    #[test]
+    fn test_prominent_details_shell_does_not_truncate_long_command() {
+        let command = format!("printf '{}\\n' > /tmp/x && cat /tmp/x", "x".repeat(300));
+        let request = ApprovalRequest::new(
+            "test-id",
+            "exec_shell",
+            "Run a shell command",
+            &json!({"command": command, "cwd": "/tmp/project"}),
+            "test_key",
+        );
+
+        let details = request.prominent_detail_items(Locale::En);
+
+        assert_eq!(details[0].label, "Command");
+        assert_eq!(details[0].value, command);
+        assert!(
+            details[0]
+                .shell_lines
+                .as_ref()
+                .is_some_and(|lines| lines.iter().any(|line| line.contains("cat /tmp/x"))),
+            "shell preview should preserve the dangerous tail of long commands"
+        );
+        assert_eq!(details[1].label, "Dir");
+        assert_eq!(details[1].value, "/tmp/project");
+    }
+
+    #[test]
+    fn test_prominent_details_file_write() {
+        let request = ApprovalRequest::new(
+            "test-id",
+            "write_file",
+            "Write a file to disk",
+            &json!({"path": "src/main.rs", "content": "fn main() {}"}),
+            "test_key",
+        );
+
+        let details = request.prominent_detail_items(Locale::En);
+
+        assert_eq!(details[0].label, "File");
+        assert_eq!(details[0].value, "src/main.rs");
+        assert!(details[0].shell_lines.is_none());
+    }
+
+    #[test]
+    fn test_shell_formatter_preserves_logical_or_operator() {
+        let lines = format_shell_command_for_approval("cargo build || echo fallback");
+
+        assert_eq!(lines, vec!["cargo build ||", "echo fallback"]);
+    }
+
+    #[test]
+    fn test_shell_formatter_detects_printf_write_file_preview() {
+        let lines =
+            format_shell_command_for_approval("printf '%s\\n' 'hello' 'world' > src/main.rs");
+
+        assert_eq!(lines[0], "printf > src/main.rs");
+        assert!(lines.iter().any(|line| line.contains("hello")));
+        assert!(lines.iter().any(|line| line.contains("world")));
+    }
+
     // ========================================================================
     // ApprovalView Tests — Benign Variant (single-key approve)
     // ========================================================================
@@ -1147,8 +1546,29 @@ mod tests {
         let view = ApprovalView::new(benign_request());
         assert_eq!(view.selected, 0);
         assert!(view.timeout.is_none());
-        assert_eq!(view.pending_confirm(), None);
         assert_eq!(view.risk(), RiskLevel::Benign);
+    }
+
+    #[test]
+    fn tab_toggles_collapsed_card_so_transcript_stays_visible() {
+        // Regression for PR #1455 / @tiger-dog: the approval modal
+        // rendered as a full-screen takeover that hid the transcript
+        // behind it, so users had to dismiss the prompt to remember
+        // what they were approving. Tab now flips between the full
+        // takeover card and a single-line bottom banner.
+        let mut view = ApprovalView::new(benign_request());
+        assert!(
+            !view.collapsed,
+            "modal must start expanded so first-time users notice it"
+        );
+
+        let action = view.handle_key(create_key_event(KeyCode::Tab));
+        assert!(matches!(action, ViewAction::None));
+        assert!(view.collapsed, "first Tab collapses the card");
+
+        let action = view.handle_key(create_key_event(KeyCode::Tab));
+        assert!(matches!(action, ViewAction::None));
+        assert!(!view.collapsed, "second Tab restores the takeover card");
     }
 
     #[test]
@@ -1173,15 +1593,20 @@ mod tests {
 
     #[test]
     fn benign_y_one_step_approves() {
-        let mut view = ApprovalView::new(benign_request());
-        let action = view.handle_key(create_key_event(KeyCode::Char('y')));
-        assert!(matches!(
-            action,
-            ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
-                decision: ReviewDecision::Approved,
-                ..
-            })
-        ));
+        for code in [KeyCode::Char('y'), KeyCode::Char('Y')] {
+            let mut view = ApprovalView::new(benign_request());
+            let action = view.handle_key(create_key_event(code));
+            assert!(
+                matches!(
+                    action,
+                    ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
+                        decision: ReviewDecision::Approved,
+                        ..
+                    })
+                ),
+                "expected Approved for {code:?}"
+            );
+        }
     }
 
     #[test]
@@ -1212,30 +1637,31 @@ mod tests {
 
     #[test]
     fn benign_a_two_approves_for_session() {
-        let mut view = ApprovalView::new(benign_request());
-        let action = view.handle_key(create_key_event(KeyCode::Char('a')));
-        assert!(matches!(
-            action,
-            ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
-                decision: ReviewDecision::ApprovedForSession,
-                ..
-            })
-        ));
-
-        let mut view = ApprovalView::new(benign_request());
-        let action = view.handle_key(create_key_event(KeyCode::Char('2')));
-        assert!(matches!(
-            action,
-            ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
-                decision: ReviewDecision::ApprovedForSession,
-                ..
-            })
-        ));
+        for code in [KeyCode::Char('a'), KeyCode::Char('A'), KeyCode::Char('2')] {
+            let mut view = ApprovalView::new(benign_request());
+            let action = view.handle_key(create_key_event(code));
+            assert!(
+                matches!(
+                    action,
+                    ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
+                        decision: ReviewDecision::ApprovedForSession,
+                        ..
+                    })
+                ),
+                "expected ApprovedForSession for {code:?}"
+            );
+        }
     }
 
     #[test]
     fn benign_n_d_three_all_deny() {
-        for code in [KeyCode::Char('n'), KeyCode::Char('d'), KeyCode::Char('3')] {
+        for code in [
+            KeyCode::Char('n'),
+            KeyCode::Char('N'),
+            KeyCode::Char('d'),
+            KeyCode::Char('D'),
+            KeyCode::Char('3'),
+        ] {
             let mut view = ApprovalView::new(benign_request());
             let action = view.handle_key(create_key_event(code));
             assert!(
@@ -1332,7 +1758,7 @@ mod tests {
     }
 
     // ========================================================================
-    // ApprovalView Tests — Destructive Variant (two-key confirm)
+    // ApprovalView Tests — Destructive Variant (one-step approve with warning)
     // ========================================================================
 
     #[test]
@@ -1342,35 +1768,29 @@ mod tests {
     }
 
     #[test]
-    fn destructive_y_first_press_stages_then_second_commits() {
-        let mut view = ApprovalView::new(destructive_request());
+    fn destructive_y_first_press_approves_once() {
+        for code in [KeyCode::Char('y'), KeyCode::Char('Y')] {
+            let mut view = ApprovalView::new(destructive_request());
 
-        // First press stages — no decision emitted yet.
-        let action = view.handle_key(create_key_event(KeyCode::Char('y')));
-        assert!(matches!(action, ViewAction::None));
-        assert_eq!(view.pending_confirm(), Some(ApprovalOption::ApproveOnce));
-
-        // Second press of the same key commits.
-        let action = view.handle_key(create_key_event(KeyCode::Char('y')));
-        assert!(matches!(
-            action,
-            ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
-                decision: ReviewDecision::Approved,
-                ..
-            })
-        ));
+            let action = view.handle_key(create_key_event(code));
+            assert!(
+                matches!(
+                    action,
+                    ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
+                        decision: ReviewDecision::Approved,
+                        ..
+                    })
+                ),
+                "expected Approved for {code:?}"
+            );
+        }
     }
 
     #[test]
-    fn destructive_enter_first_press_stages_then_second_commits() {
+    fn destructive_enter_approves_selected_option() {
         let mut view = ApprovalView::new(destructive_request());
 
-        // Selection starts at ApproveOnce — Enter stages.
-        let action = view.handle_key(create_key_event(KeyCode::Enter));
-        assert!(matches!(action, ViewAction::None));
-        assert_eq!(view.pending_confirm(), Some(ApprovalOption::ApproveOnce));
-
-        // Second Enter on the same selection commits.
+        // Selection starts at ApproveOnce — Enter commits the selected option.
         let action = view.handle_key(create_key_event(KeyCode::Enter));
         assert!(matches!(
             action,
@@ -1382,39 +1802,11 @@ mod tests {
     }
 
     #[test]
-    fn destructive_navigation_clears_staged_confirmation() {
+    fn destructive_navigation_then_enter_commits_highlighted_option() {
         let mut view = ApprovalView::new(destructive_request());
 
-        view.handle_key(create_key_event(KeyCode::Char('y')));
-        assert_eq!(view.pending_confirm(), Some(ApprovalOption::ApproveOnce));
-
-        // Moving the selection abandons the staging.
         view.handle_key(create_key_event(KeyCode::Down));
-        assert_eq!(view.pending_confirm(), None);
-    }
-
-    #[test]
-    fn destructive_unrelated_key_clears_staged_confirmation() {
-        let mut view = ApprovalView::new(destructive_request());
-
-        view.handle_key(create_key_event(KeyCode::Char('y')));
-        assert_eq!(view.pending_confirm(), Some(ApprovalOption::ApproveOnce));
-
-        // A key with no mapped action clears the staging.
-        let action = view.handle_key(create_key_event(KeyCode::Char('q')));
-        assert!(matches!(action, ViewAction::None));
-        assert_eq!(view.pending_confirm(), None);
-    }
-
-    #[test]
-    fn destructive_a_first_press_stages_then_second_commits_session() {
-        let mut view = ApprovalView::new(destructive_request());
-
-        let action = view.handle_key(create_key_event(KeyCode::Char('a')));
-        assert!(matches!(action, ViewAction::None));
-        assert_eq!(view.pending_confirm(), Some(ApprovalOption::ApproveAlways));
-
-        let action = view.handle_key(create_key_event(KeyCode::Char('a')));
+        let action = view.handle_key(create_key_event(KeyCode::Enter));
         assert!(matches!(
             action,
             ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
@@ -1425,40 +1817,59 @@ mod tests {
     }
 
     #[test]
-    fn destructive_y_then_a_does_not_commit_either() {
-        // Pressing 'y' then 'a' must NOT commit ApproveAlways — the
-        // second key is a different option, so it re-stages instead.
+    fn destructive_unrelated_key_keeps_modal_open() {
         let mut view = ApprovalView::new(destructive_request());
 
-        let action = view.handle_key(create_key_event(KeyCode::Char('y')));
+        let action = view.handle_key(create_key_event(KeyCode::Char('q')));
         assert!(matches!(action, ViewAction::None));
-        assert_eq!(view.pending_confirm(), Some(ApprovalOption::ApproveOnce));
-
-        let action = view.handle_key(create_key_event(KeyCode::Char('a')));
-        assert!(matches!(action, ViewAction::None));
-        assert_eq!(view.pending_confirm(), Some(ApprovalOption::ApproveAlways));
     }
 
     #[test]
-    fn destructive_deny_does_not_require_confirmation() {
-        // Deny / Abort skip the two-key dance — the user is bailing.
-        let mut view = ApprovalView::new(destructive_request());
-        let action = view.handle_key(create_key_event(KeyCode::Char('n')));
-        assert!(matches!(
-            action,
-            ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
-                decision: ReviewDecision::Denied,
-                ..
-            })
-        ));
+    fn destructive_a_first_press_approves_for_session() {
+        for code in [KeyCode::Char('a'), KeyCode::Char('A')] {
+            let mut view = ApprovalView::new(destructive_request());
+
+            let action = view.handle_key(create_key_event(code));
+            assert!(
+                matches!(
+                    action,
+                    ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
+                        decision: ReviewDecision::ApprovedForSession,
+                        ..
+                    })
+                ),
+                "expected ApprovedForSession for {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn destructive_deny_commits_immediately() {
+        // Deny commits immediately — the user is rejecting the tool.
+        for code in [
+            KeyCode::Char('n'),
+            KeyCode::Char('N'),
+            KeyCode::Char('d'),
+            KeyCode::Char('D'),
+        ] {
+            let mut view = ApprovalView::new(destructive_request());
+            let action = view.handle_key(create_key_event(code));
+            assert!(
+                matches!(
+                    action,
+                    ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
+                        decision: ReviewDecision::Denied,
+                        ..
+                    })
+                ),
+                "expected Denied for {code:?}"
+            );
+        }
     }
 
     #[test]
     fn destructive_esc_aborts_immediately() {
         let mut view = ApprovalView::new(destructive_request());
-        // Stage something first.
-        view.handle_key(create_key_event(KeyCode::Char('y')));
-        // Esc still aborts in one press.
         let action = view.handle_key(create_key_event(KeyCode::Esc));
         assert!(matches!(
             action,
@@ -1493,20 +1904,21 @@ mod tests {
     }
 
     #[test]
-    fn render_benign_includes_review_badge_and_one_step_hint() {
+    fn render_benign_includes_review_badge_and_selection_hint() {
         let view = ApprovalView::new(benign_request());
         let lines = render_lines(&view, 100, 40);
         let joined = lines.join("\n");
         assert!(joined.contains("REVIEW"), "missing REVIEW badge:\n{joined}");
+        assert!(joined.contains("Choose"), "benign hint missing:\n{joined}");
         assert!(
-            joined.contains("Single key approves"),
-            "benign hint missing:\n{joined}"
+            joined.contains("Enter selected option"),
+            "benign selection hint missing:\n{joined}"
         );
         assert!(joined.contains("read_file"));
     }
 
     #[test]
-    fn render_destructive_shows_warning_badge_and_two_step_hint() {
+    fn render_destructive_shows_warning_badge_and_one_step_hint() {
         let view = ApprovalView::new(destructive_request());
         let lines = render_lines(&view, 100, 40);
         let joined = lines.join("\n");
@@ -1515,31 +1927,15 @@ mod tests {
             "missing DESTRUCTIVE badge:\n{joined}"
         );
         assert!(
-            joined.contains("Two keys to approve"),
+            joined.contains("Enter selected option"),
             "destructive hint missing:\n{joined}"
         );
         assert!(joined.contains("write_file"));
     }
 
     #[test]
-    fn render_destructive_after_stage_shows_confirm_banner() {
-        let mut view = ApprovalView::new(destructive_request());
-        view.handle_key(create_key_event(KeyCode::Char('y')));
-        let lines = render_lines(&view, 100, 40);
-        let joined = lines.join("\n");
-        assert!(
-            joined.contains("Confirm destructive action"),
-            "confirm banner missing:\n{joined}"
-        );
-        assert!(
-            joined.contains("(staged)"),
-            "stage marker missing:\n{joined}"
-        );
-    }
-
-    #[test]
     fn render_destructive_zh_hans_localizes_security_copy() {
-        let mut view = ApprovalView::new_for_locale(destructive_request(), Locale::ZhHans);
+        let view = ApprovalView::new_for_locale(destructive_request(), Locale::ZhHans);
         let lines = render_lines(&view, 100, 40);
         let joined = compact_rendered_text(&lines);
         assert!(
@@ -1547,8 +1943,12 @@ mod tests {
             "missing zh risk badge:\n{joined}"
         );
         assert!(
-            joined.contains("两次按键确认"),
-            "missing zh two-step hint:\n{joined}"
+            joined.contains("选择："),
+            "missing zh selection prefix:\n{joined}"
+        );
+        assert!(
+            joined.contains("Enter执行选中项，或直接按y/a/d"),
+            "missing zh one-step hint:\n{joined}"
         );
         assert!(
             joined.contains("文件写入"),
@@ -1565,22 +1965,6 @@ mod tests {
         assert!(
             joined.contains("仅本次批准"),
             "missing zh approve option:\n{joined}"
-        );
-
-        view.handle_key(create_key_event(KeyCode::Char('y')));
-        let lines = render_lines(&view, 100, 40);
-        let joined = compact_rendered_text(&lines);
-        assert!(
-            joined.contains("确认破坏性操作"),
-            "missing zh confirm banner:\n{joined}"
-        );
-        assert!(
-            joined.contains("(待确认)"),
-            "missing zh staged marker:\n{joined}"
-        );
-        assert!(
-            joined.contains("Enter或y"),
-            "missing zh confirm key:\n{joined}"
         );
     }
 
@@ -1611,7 +1995,7 @@ mod tests {
     fn test_elevation_view_initial_state() {
         let request =
             ElevationRequest::for_shell("test-id", "cargo build", "network blocked", true, false);
-        let view = ElevationView::new(request);
+        let view = ElevationView::new(request, Locale::En);
         assert_eq!(view.selected, 0);
     }
 
@@ -1619,7 +2003,7 @@ mod tests {
     fn test_elevation_view_keybindings() {
         let request =
             ElevationRequest::for_shell("test-id", "cargo test", "write blocked", false, true);
-        let mut view = ElevationView::new(request);
+        let mut view = ElevationView::new(request, Locale::En);
 
         let action = view.handle_key(create_key_event(KeyCode::Char('n')));
         assert!(matches!(
@@ -1632,7 +2016,7 @@ mod tests {
 
         let request =
             ElevationRequest::for_shell("test-id", "cargo build", "write blocked", false, true);
-        let mut view = ElevationView::new(request);
+        let mut view = ElevationView::new(request, Locale::En);
         let action = view.handle_key(create_key_event(KeyCode::Char('w')));
         assert!(matches!(
             action,
@@ -1644,7 +2028,7 @@ mod tests {
 
         let request =
             ElevationRequest::for_shell("test-id", "cargo build", "blocked", false, false);
-        let mut view = ElevationView::new(request);
+        let mut view = ElevationView::new(request, Locale::En);
         let action = view.handle_key(create_key_event(KeyCode::Char('f')));
         assert!(matches!(
             action,
@@ -1656,7 +2040,7 @@ mod tests {
 
         let request =
             ElevationRequest::for_shell("test-id", "cargo build", "blocked", false, false);
-        let mut view = ElevationView::new(request);
+        let mut view = ElevationView::new(request, Locale::En);
         let action = view.handle_key(create_key_event(KeyCode::Esc));
         assert!(matches!(
             action,
@@ -1668,7 +2052,7 @@ mod tests {
 
         let request =
             ElevationRequest::for_shell("test-id", "cargo build", "blocked", false, false);
-        let mut view = ElevationView::new(request);
+        let mut view = ElevationView::new(request, Locale::En);
         let action = view.handle_key(create_key_event(KeyCode::Char('a')));
         assert!(matches!(
             action,
@@ -1682,7 +2066,7 @@ mod tests {
     #[test]
     fn test_elevation_view_navigation() {
         let request = ElevationRequest::for_shell("test-id", "cargo build", "blocked", true, false);
-        let mut view = ElevationView::new(request);
+        let mut view = ElevationView::new(request, Locale::En);
 
         assert_eq!(view.selected, 0);
 
@@ -1702,7 +2086,7 @@ mod tests {
     #[test]
     fn test_elevation_view_enter_uses_selected_option() {
         let request = ElevationRequest::for_shell("test-id", "cargo build", "blocked", true, false);
-        let mut view = ElevationView::new(request);
+        let mut view = ElevationView::new(request, Locale::En);
 
         view.handle_key(create_key_event(KeyCode::Down));
         assert_eq!(view.selected, 1);
@@ -1715,6 +2099,136 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn render_elevation_lines(view: &ElevationView, w: u16, h: u16) -> Vec<String> {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
+        view.render(Rect::new(0, 0, w, h), &mut buf);
+        (0..h)
+            .map(|row| {
+                (0..w)
+                    .map(|col| buf[(col, row)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn compact_elevation_text(lines: &[String]) -> String {
+        lines.join("\n").replace(' ', "")
+    }
+
+    fn elevation_shell_request() -> ElevationRequest {
+        ElevationRequest::for_shell("test-id", "cargo build", "network blocked", true, false)
+    }
+
+    #[test]
+    fn test_elevation_render_en_has_expected_strings() {
+        let view = ElevationView::new(elevation_shell_request(), Locale::En);
+        let lines = render_elevation_lines(&view, 70, 22);
+        let joined = compact_elevation_text(&lines);
+        assert!(
+            joined.contains("SandboxDenied"),
+            "missing en title:\n{joined}"
+        );
+        assert!(joined.contains("Tool:"), "missing en tool label:\n{joined}");
+        assert!(joined.contains("Cmd:"), "missing en cmd label:\n{joined}");
+        assert!(
+            joined.contains("Reason:"),
+            "missing en reason label:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn test_elevation_render_zh_hans_localizes_copy() {
+        let view = ElevationView::new(elevation_shell_request(), Locale::ZhHans);
+        let lines = render_elevation_lines(&view, 70, 22);
+        let joined = compact_elevation_text(&lines);
+        assert!(joined.contains("沙箱拒绝"), "missing zh title:\n{joined}");
+        assert!(
+            joined.contains("工具："),
+            "missing zh tool label:\n{joined}"
+        );
+        assert!(joined.contains("命令："), "missing zh cmd label:\n{joined}");
+        assert!(
+            joined.contains("原因："),
+            "missing zh reason label:\n{joined}"
+        );
+        assert!(
+            joined.contains("批准后的影响"),
+            "missing zh impact header:\n{joined}"
+        );
+        let en_artifacts = [
+            "SandboxDenied",
+            "Tool:",
+            "Cmd:",
+            "Reason:",
+            "Impactifapproved",
+            "Choosehowtoproceed",
+            "Allowoutboundnetwork",
+            "Allowextrawriteaccess",
+            "Fullaccess",
+            "Abort",
+        ];
+        for artifact in &en_artifacts {
+            assert!(
+                !joined.contains(artifact),
+                "English leak '{artifact}' in zh rendering:\n{joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_elevation_render_ja_has_translated_copy() {
+        let view = ElevationView::new(elevation_shell_request(), Locale::Ja);
+        let lines = render_elevation_lines(&view, 70, 22);
+        let joined = compact_elevation_text(&lines);
+        assert!(
+            joined.contains("サンドボックス拒否"),
+            "missing ja title:\n{joined}"
+        );
+        assert!(
+            joined.contains("ツール："),
+            "missing ja tool label:\n{joined}"
+        );
+        assert!(
+            joined.contains("コマンド："),
+            "missing ja cmd label:\n{joined}"
+        );
+        assert!(
+            joined.contains("理由："),
+            "missing ja reason label:\n{joined}"
+        );
+        for eng in &["SandboxDenied", "Tool:", "Cmd:", "Reason:"] as &[&str] {
+            assert!(
+                !joined.contains(eng),
+                "English leak '{eng}' in ja:\n{joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_elevation_render_zh_hant_has_translated_copy() {
+        let view = ElevationView::new(elevation_shell_request(), Locale::ZhHant);
+        let lines = render_elevation_lines(&view, 70, 22);
+        let joined = compact_elevation_text(&lines);
+        assert!(
+            joined.contains("沙箱拒絕"),
+            "missing zh-Hant title:\n{joined}"
+        );
+        assert!(
+            joined.contains("工具："),
+            "missing zh-Hant tool label:\n{joined}"
+        );
+        assert!(
+            joined.contains("命令："),
+            "missing zh-Hant cmd label:\n{joined}"
+        );
+        assert!(
+            joined.contains("原因："),
+            "missing zh-Hant reason label:\n{joined}"
+        );
     }
 
     // ========================================================================

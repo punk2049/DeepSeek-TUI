@@ -125,14 +125,30 @@ pub(super) fn emit_tool_audit(event: serde_json::Value) {
     };
     let line = match serde_json::to_string(&event) {
         Ok(line) => line,
-        Err(_) => return,
+        Err(e) => {
+            tracing::error!("Failed to serialize tool audit event: {e}");
+            return;
+        }
     };
     let path = PathBuf::from(path);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        tracing::error!(
+            "Failed to create audit log directory {}: {e}",
+            parent.display()
+        );
+        return;
     }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{line}");
+    match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut file) => {
+            if let Err(e) = writeln!(file, "{line}") {
+                tracing::error!("Failed to write to audit log {}: {e}", path.display());
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to open audit log {}: {e}", path.display());
+        }
     }
 }
 
@@ -271,6 +287,27 @@ impl Engine {
         mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
         context_override: Option<crate::tools::ToolContext>,
     ) -> Result<ToolResult, ToolError> {
+        let started_at = std::time::Instant::now();
+        let dispatch = if McpPool::is_mcp_tool(&tool_name) {
+            "mcp"
+        } else if registry.is_some() {
+            "registry"
+        } else {
+            "missing"
+        };
+        let input_bytes = serde_json::to_string(&tool_input)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        tracing::debug!(
+            target: "engine.tool_execution",
+            tool = %tool_name,
+            dispatch,
+            interactive,
+            supports_parallel,
+            input_bytes,
+            "tool.exec.start",
+        );
+
         let _guard = if supports_parallel {
             ToolExecGuard::Read(lock.read().await)
         } else {
@@ -284,7 +321,7 @@ impl Engine {
         // cancelled interactive tool).
         let _terminal = InteractiveTerminalGuard::engage(tx_event, interactive).await;
 
-        if McpPool::is_mcp_tool(&tool_name) {
+        let outcome = if McpPool::is_mcp_tool(&tool_name) {
             if let Some(pool) = mcp_pool {
                 Engine::execute_mcp_tool_with_pool(pool, &tool_name, tool_input).await
             } else {
@@ -300,7 +337,43 @@ impl Engine {
             Err(ToolError::not_available(format!(
                 "tool '{tool_name}' is not registered"
             )))
+        };
+
+        let duration_ms = started_at.elapsed().as_millis() as u64;
+        match &outcome {
+            Ok(result) => {
+                tracing::debug!(
+                    target: "engine.tool_execution",
+                    tool = %tool_name,
+                    dispatch,
+                    duration_ms,
+                    success = result.success,
+                    output_bytes = result.content.len(),
+                    "tool.exec.end",
+                );
+            }
+            Err(err) => {
+                let kind = match err {
+                    ToolError::InvalidInput { .. } => "invalid_input",
+                    ToolError::MissingField { .. } => "missing_field",
+                    ToolError::PathEscape { .. } => "path_escape",
+                    ToolError::ExecutionFailed { .. } => "execution_failed",
+                    ToolError::Timeout { .. } => "timeout",
+                    ToolError::NotAvailable { .. } => "not_available",
+                    ToolError::PermissionDenied { .. } => "permission_denied",
+                };
+                tracing::warn!(
+                    target: "engine.tool_execution",
+                    tool = %tool_name,
+                    dispatch,
+                    duration_ms,
+                    error_kind = kind,
+                    error = %err,
+                    "tool.exec.end",
+                );
+            }
         }
+        outcome
     }
 }
 

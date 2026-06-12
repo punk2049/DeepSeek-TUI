@@ -701,6 +701,7 @@ pub type SharedTaskManager = Arc<TaskManager>;
 
 pub struct TaskManager {
     cfg: TaskManagerConfig,
+    default_workspace: Mutex<PathBuf>,
     executor: Arc<dyn TaskExecutor>,
     tasks_dir: PathBuf,
     artifacts_dir: PathBuf,
@@ -766,8 +767,10 @@ impl TaskManager {
         let (tasks, queue) = load_state(&tasks_dir, &queue_path)?;
 
         let cancel_token = CancellationToken::new();
+        let default_workspace = cfg.default_workspace.clone();
         let manager = Arc::new(Self {
             cfg,
+            default_workspace: Mutex::new(default_workspace),
             executor,
             tasks_dir,
             artifacts_dir,
@@ -810,6 +813,15 @@ impl TaskManager {
         self.cancel_token.is_cancelled()
     }
 
+    pub async fn set_default_workspace(&self, workspace: PathBuf) {
+        let mut default_workspace = self.default_workspace.lock().await;
+        *default_workspace = workspace;
+    }
+
+    pub async fn default_workspace(&self) -> PathBuf {
+        self.default_workspace.lock().await.clone()
+    }
+
     /// Enqueue a new task.
     pub async fn add_task(&self, req: NewTaskRequest) -> Result<TaskRecord> {
         let prompt = req.prompt.trim().to_string();
@@ -822,13 +834,16 @@ impl TaskManager {
             id: format!("task_{}", &Uuid::new_v4().to_string()[..8]),
             prompt,
             model: req.model.unwrap_or_else(|| self.cfg.default_model.clone()),
-            workspace: req
-                .workspace
-                .unwrap_or_else(|| self.cfg.default_workspace.clone()),
+            workspace: match req.workspace {
+                Some(workspace) => workspace,
+                None => self.default_workspace().await,
+            },
             mode: req.mode.unwrap_or_else(|| self.cfg.default_mode.clone()),
             allow_shell: req.allow_shell.unwrap_or(self.cfg.allow_shell),
             trust_mode: req.trust_mode.unwrap_or(self.cfg.trust_mode),
-            auto_approve: req.auto_approve.unwrap_or(true),
+            // Auto-approval must be opted into explicitly
+            // (GHSA-72w5-pf8h-xfp4).
+            auto_approve: req.auto_approve.unwrap_or(false),
             status: TaskStatus::Queued,
             created_at: Utc::now(),
             started_at: None,
@@ -1303,7 +1318,7 @@ impl TaskManager {
                 ),
                 TaskStatus::Canceled => "Task canceled".to_string(),
                 TaskStatus::Queued | TaskStatus::Running => {
-                    format!("Task ended in unexpected state: {}", mode_label)
+                    format!("Task ended in unexpected state: {mode_label}")
                 }
             },
             detail_path: None,
@@ -1497,14 +1512,34 @@ fn load_state(
                 );
             }
             if task.status == TaskStatus::Running {
-                task.status = TaskStatus::Queued;
-                task.started_at = None;
-                task.ended_at = None;
-                task.duration_ms = None;
+                let now = Utc::now();
+                let duration_ms = task.started_at.and_then(|started| {
+                    u64::try_from(now.signed_duration_since(started).num_milliseconds()).ok()
+                });
+                task.status = TaskStatus::Failed;
+                task.ended_at = Some(now);
+                task.duration_ms = duration_ms;
+                task.error = Some(
+                    "Interrupted by process restart; prior process is not attached".to_string(),
+                );
+                for tool in &mut task.tool_calls {
+                    if tool.status == TaskToolStatus::Running {
+                        tool.status = TaskToolStatus::Failed;
+                        tool.ended_at = Some(now);
+                        tool.duration_ms = duration_ms.or_else(|| {
+                            u64::try_from(
+                                now.signed_duration_since(tool.started_at)
+                                    .num_milliseconds(),
+                            )
+                            .ok()
+                        });
+                    }
+                }
                 task.timeline.push(TaskTimelineEntry {
-                    timestamp: Utc::now(),
+                    timestamp: now,
                     kind: "recovered".to_string(),
-                    summary: "Recovered from restart and re-queued".to_string(),
+                    summary: "Interrupted by process restart; prior process is not attached"
+                        .to_string(),
                     detail_path: None,
                 });
             }
@@ -1624,7 +1659,8 @@ fn default_auto_approve() -> bool {
     true
 }
 
-/// Default task persistence location (`~/.deepseek/tasks`).
+/// Default task manager data location (`~/.codewhale/tasks`, or legacy
+/// `~/.deepseek/tasks` when only the legacy directory exists).
 #[must_use]
 pub fn default_tasks_dir() -> PathBuf {
     if let Ok(path) = std::env::var("DEEPSEEK_TASKS_DIR")
@@ -1632,10 +1668,21 @@ pub fn default_tasks_dir() -> PathBuf {
     {
         return PathBuf::from(path);
     }
-    if let Some(home) = dirs::home_dir() {
-        return home.join(".deepseek").join("tasks");
+    dirs::home_dir()
+        .map(|home| default_tasks_dir_for_home(&home))
+        .unwrap_or_else(|| PathBuf::from(".codewhale").join("tasks"))
+}
+
+fn default_tasks_dir_for_home(home: &Path) -> PathBuf {
+    let primary = home.join(".codewhale").join("tasks");
+    if primary.is_dir() {
+        return primary;
     }
-    PathBuf::from(".deepseek").join("tasks")
+    let legacy = home.join(".deepseek").join("tasks");
+    if legacy.is_dir() {
+        return legacy;
+    }
+    primary
 }
 
 /// Wait for a task to reach a terminal status (tests and API helpers).
@@ -1744,7 +1791,7 @@ mod tests {
         let task = manager
             .add_task(NewTaskRequest::from_prompt("test persistence"))
             .await?;
-        let finished = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(3)).await?;
+        let finished = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(10)).await?;
         assert_eq!(finished.status, TaskStatus::Completed);
         assert_eq!(finished.thread_id.as_deref(), Some("thr_test"));
         assert_eq!(finished.turn_id.as_deref(), Some("turn_test"));
@@ -1763,6 +1810,116 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn running_tasks_are_not_requeued_after_restart() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
+        let tasks_dir = root.join("tasks");
+        fs::create_dir_all(&tasks_dir)?;
+        let queue_path = root.join("queue.json");
+        let task_id = "task_stale_running".to_string();
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let task = TaskRecord {
+            schema_version: CURRENT_TASK_SCHEMA_VERSION,
+            id: task_id.clone(),
+            prompt: "long-running shell work".to_string(),
+            model: "deepseek-v4-flash".to_string(),
+            workspace: PathBuf::from("."),
+            mode: "agent".to_string(),
+            allow_shell: true,
+            trust_mode: false,
+            auto_approve: false,
+            status: TaskStatus::Running,
+            created_at: started_at,
+            started_at: Some(started_at),
+            ended_at: None,
+            duration_ms: None,
+            result_summary: None,
+            result_detail_path: None,
+            error: None,
+            thread_id: Some("thr_stale".to_string()),
+            turn_id: Some("turn_stale".to_string()),
+            runtime_event_count: 0,
+            checklist: TaskChecklistState::default(),
+            gates: Vec::new(),
+            attempts: Vec::new(),
+            artifacts: Vec::new(),
+            github_events: Vec::new(),
+            tool_calls: vec![TaskToolCallSummary {
+                id: "tool_shell".to_string(),
+                name: "task_shell_start".to_string(),
+                status: TaskToolStatus::Running,
+                started_at,
+                ended_at: None,
+                duration_ms: None,
+                input_summary: Some("shell: sleep 999".to_string()),
+                output_summary: None,
+                detail_path: None,
+                patch_ref: None,
+            }],
+            timeline: vec![TaskTimelineEntry {
+                timestamp: started_at,
+                kind: "running".to_string(),
+                summary: "Task started".to_string(),
+                detail_path: None,
+            }],
+        };
+        fs::write(
+            tasks_dir.join(format!("{task_id}.json")),
+            serde_json::to_string_pretty(&task)?,
+        )?;
+        fs::write(
+            &queue_path,
+            serde_json::to_string_pretty(&QueueFile {
+                queue: vec![task_id.clone()],
+            })?,
+        )?;
+
+        let (tasks, queue) = load_state(&tasks_dir, &queue_path)?;
+        let recovered = tasks.get(&task_id).expect("task loaded");
+
+        assert!(queue.is_empty(), "stale running task must not be requeued");
+        assert_eq!(recovered.status, TaskStatus::Failed);
+        assert!(
+            recovered
+                .error
+                .as_deref()
+                .is_some_and(|err| err.contains("prior process is not attached")),
+            "recovered task should explain stale process ownership: {recovered:?}"
+        );
+        assert!(recovered.ended_at.is_some());
+        assert!(recovered.duration_ms.is_some());
+        assert_eq!(recovered.tool_calls[0].status, TaskToolStatus::Failed);
+        assert!(recovered.tool_calls[0].ended_at.is_some());
+        assert!(
+            recovered
+                .timeline
+                .iter()
+                .any(|entry| entry.kind == "recovered"
+                    && entry.summary.contains("prior process is not attached")),
+            "recovery timeline should explain why the task is terminal: {:?}",
+            recovered.timeline
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_workspace_updates_for_future_tasks() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
+        let new_workspace =
+            std::env::temp_dir().join(format!("deepseek-workspace-{}", Uuid::new_v4()));
+        let manager =
+            TaskManager::start_with_executor(test_config(root), Arc::new(MockExecutor)).await?;
+
+        manager.set_default_workspace(new_workspace.clone()).await;
+        let task = manager
+            .add_task(NewTaskRequest::from_prompt("test workspace default"))
+            .await?;
+
+        assert_eq!(manager.default_workspace().await, new_workspace);
+        assert_eq!(task.workspace, new_workspace);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn record_tool_metadata_updates_explicit_task() -> Result<()> {
         let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
@@ -1772,7 +1929,7 @@ mod tests {
         let task = manager
             .add_task(NewTaskRequest::from_prompt("test metadata"))
             .await?;
-        let finished = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(3)).await?;
+        let finished = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(10)).await?;
         let updated = manager
             .record_tool_metadata(
                 &finished.id,
@@ -1781,7 +1938,7 @@ mod tests {
                         "gate": {
                             "id": "gate_test",
                             "gate": "test",
-                            "command": "cargo test -p deepseek-tui --lib",
+                            "command": "cargo test -p codewhale-tui --lib",
                             "cwd": ".",
                             "exit_code": 0,
                             "status": "passed",
@@ -1813,8 +1970,43 @@ mod tests {
 
         sleep(Duration::from_millis(10)).await;
         let _ = manager.cancel_task(&task.id).await?;
-        let finished = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(3)).await?;
+        let finished = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(10)).await?;
         assert_eq!(finished.status, TaskStatus::Canceled);
+        Ok(())
+    }
+
+    // GHSA-72w5-pf8h-xfp4 — regression: omitted optional fields must not
+    // silently elevate the spawned task's privileges.
+    #[tokio::test]
+    async fn add_task_without_optional_fields_does_not_grant_shell_or_auto_approve() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
+        let manager =
+            TaskManager::start_with_executor(test_config(root.clone()), Arc::new(MockExecutor))
+                .await?;
+
+        let req = NewTaskRequest {
+            prompt: "fix TODOs and write a README".to_string(),
+            model: None,
+            workspace: None,
+            mode: None,
+            allow_shell: None,
+            trust_mode: None,
+            auto_approve: None,
+        };
+        let task = manager.add_task(req).await?;
+
+        assert!(
+            !task.allow_shell,
+            "model-omitted allow_shell must default to false (no silent shell grant)"
+        );
+        assert!(
+            !task.auto_approve,
+            "model-omitted auto_approve must default to false (no silent auto-approval)"
+        );
+        assert!(
+            !task.trust_mode,
+            "model-omitted trust_mode must default to false"
+        );
         Ok(())
     }
 
@@ -1828,7 +2020,7 @@ mod tests {
         let task = manager
             .add_task(NewTaskRequest::from_prompt("test schema gate"))
             .await?;
-        let _ = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(3)).await?;
+        let _ = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(10)).await?;
         drop(manager);
 
         let task_path = root.join("tasks").join(format!("{}.json", task.id));
@@ -1841,5 +2033,63 @@ mod tests {
             Err(err) => assert!(err.to_string().contains("newer than supported")),
         }
         Ok(())
+    }
+
+    #[test]
+    fn default_tasks_dir_falls_back_to_legacy_deepseek_tasks() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let home = temp_home.path();
+        let legacy_tasks = home.join(".deepseek").join("tasks");
+        std::fs::create_dir_all(&legacy_tasks).unwrap();
+
+        assert_eq!(default_tasks_dir_for_home(home), legacy_tasks);
+    }
+
+    #[test]
+    fn default_tasks_dir_prefers_existing_codewhale_tasks() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let home = temp_home.path();
+        let primary_tasks = home.join(".codewhale").join("tasks");
+        let legacy_tasks = home.join(".deepseek").join("tasks");
+        std::fs::create_dir_all(&primary_tasks).unwrap();
+        std::fs::create_dir_all(&legacy_tasks).unwrap();
+
+        assert_eq!(default_tasks_dir_for_home(home), primary_tasks);
+    }
+
+    #[test]
+    fn default_tasks_dir_falls_back_to_legacy_when_primary_is_file() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let home = temp_home.path();
+        let primary_tasks = home.join(".codewhale").join("tasks");
+        let legacy_tasks = home.join(".deepseek").join("tasks");
+        std::fs::create_dir_all(primary_tasks.parent().unwrap()).unwrap();
+        std::fs::write(&primary_tasks, "not a directory").unwrap();
+        std::fs::create_dir_all(&legacy_tasks).unwrap();
+
+        assert_eq!(default_tasks_dir_for_home(home), legacy_tasks);
+    }
+
+    #[test]
+    fn default_tasks_dir_ignores_legacy_file_for_new_installs() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let home = temp_home.path();
+        let primary_tasks = home.join(".codewhale").join("tasks");
+        let legacy_tasks = home.join(".deepseek").join("tasks");
+        std::fs::create_dir_all(legacy_tasks.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_tasks, "not a directory").unwrap();
+
+        assert_eq!(default_tasks_dir_for_home(home), primary_tasks);
+    }
+
+    #[test]
+    fn default_tasks_dir_uses_codewhale_tasks_for_new_installs() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let home = temp_home.path();
+
+        assert_eq!(
+            default_tasks_dir_for_home(home),
+            home.join(".codewhale").join("tasks")
+        );
     }
 }

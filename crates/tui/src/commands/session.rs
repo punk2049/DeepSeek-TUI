@@ -3,24 +3,34 @@
 use std::fmt::Write;
 use std::path::PathBuf;
 
-use crate::session_manager::create_saved_session_with_mode;
+use crate::session_manager::{
+    create_saved_session_with_id_and_mode, create_saved_session_with_mode,
+};
 use crate::tui::app::{App, AppAction};
 use crate::tui::history::{HistoryCell, history_cells_from_message};
 use crate::tui::session_picker::SessionPickerView;
 
 use super::CommandResult;
 
-/// Save session to file
+/// Save session to file.
+///
+/// When an explicit path is given, the session is exported there
+/// (user-visible explicit export).  Without a path, v0.8.44 saves
+/// into the managed session directory (`~/.codewhale/sessions`
+/// or legacy `~/.deepseek/sessions`) so repo-local `session_*.json`
+/// artifacts are no longer created by default.
 pub fn save(app: &mut App, path: Option<&str>) -> CommandResult {
     let save_path = if let Some(p) = path {
         PathBuf::from(p)
     } else {
+        let dir = crate::session_manager::default_sessions_dir()
+            .unwrap_or_else(|_| app.workspace.clone());
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-        PathBuf::from(format!("session_{timestamp}.json"))
+        dir.join(format!("session_{timestamp}.json"))
     };
 
     let messages = app.api_messages.clone();
-    let session = create_saved_session_with_mode(
+    let mut session = create_saved_session_with_mode(
         &messages,
         &app.model,
         &app.workspace,
@@ -28,6 +38,8 @@ pub fn save(app: &mut App, path: Option<&str>) -> CommandResult {
         app.system_prompt.as_ref(),
         Some(app.mode.label()),
     );
+    app.sync_cost_to_metadata(&mut session.metadata);
+    session.artifacts = app.session_artifacts.clone();
 
     let sessions_dir = save_path
         .parent()
@@ -54,6 +66,138 @@ pub fn save(app: &mut App, path: Option<&str>) -> CommandResult {
         }
         Err(e) => CommandResult::error(format!("Failed to create directory: {e}")),
     }
+}
+
+/// Fork the active conversation into a new saved sibling session and switch to it.
+pub fn fork(app: &mut App) -> CommandResult {
+    if app.api_messages.is_empty() {
+        return CommandResult::error("Nothing to fork. Send or load a message first.");
+    }
+
+    let manager = match crate::session_manager::SessionManager::default_location() {
+        Ok(manager) => manager,
+        Err(err) => {
+            return CommandResult::error(format!("could not open sessions directory: {err}"));
+        }
+    };
+
+    let parent_id = app
+        .current_session_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let mut parent = create_saved_session_with_id_and_mode(
+        parent_id,
+        &app.api_messages,
+        &app.model,
+        &app.workspace,
+        u64::from(app.session.total_tokens),
+        app.system_prompt.as_ref(),
+        Some(app.mode.label()),
+    );
+    app.sync_cost_to_metadata(&mut parent.metadata);
+    parent.artifacts = app.session_artifacts.clone();
+
+    if let Err(err) = manager.save_session(&parent) {
+        return CommandResult::error(format!("Failed to save parent session: {err}"));
+    }
+
+    let mut forked = create_saved_session_with_mode(
+        &app.api_messages,
+        &app.model,
+        &app.workspace,
+        u64::from(app.session.total_tokens),
+        app.system_prompt.as_ref(),
+        Some(app.mode.label()),
+    );
+    forked.metadata.copy_cost_from(&parent.metadata);
+    forked.metadata.mark_forked_from(&parent.metadata);
+
+    if let Err(err) = manager.save_session(&forked) {
+        return CommandResult::error(format!("Failed to save forked session: {err}"));
+    }
+
+    app.current_session_id = Some(forked.metadata.id.clone());
+    let fork_id = forked.metadata.id.clone();
+    let parent_label = crate::session_manager::truncate_id(&parent.metadata.id).to_string();
+    let fork_label = crate::session_manager::truncate_id(&fork_id).to_string();
+
+    CommandResult::with_message_and_action(
+        format!("Forked session {parent_label} -> {fork_label}"),
+        AppAction::SyncSession {
+            session_id: Some(fork_id),
+            messages: app.api_messages.clone(),
+            system_prompt: app.system_prompt.clone(),
+            model: app.model.clone(),
+            workspace: app.workspace.clone(),
+        },
+    )
+}
+
+/// Start a fresh saved session from the current TUI state.
+pub fn new_session(app: &mut App, arg: Option<&str>) -> CommandResult {
+    let force = match arg.map(str::trim).filter(|s| !s.is_empty()) {
+        None => false,
+        Some("--force" | "force") => true,
+        Some(other) => {
+            return CommandResult::error(format!(
+                "Usage: /new [--force]\n\nUnknown argument: {other}"
+            ));
+        }
+    };
+
+    if !force {
+        let blockers = new_session_blockers(app);
+        if !blockers.is_empty() {
+            return CommandResult::error(format!(
+                "Cannot start a new session while {}. Run `/new --force` to discard pending work and start a fresh session.",
+                blockers.join(", ")
+            ));
+        }
+    }
+
+    let new_id = uuid::Uuid::new_v4().to_string();
+    super::core::reset_conversation_state(app);
+    app.clear_input();
+    app.session_artifacts.clear();
+    app.session_context_references.clear();
+    app.tool_evidence.clear();
+    app.current_session_id = Some(new_id.clone());
+    app.session_title = Some("New Session".to_string());
+    app.scroll_to_bottom();
+
+    CommandResult::with_message_and_action(
+        format!(
+            "Started new session {} (New Session). Previous sessions remain available via /resume.",
+            crate::session_manager::truncate_id(&new_id)
+        ),
+        AppAction::SyncSession {
+            session_id: Some(new_id),
+            messages: Vec::new(),
+            system_prompt: None,
+            model: app.model.clone(),
+            workspace: app.workspace.clone(),
+        },
+    )
+}
+
+fn new_session_blockers(app: &App) -> Vec<&'static str> {
+    let mut blockers = Vec::new();
+    if !app.input.trim().is_empty() {
+        blockers.push("the composer has unsent text");
+    }
+    if !app.queued_messages.is_empty() || app.queued_draft.is_some() {
+        blockers.push("queued messages are pending");
+    }
+    if app.is_loading || app.runtime_turn_status.as_deref() == Some("in_progress") {
+        blockers.push("a turn is in progress");
+    }
+    if app.is_compacting {
+        blockers.push("context compaction is running");
+    }
+    if app.task_panel.iter().any(|task| task.status == "running") {
+        blockers.push("background tasks are running");
+    }
+    blockers
 }
 
 /// Load session from file
@@ -92,11 +236,13 @@ pub fn load(app: &mut App, path: Option<&str>) -> CommandResult {
     app.extend_history(cells_to_add);
     app.mark_history_updated();
     app.viewport.transcript_selection.clear();
-    app.model.clone_from(&session.metadata.model);
+    app.set_model_selection(session.metadata.model.clone());
     app.update_model_compaction_budget();
     app.workspace.clone_from(&session.metadata.workspace);
     app.session.total_tokens = u32::try_from(session.metadata.total_tokens).unwrap_or(u32::MAX);
     app.session.total_conversation_tokens = app.session.total_tokens;
+    // Accumulated token breakdown is per-runtime-session; zero on load.
+    app.session.reset_token_breakdown();
     app.session.session_cost = 0.0;
     app.session.session_cost_cny = 0.0;
     app.session.subagent_cost = 0.0;
@@ -111,6 +257,7 @@ pub fn load(app: &mut App, path: Option<&str>) -> CommandResult {
     app.session.last_reasoning_replay_tokens = None;
     app.session.turn_cache_history.clear();
     app.current_session_id = Some(session.metadata.id.clone());
+    app.session_artifacts = session.artifacts.clone();
     if let Some(sp) = session.system_prompt {
         app.system_prompt = Some(crate::models::SystemPrompt::Text(sp));
     }
@@ -124,6 +271,7 @@ pub fn load(app: &mut App, path: Option<&str>) -> CommandResult {
             session.metadata.message_count
         ),
         crate::tui::app::AppAction::SyncSession {
+            session_id: app.current_session_id.clone(),
             messages: app.api_messages.clone(),
             system_prompt: app.system_prompt.clone(),
             model: app.model.clone(),
@@ -138,6 +286,14 @@ pub fn compact(_app: &mut App) -> CommandResult {
     CommandResult::with_message_and_action(
         "Context compaction triggered...".to_string(),
         AppAction::CompactContext,
+    )
+}
+
+/// Trigger agent-driven context purging.
+pub fn purge(_app: &mut App) -> CommandResult {
+    CommandResult::with_message_and_action(
+        "Agent context purge triggered...".to_string(),
+        AppAction::PurgeContext,
     )
 }
 
@@ -199,7 +355,7 @@ pub fn export(app: &mut App, path: Option<&str>) -> CommandResult {
 pub fn sessions(app: &mut App, arg: Option<&str>) -> CommandResult {
     let trimmed = arg.unwrap_or("").trim();
     if trimmed.is_empty() {
-        app.view_stack.push(SessionPickerView::new());
+        app.view_stack.push(SessionPickerView::new(&app.workspace));
         return CommandResult::ok();
     }
 
@@ -208,7 +364,7 @@ pub fn sessions(app: &mut App, arg: Option<&str>) -> CommandResult {
     match action.as_str() {
         "prune" => prune(app, parts.next()),
         "show" | "list" | "picker" => {
-            app.view_stack.push(SessionPickerView::new());
+            app.view_stack.push(SessionPickerView::new(&app.workspace));
             CommandResult::ok()
         }
         _ => CommandResult::error(format!(
@@ -284,8 +440,9 @@ fn line_to_string(line: ratatui::text::Line<'static>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
-    use crate::tui::app::{App, TuiOptions, TurnCacheRecord};
+    use crate::config::{Config, DEFAULT_TEXT_MODEL};
+    use crate::test_support::EnvVarGuard;
+    use crate::tui::app::{App, ReasoningEffort, TuiOptions, TurnCacheRecord};
     use std::time::Instant;
     use tempfile::TempDir;
 
@@ -330,22 +487,210 @@ mod tests {
     }
 
     #[test]
-    fn test_save_with_default_path_uses_workspace() {
+    fn save_preserves_artifact_registry() {
         let tmpdir = TempDir::new().unwrap();
+        let mut app = create_test_app_with_tmpdir(&tmpdir);
+        let save_path = tmpdir.path().join("artifact_session.json");
+        app.session_artifacts
+            .push(crate::artifacts::ArtifactRecord {
+                id: "art_call_big".to_string(),
+                kind: crate::artifacts::ArtifactKind::ToolOutput,
+                session_id: "artifact-session".to_string(),
+                tool_call_id: "call-big".to_string(),
+                tool_name: "exec_shell".to_string(),
+                created_at: chrono::Utc::now(),
+                byte_size: 512_000,
+                preview: "cargo test output".to_string(),
+                storage_path: tmpdir.path().join("call-big.txt"),
+            });
+
+        let result = save(&mut app, Some(save_path.to_str().unwrap()));
+
+        assert!(!result.is_error);
+        let saved: crate::session_manager::SavedSession =
+            serde_json::from_str(&std::fs::read_to_string(save_path).unwrap()).unwrap();
+        assert_eq!(saved.artifacts, app.session_artifacts);
+    }
+
+    #[test]
+    fn fork_saves_parent_and_switches_to_child_session() {
+        let tmpdir = TempDir::new().unwrap();
+        let _lock = crate::test_support::lock_test_env();
+        let home = tmpdir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let home_guard = EnvVarGuard::set("HOME", &home);
+        let previous_home = home_guard.previous();
+        let mut app = create_test_app_with_tmpdir(&tmpdir);
+        app.current_session_id = Some("parent-session".to_string());
+        app.api_messages.push(crate::models::Message {
+            role: "user".to_string(),
+            content: vec![crate::models::ContentBlock::Text {
+                text: "try another path".to_string(),
+                cache_control: None,
+            }],
+        });
+
+        let result = fork(&mut app);
+
+        assert!(!result.is_error, "{:?}", result.message);
+        let new_id = app.current_session_id.clone().expect("fork session id");
+        assert_ne!(new_id, "parent-session");
+        assert!(result.message.as_deref().unwrap_or("").contains("Forked"));
+        assert!(matches!(result.action, Some(AppAction::SyncSession { .. })));
+
+        let manager = crate::session_manager::SessionManager::default_location().unwrap();
+        let parent = manager
+            .load_session("parent-session")
+            .expect("parent saved");
+        let child = manager.load_session(&new_id).expect("child saved");
+        assert_eq!(parent.messages.len(), 1);
+        assert_eq!(
+            child.metadata.parent_session_id.as_deref(),
+            Some("parent-session")
+        );
+        assert_eq!(child.metadata.forked_from_message_count, Some(1));
+        drop(home_guard);
+        assert_eq!(std::env::var_os("HOME"), previous_home);
+    }
+
+    #[test]
+    fn new_session_from_resumed_state_creates_distinct_empty_session() {
+        let tmpdir = TempDir::new().unwrap();
+        let mut app = create_test_app_with_tmpdir(&tmpdir);
+        app.current_session_id = Some("old-session".to_string());
+        app.session_title = Some("Old Session".to_string());
+        app.api_messages.push(crate::models::Message {
+            role: "user".to_string(),
+            content: vec![crate::models::ContentBlock::Text {
+                text: "continue this thread".to_string(),
+                cache_control: None,
+            }],
+        });
+        app.add_message(HistoryCell::System {
+            content: "old transcript".to_string(),
+        });
+        app.system_prompt = Some(crate::models::SystemPrompt::Text("old prompt".to_string()));
+        app.session.total_tokens = 123;
+        app.session.session_cost = 1.25;
+
+        let result = new_session(&mut app, None);
+
+        assert!(!result.is_error, "{:?}", result.message);
+        let new_id = app.current_session_id.clone().expect("new session id");
+        assert_ne!(new_id, "old-session");
+        assert_eq!(app.session_title.as_deref(), Some("New Session"));
+        assert!(app.api_messages.is_empty());
+        assert!(app.history.is_empty());
+        assert!(app.system_prompt.is_none());
+        assert_eq!(app.session.total_tokens, 0);
+        assert_eq!(app.session.session_cost, 0.0);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("/resume")
+        );
+        match result.action {
+            Some(AppAction::SyncSession {
+                session_id,
+                messages,
+                system_prompt,
+                ..
+            }) => {
+                assert_eq!(session_id.as_deref(), Some(new_id.as_str()));
+                assert!(messages.is_empty());
+                assert!(system_prompt.is_none());
+            }
+            other => panic!("expected SyncSession action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_session_blocks_unsent_input_without_force() {
+        let tmpdir = TempDir::new().unwrap();
+        let mut app = create_test_app_with_tmpdir(&tmpdir);
+        app.current_session_id = Some("old-session".to_string());
+        app.input = "draft text".to_string();
+
+        let result = new_session(&mut app, None);
+
+        assert!(result.is_error);
+        assert_eq!(app.current_session_id.as_deref(), Some("old-session"));
+        assert_eq!(app.input, "draft text");
+        assert!(result.action.is_none());
+        assert!(
+            result
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("/new --force")
+        );
+    }
+
+    #[test]
+    fn new_session_force_discards_unsent_input() {
+        let tmpdir = TempDir::new().unwrap();
+        let mut app = create_test_app_with_tmpdir(&tmpdir);
+        app.current_session_id = Some("old-session".to_string());
+        app.input = "draft text".to_string();
+
+        let result = new_session(&mut app, Some("--force"));
+
+        assert!(!result.is_error, "{:?}", result.message);
+        assert_ne!(app.current_session_id.as_deref(), Some("old-session"));
+        assert!(app.input.is_empty());
+        assert!(matches!(result.action, Some(AppAction::SyncSession { .. })));
+    }
+
+    #[test]
+    fn new_session_blocks_in_flight_turn_without_force() {
+        let tmpdir = TempDir::new().unwrap();
+        let mut app = create_test_app_with_tmpdir(&tmpdir);
+        app.current_session_id = Some("old-session".to_string());
+        app.is_loading = true;
+
+        let result = new_session(&mut app, None);
+
+        assert!(result.is_error);
+        assert_eq!(app.current_session_id.as_deref(), Some("old-session"));
+        assert!(result.action.is_none());
+    }
+
+    #[test]
+    fn test_save_with_default_path_uses_managed_sessions_dir() {
+        let tmpdir = TempDir::new().unwrap();
+        let _lock = crate::test_support::lock_test_env();
+        // Set CODEWHALE_HOME so the managed sessions directory lands inside the
+        // temp dir rather than the real user home. Pre-create the directory so
+        // resolve_state_dir picks it up instead of falling back to legacy.
+        let home = tmpdir.path().join("home");
+        let sessions_dir = home.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", &home);
+        let previous_codewhale_home = codewhale_home.previous();
         let mut app = create_test_app_with_tmpdir(&tmpdir);
         let result = save(&mut app, None);
         assert!(result.message.is_some());
         let msg = result.message.unwrap();
-        // Should create file in workspace with timestamp name
         // Give it a moment to ensure file is written
         std::thread::sleep(std::time::Duration::from_millis(10));
-        let entries: Vec<_> = std::fs::read_dir(tmpdir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("session_"))
-            .collect();
-        // Test passes if file was created or if save returned success message
-        assert!(!entries.is_empty() || msg.contains("Session saved"));
+        let entries: Vec<_> = if sessions_dir.exists() {
+            std::fs::read_dir(&sessions_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with("session_"))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        drop(codewhale_home);
+        // Session should be saved to the managed dir, not the workspace root.
+        assert!(
+            !entries.is_empty(),
+            "expected session file in {sessions_dir:?}, got none; msg: {msg}"
+        );
+        assert_eq!(std::env::var_os("CODEWHALE_HOME"), previous_codewhale_home);
     }
 
     #[test]
@@ -416,6 +761,71 @@ mod tests {
         assert_eq!(app2.session.total_tokens, 500);
         assert!(app2.current_session_id.is_some());
         assert!(matches!(result.action, Some(AppAction::SyncSession { .. })));
+    }
+
+    #[test]
+    fn load_auto_model_session_restores_auto_mode() {
+        let tmpdir = TempDir::new().unwrap();
+        let mut saved_app = create_test_app_with_tmpdir(&tmpdir);
+        saved_app.set_model_selection("auto".to_string());
+        saved_app.last_effective_model = Some("deepseek-v4-flash".to_string());
+        saved_app.last_effective_reasoning_effort = Some(ReasoningEffort::Low);
+        let save_path = tmpdir.path().join("auto_model.json");
+        save(&mut saved_app, Some(save_path.to_str().unwrap()));
+
+        let mut app = create_test_app_with_tmpdir(&tmpdir);
+        app.set_model_selection("deepseek-v4-flash".to_string());
+        app.reasoning_effort = ReasoningEffort::High;
+        let result = load(&mut app, Some(save_path.to_str().unwrap()));
+
+        assert!(!result.is_error);
+        assert!(app.auto_model);
+        assert_eq!(app.model, "auto");
+        assert_eq!(app.model_selection_for_persistence(), "auto");
+        assert_eq!(app.last_effective_model, None);
+        assert_eq!(app.last_effective_reasoning_effort, None);
+        assert_eq!(app.reasoning_effort, ReasoningEffort::Auto);
+        assert_eq!(app.effective_model_for_budget(), DEFAULT_TEXT_MODEL);
+    }
+
+    #[test]
+    fn load_restores_artifact_registry() {
+        let tmpdir = TempDir::new().unwrap();
+        let mut saved_app = create_test_app_with_tmpdir(&tmpdir);
+        saved_app
+            .session_artifacts
+            .push(crate::artifacts::ArtifactRecord {
+                id: "art_call_big".to_string(),
+                kind: crate::artifacts::ArtifactKind::ToolOutput,
+                session_id: "artifact-session".to_string(),
+                tool_call_id: "call-big".to_string(),
+                tool_name: "exec_shell".to_string(),
+                created_at: chrono::Utc::now(),
+                byte_size: 128,
+                preview: "checking crate".to_string(),
+                storage_path: tmpdir.path().join("call-big.txt"),
+            });
+        let save_path = tmpdir.path().join("artifact_load.json");
+        save(&mut saved_app, Some(save_path.to_str().unwrap()));
+
+        let mut app = create_test_app_with_tmpdir(&tmpdir);
+        app.session_artifacts
+            .push(crate::artifacts::ArtifactRecord {
+                id: "art_stale".to_string(),
+                kind: crate::artifacts::ArtifactKind::ToolOutput,
+                session_id: "stale-session".to_string(),
+                tool_call_id: "stale".to_string(),
+                tool_name: "exec_shell".to_string(),
+                created_at: chrono::Utc::now(),
+                byte_size: 1,
+                preview: "stale".to_string(),
+                storage_path: tmpdir.path().join("stale.txt"),
+            });
+
+        let result = load(&mut app, Some(save_path.to_str().unwrap()));
+
+        assert!(!result.is_error);
+        assert_eq!(app.session_artifacts, saved_app.session_artifacts);
     }
 
     #[test]

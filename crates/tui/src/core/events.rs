@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::core::coherence::CoherenceState;
 use crate::error_taxonomy::ErrorEnvelope;
-use crate::models::{Message, SystemPrompt, Usage};
+use crate::models::{Message, SystemPrompt, Tool, Usage};
 use crate::tools::spec::{ToolError, ToolResult};
 use crate::tools::subagent::SubAgentResult;
 use crate::tools::user_input::UserInputRequest;
@@ -92,6 +92,10 @@ pub enum Event {
         usage: Usage,
         status: TurnOutcomeStatus,
         error: Option<String>,
+        /// Tool catalog sent with this turn's model request.
+        tool_catalog: Option<Vec<Tool>>,
+        /// API base URL used by this turn's client.
+        base_url: Option<String>,
     },
 
     /// Context compaction started.
@@ -114,22 +118,34 @@ pub enum Event {
         messages_after: Option<usize>,
     },
 
+    /// Context purge started.
+    PurgeStarted {
+        /// Status message for display.
+        message: String,
+    },
+
+    /// Context purge completed.
+    PurgeCompleted {
+        /// Number of messages before purge.
+        messages_before: usize,
+        /// Number of messages after purge.
+        messages_after: usize,
+        /// How many messages were removed.
+        removed_count: usize,
+        /// How many replace operations were applied.
+        replaced_count: usize,
+        /// Summary message for display.
+        message: String,
+    },
+
+    /// Context purge failed.
+    PurgeFailed { message: String },
+
     /// Context compaction failed.
     CompactionFailed {
         id: String,
         auto: bool,
         message: String,
-    },
-
-    /// Checkpoint-restart cycle boundary advanced (issue #124). The previous
-    /// cycle has already been archived to disk; the engine has swapped its
-    /// in-memory message buffer for the seed messages of cycle `to`.
-    /// Carries the full briefing record so the UI can populate
-    /// `app.cycle_briefings` for `/cycle <n>`.
-    CycleAdvanced {
-        from: u32,
-        to: u32,
-        briefing: crate::cycle_manager::CycleBriefing,
     },
 
     /// Capacity decision telemetry.
@@ -226,8 +242,18 @@ pub enum Event {
         id: String,
         tool_name: String,
         description: String,
-        /// Fingerprint key for per‑call approval caching (§5.A).
+        /// Tool parameters for approval display. Carried on the event so the
+        /// TUI does not need to reconstruct them from `pending_tool_uses`.
+        input: Value,
+        /// Exact-argument fingerprint, used to scope *denials* (#1617).
         approval_key: String,
+        /// Lossy / arity-aware fingerprint, used to scope *approvals* so an
+        /// "approve for session" covers later flag variants (v0.8.37).
+        approval_grouping_key: String,
+        /// The model's explanation of intent before invoking write tools (#2381).
+        /// Displayed in the approval view so users understand *why* the change
+        /// is being made before reviewing *what* will change.
+        intent_summary: Option<String>,
     },
 
     /// Request user input for a tool call
@@ -244,6 +270,7 @@ pub enum Event {
     /// text block, and that assistant message still has to be persisted for
     /// later `reasoning_content` replay.
     SessionUpdated {
+        session_id: String,
         messages: Vec<Message>,
         system_prompt: Option<SystemPrompt>,
         model: String,
@@ -259,6 +286,28 @@ pub enum Event {
         denial_reason: String,
         blocked_network: bool,
         blocked_write: bool,
+    },
+
+    // === Prefix-Cache Stability Events ===
+    /// The prefix (system prompt + tool specs) changed between turns,
+    /// which invalidates DeepSeek's KV prefix cache. Carries diagnostics
+    /// for the TUI to surface.
+    PrefixCacheChange {
+        /// Human-readable description of what changed.
+        description: String,
+        /// Whether the system prompt component changed.
+        system_prompt_changed: bool,
+        /// Whether the tool set component changed.
+        tools_changed: bool,
+        /// Overall prefix stability percentage (100 = fully stable).
+        stability_pct: u32,
+        /// True when the prefix actually changed (cache invalidated).
+        /// False for routine stable-check heartbeats.
+        changed: bool,
+        /// Current pinned prefix combined hash (SHA-256, 64 hex chars).
+        /// Carried so `/cache stats` can surface it without reaching
+        /// into the engine's PrefixStabilityManager.
+        pinned_combined_hash: String,
     },
 }
 

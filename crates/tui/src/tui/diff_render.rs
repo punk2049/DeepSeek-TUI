@@ -2,7 +2,7 @@
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::palette;
 
@@ -318,20 +318,10 @@ fn render_diff_line(
 
 fn format_line_numbers(old_line: Option<usize>, new_line: Option<usize>, marker: char) -> String {
     let old = old_line
-        .map(|value| {
-            format!(
-                "{value:>LINE_NUMBER_WIDTH$}",
-                LINE_NUMBER_WIDTH = LINE_NUMBER_WIDTH
-            )
-        })
+        .map(|value| format!("{value:>LINE_NUMBER_WIDTH$}"))
         .unwrap_or_else(|| " ".repeat(LINE_NUMBER_WIDTH));
     let new = new_line
-        .map(|value| {
-            format!(
-                "{value:>LINE_NUMBER_WIDTH$}",
-                LINE_NUMBER_WIDTH = LINE_NUMBER_WIDTH
-            )
-        })
+        .map(|value| format!("{value:>LINE_NUMBER_WIDTH$}"))
         .unwrap_or_else(|| " ".repeat(LINE_NUMBER_WIDTH));
     format!("{old} {new} {marker} ")
 }
@@ -351,38 +341,82 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
     }
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    let mut current_width = 0;
-
-    for word in text.split_whitespace() {
-        let word_width = word.width();
-        let additional = if current.is_empty() {
-            word_width
-        } else {
-            word_width + 1
-        };
-        if current_width + additional > width && !current.is_empty() {
-            lines.push(current);
-            current = word.to_string();
-            current_width = word_width;
-        } else {
-            if !current.is_empty() {
-                current.push(' ');
-                current_width += 1;
-            }
-            current.push_str(word);
-            current_width += word_width;
-        }
+    let lead = text
+        .chars()
+        .take_while(|ch| ch.is_whitespace())
+        .collect::<String>();
+    let trimmed = text.trim_start();
+    if trimmed.is_empty() {
+        return vec![text.to_string()];
     }
 
-    if current.is_empty() {
-        lines.push(String::new());
-    } else {
+    let mut lines = Vec::new();
+    let lead_width = lead.width();
+    let mut current = lead.clone();
+    let mut current_width = lead_width;
+    let mut has_word = false;
+
+    for word in trimmed.split_whitespace() {
+        let word_width = word.width();
+        if word_width > width {
+            if has_word {
+                lines.push(std::mem::take(&mut current));
+                current = lead.clone();
+                current_width = lead_width;
+            }
+            push_word_breaking_chars(word, width, &mut current, &mut current_width, &mut lines);
+            has_word = current_width > lead_width;
+            continue;
+        }
+        let additional = if has_word { word_width + 1 } else { word_width };
+        if current_width + additional > width && has_word {
+            lines.push(current);
+            current = lead.clone();
+            current_width = lead_width;
+            has_word = false;
+        }
+        if has_word {
+            current.push(' ');
+            current_width += 1;
+        }
+        if current_width + word_width > width && !has_word && lead_width > 0 {
+            lines.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        if current_width == 0 && lead_width > 0 && word_width + lead_width <= width {
+            current = lead.clone();
+            current_width = lead_width;
+        }
+        current.push_str(word);
+        current_width += word_width;
+        has_word = true;
+    }
+
+    if has_word || !current.is_empty() {
         lines.push(current);
+    } else {
+        lines.push(String::new());
     }
 
     lines
+}
+
+fn push_word_breaking_chars(
+    word: &str,
+    width: usize,
+    current: &mut String,
+    current_width: &mut usize,
+    lines: &mut Vec<String>,
+) {
+    for ch in word.chars() {
+        let char_width = ch.width().unwrap_or(1);
+        if *current_width + char_width > width && *current_width > 0 {
+            lines.push(std::mem::take(current));
+            *current_width = 0;
+        }
+        current.push(ch);
+        *current_width += char_width;
+    }
 }
 
 #[cfg(test)]
@@ -394,6 +428,10 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    fn diff_content_text(line: &Line<'static>) -> Option<String> {
+        line.spans.get(1).map(|span| span.content.to_string())
     }
 
     #[test]
@@ -449,5 +487,57 @@ diff --git a/src/a.rs b/src/a.rs
             text.iter().any(|line| line.contains(" - old")),
             "deleted line should carry - gutter: {text:?}"
         );
+    }
+
+    #[test]
+    fn wrap_text_preserves_leading_whitespace_without_extra_space() {
+        assert_eq!(wrap_text("    let y = 2;", 80), vec!["    let y = 2;"]);
+        assert_eq!(
+            wrap_text("        println!(\"hello\");", 80),
+            vec!["        println!(\"hello\");"]
+        );
+    }
+
+    #[test]
+    fn render_diff_preserves_leading_whitespace_exactly() {
+        let diff = "\
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,3 @@
+ fn main() {
++    let y = 2;
++        println!(\"{y}\");
+ }
+";
+
+        let rendered = render_diff(diff, 80);
+        let content = rendered
+            .iter()
+            .filter_map(diff_content_text)
+            .collect::<Vec<_>>();
+
+        assert!(
+            content.iter().any(|line| line == "    let y = 2;"),
+            "added line should keep exact 4-space indent: {content:?}"
+        );
+        assert!(
+            content
+                .iter()
+                .any(|line| line == "        println!(\"{y}\");"),
+            "added line should keep exact 8-space indent: {content:?}"
+        );
+    }
+
+    #[test]
+    fn wrap_text_breaks_overlong_cjk_runs() {
+        let text = "这是一个非常长的中文字符串".repeat(10);
+        let lines = wrap_text(&text, 16);
+
+        for line in &lines {
+            assert!(line.width() <= 16, "line {line:?} exceeds width 16");
+        }
+
+        assert_eq!(lines.join(""), text);
     }
 }

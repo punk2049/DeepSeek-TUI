@@ -1,8 +1,6 @@
 #[cfg(feature = "web")]
 use std::net::SocketAddr;
 #[cfg(feature = "web")]
-use std::process::Command;
-#[cfg(feature = "web")]
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -58,21 +56,33 @@ pub struct SettingsSection {
     pub show_thinking: bool,
     pub show_tool_details: bool,
     pub locale: UiLocale,
+    pub theme: UiThemeValue,
     #[schemars(
         title = "Background color",
         description = "Main TUI background color as #RRGGBB"
     )]
     pub background_color: Option<String>,
+    pub bracketed_paste: bool,
     pub composer_density: ComposerDensityValue,
     pub composer_border: bool,
+    pub composer_vim_mode: ComposerVimModeValue,
+    #[schemars(range(min = 0))]
+    pub mention_menu_limit: usize,
+    pub mention_menu_behavior: MentionMenuBehaviorValue,
+    #[schemars(range(min = 0))]
+    pub mention_walk_depth: usize,
     pub transcript_spacing: TranscriptSpacingValue,
+    pub status_indicator: StatusIndicatorValue,
+    pub synchronized_output: SynchronizedOutputValue,
     pub default_mode: DefaultModeValue,
     #[schemars(range(min = 10, max = 50))]
     pub sidebar_width: u16,
     pub sidebar_focus: SidebarFocusValue,
+    pub context_panel: bool,
     #[schemars(range(min = 0))]
     pub max_history: usize,
     pub cost_currency: CostCurrencyValue,
+    pub prefer_external_pdftotext: bool,
     pub default_model: Option<String>,
 }
 
@@ -161,6 +171,23 @@ pub enum UiLocale {
     #[serde(rename = "pt-BR")]
     #[schemars(rename = "pt-BR")]
     PtBr,
+    #[serde(rename = "es-419")]
+    #[schemars(rename = "es-419")]
+    Es419,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum UiThemeValue {
+    System,
+    Dark,
+    Light,
+    Grayscale,
+    CatppuccinMocha,
+    TokyoNight,
+    Dracula,
+    GruvboxDark,
+    Matrix,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -169,6 +196,20 @@ pub enum ComposerDensityValue {
     Compact,
     Comfortable,
     Spacious,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerVimModeValue {
+    Normal,
+    Vim,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MentionMenuBehaviorValue {
+    Fuzzy,
+    Browser,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -198,11 +239,11 @@ pub enum CostCurrencyValue {
 #[serde(rename_all = "snake_case")]
 pub enum SidebarFocusValue {
     Auto,
-    Plan,
-    Todos,
+    Work,
     Tasks,
     Agents,
     Context,
+    Hidden,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -218,6 +259,22 @@ pub enum ReasoningEffortValue {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum StatusIndicatorValue {
+    Whale,
+    Dots,
+    Off,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SynchronizedOutputValue {
+    Auto,
+    On,
+    Off,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum StatusItemValue {
     Mode,
     Model,
@@ -226,17 +283,20 @@ pub enum StatusItemValue {
     Coherence,
     Agents,
     ReasoningReplay,
+    PrefixStability,
     Cache,
     ContextPercent,
     GitBranch,
     LastToolElapsed,
     RateLimit,
+    Tokens,
+    Balance,
 }
 
 pub fn parse_mode(arg: Option<&str>) -> Result<ConfigUiMode, String> {
     let raw = arg.unwrap_or("").trim();
     // Bare `/config` opens the legacy native modal — it matches the rest
-    // of the deepseek-tui navy chrome out of the box. Power users can
+    // of the codewhale-tui navy chrome out of the box. Power users can
     // opt into the schemaui-driven editor with `/config tui`, or the
     // browser surface with `/config web` (web feature only).
     if raw.is_empty() || raw.eq_ignore_ascii_case("native") {
@@ -273,15 +333,25 @@ pub fn build_document(app: &App, config: &Config) -> Result<ConfigUiDocument> {
             show_thinking: settings.show_thinking,
             show_tool_details: settings.show_tool_details,
             locale: UiLocale::from_setting(&settings.locale)?,
+            theme: UiThemeValue::from_setting(&settings.theme)?,
             background_color: settings.background_color.clone(),
+            bracketed_paste: settings.bracketed_paste,
             composer_density: settings.composer_density.as_str().into(),
             composer_border: settings.composer_border,
+            composer_vim_mode: settings.composer_vim_mode.as_str().into(),
+            mention_menu_limit: settings.mention_menu_limit,
+            mention_menu_behavior: settings.mention_menu_behavior.as_str().into(),
+            mention_walk_depth: settings.mention_walk_depth,
             transcript_spacing: settings.transcript_spacing.as_str().into(),
+            status_indicator: settings.status_indicator.as_str().into(),
+            synchronized_output: settings.synchronized_output.as_str().into(),
             default_mode: settings.default_mode.as_str().into(),
             sidebar_width: settings.sidebar_width_percent,
             sidebar_focus: settings.sidebar_focus.as_str().into(),
+            context_panel: settings.context_panel,
             max_history: settings.max_input_history,
             cost_currency: CostCurrencyValue::from_setting(&settings.cost_currency)?,
+            prefer_external_pdftotext: settings.prefer_external_pdftotext,
             default_model,
         },
         config: ConfigSection {
@@ -294,7 +364,7 @@ pub fn build_document(app: &App, config: &Config) -> Result<ConfigUiDocument> {
 
 pub fn build_schema() -> Value {
     let mut schema = serde_json::to_value(schema_for!(ConfigUiDocument)).expect("config ui schema");
-    schema["title"] = Value::String("DeepSeek TUI Config".to_string());
+    schema["title"] = Value::String("codewhale Config".to_string());
     schema["description"] =
         Value::String("Edit runtime and persisted TUI configuration.".to_string());
     schema
@@ -305,7 +375,7 @@ pub fn run_tui_editor(app: &App, config: &Config) -> Result<ConfigUiDocument> {
     let document = build_document(app, config)?;
     let value = SchemaUI::new(serde_json::to_value(document.clone())?)
         .with_schema(build_schema())
-        .with_title("DeepSeek TUI Config")
+        .with_title("codewhale Config")
         .with_description("Edit persisted settings and live runtime knobs.")
         .run(FrontendOptions::Tui(
             UiOptions::default()
@@ -323,7 +393,7 @@ pub async fn start_web_editor(app: &App, config: &Config) -> Result<WebConfigSes
     let initial = serde_json::to_value(build_document(app, config)?)?;
     let session = WebSessionBuilder::new(build_schema())
         .with_initial_data(initial)
-        .with_title("DeepSeek TUI Config")
+        .with_title("codewhale Config")
         .with_description("Save updates the browser draft. Exit commits changes back to the TUI.")
         .build()?;
     let bound = bind_session(session, ServeOptions::default()).await?;
@@ -335,7 +405,7 @@ pub async fn start_web_editor(app: &App, config: &Config) -> Result<WebConfigSes
         let poll_tx = tx.clone();
         let poll_url = format!("{url}/api/session");
         let poll_task = tokio::spawn(async move {
-            let client = reqwest::Client::new();
+            let client = crate::tls::reqwest_client();
             let mut last: Option<ConfigUiDocument> = Some(app_snapshot);
             loop {
                 tokio::time::sleep(Duration::from_millis(750)).await;
@@ -430,6 +500,7 @@ pub fn apply_document(
             bool_str(doc.settings.show_tool_details),
         ),
         ("locale", doc.settings.locale.as_setting()),
+        ("theme", doc.settings.theme.as_setting()),
         (
             "background_color",
             doc.settings
@@ -437,20 +508,50 @@ pub fn apply_document(
                 .as_deref()
                 .unwrap_or("default"),
         ),
+        ("bracketed_paste", bool_str(doc.settings.bracketed_paste)),
         (
             "composer_density",
             doc.settings.composer_density.as_setting(),
         ),
         ("composer_border", bool_str(doc.settings.composer_border)),
         (
+            "composer_vim_mode",
+            doc.settings.composer_vim_mode.as_setting(),
+        ),
+        (
+            "mention_menu_limit",
+            &doc.settings.mention_menu_limit.to_string(),
+        ),
+        (
+            "mention_menu_behavior",
+            doc.settings.mention_menu_behavior.as_setting(),
+        ),
+        (
+            "mention_walk_depth",
+            &doc.settings.mention_walk_depth.to_string(),
+        ),
+        (
             "transcript_spacing",
             doc.settings.transcript_spacing.as_setting(),
+        ),
+        (
+            "status_indicator",
+            doc.settings.status_indicator.as_setting(),
+        ),
+        (
+            "synchronized_output",
+            doc.settings.synchronized_output.as_setting(),
         ),
         ("default_mode", doc.settings.default_mode.as_setting()),
         ("sidebar_width", &doc.settings.sidebar_width.to_string()),
         ("sidebar_focus", doc.settings.sidebar_focus.as_setting()),
+        ("context_panel", bool_str(doc.settings.context_panel)),
         ("max_history", &doc.settings.max_history.to_string()),
         ("cost_currency", doc.settings.cost_currency.as_setting()),
+        (
+            "prefer_external_pdftotext",
+            bool_str(doc.settings.prefer_external_pdftotext),
+        ),
         ("mcp_config_path", doc.config.mcp_config_path.as_str()),
     ] {
         let result = commands::set_config_value(app, key, value, persist);
@@ -495,7 +596,7 @@ pub fn apply_document(
         app.status_items = new_status_items.clone();
         app.needs_redraw = true;
         if persist {
-            let path = commands::persist_status_items(&new_status_items)?;
+            let path = crate::config_persistence::persist_status_items(&new_status_items)?;
             notes.push(format!("status_items saved to {}", path.display()));
         } else {
             notes.push("status_items updated for this session".to_string());
@@ -529,36 +630,7 @@ pub fn parse_document(value: Value) -> Result<ConfigUiDocument> {
 
 #[cfg(feature = "web")]
 pub fn open_browser(url: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = Command::new("open");
-        command.arg(url);
-        command
-    };
-    #[cfg(target_os = "linux")]
-    let mut command = {
-        let mut command = Command::new("xdg-open");
-        command.arg(url);
-        command
-    };
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "start", "", url]);
-        command
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    return Err(anyhow::anyhow!(
-        "browser opening is unsupported on this platform"
-    ));
-
-    let status = command
-        .status()
-        .context("failed to launch browser command")?;
-    if !status.success() {
-        bail!("browser command exited with status {status}");
-    }
-    Ok(())
+    crate::utils::open_url(url)
 }
 
 fn validate_document(doc: &ConfigUiDocument) -> Result<()> {
@@ -613,7 +685,11 @@ fn apply_reasoning_effort(
     app.last_effective_reasoning_effort = None;
     app.update_model_compaction_budget();
     if persist {
-        commands::persist_root_string_key("reasoning_effort", effort.as_setting())?;
+        crate::config_persistence::persist_root_string_key(
+            app.config_path.as_deref(),
+            "reasoning_effort",
+            effort.as_setting(),
+        )?;
     }
     config.reasoning_effort = Some(effort.as_setting().to_string());
     Ok(())
@@ -641,6 +717,7 @@ impl UiLocale {
             Self::Ja => "ja",
             Self::ZhHans => "zh-Hans",
             Self::PtBr => "pt-BR",
+            Self::Es419 => "es-419",
         }
     }
 
@@ -651,8 +728,41 @@ impl UiLocale {
             Some("ja") => Ok(Self::Ja),
             Some("zh-Hans") => Ok(Self::ZhHans),
             Some("pt-BR") => Ok(Self::PtBr),
+            Some("es-419") => Ok(Self::Es419),
             Some(other) => bail!("unsupported locale '{other}'"),
             None => bail!("invalid locale '{value}'"),
+        }
+    }
+}
+
+impl UiThemeValue {
+    fn as_setting(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::Grayscale => "grayscale",
+            Self::CatppuccinMocha => "catppuccin-mocha",
+            Self::TokyoNight => "tokyo-night",
+            Self::Dracula => "dracula",
+            Self::GruvboxDark => "gruvbox-dark",
+            Self::Matrix => "matrix",
+        }
+    }
+
+    fn from_setting(value: &str) -> Result<Self> {
+        match crate::palette::normalize_theme_name(value) {
+            Some("system") => Ok(Self::System),
+            Some("dark") => Ok(Self::Dark),
+            Some("light") => Ok(Self::Light),
+            Some("grayscale") => Ok(Self::Grayscale),
+            Some("catppuccin-mocha") => Ok(Self::CatppuccinMocha),
+            Some("tokyo-night") => Ok(Self::TokyoNight),
+            Some("dracula") => Ok(Self::Dracula),
+            Some("gruvbox-dark") => Ok(Self::GruvboxDark),
+            Some("matrix") => Ok(Self::Matrix),
+            Some(other) => bail!("unsupported theme '{other}'"),
+            None => bail!("invalid theme '{value}'"),
         }
     }
 }
@@ -663,6 +773,42 @@ impl ComposerDensityValue {
             Self::Compact => "compact",
             Self::Comfortable => "comfortable",
             Self::Spacious => "spacious",
+        }
+    }
+}
+
+impl ComposerVimModeValue {
+    fn as_setting(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Vim => "vim",
+        }
+    }
+}
+
+impl From<&str> for ComposerVimModeValue {
+    fn from(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "vim" => Self::Vim,
+            _ => Self::Normal,
+        }
+    }
+}
+
+impl MentionMenuBehaviorValue {
+    fn as_setting(self) -> &'static str {
+        match self {
+            Self::Fuzzy => "fuzzy",
+            Self::Browser => "browser",
+        }
+    }
+}
+
+impl From<&str> for MentionMenuBehaviorValue {
+    fn from(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "browser" => Self::Browser,
+            _ => Self::Fuzzy,
         }
     }
 }
@@ -710,11 +856,11 @@ impl SidebarFocusValue {
     fn as_setting(self) -> &'static str {
         match self {
             Self::Auto => "auto",
-            Self::Plan => "plan",
-            Self::Todos => "todos",
+            Self::Work => "work",
             Self::Tasks => "tasks",
             Self::Agents => "agents",
             Self::Context => "context",
+            Self::Hidden => "hidden",
         }
     }
 }
@@ -798,15 +944,61 @@ impl From<&str> for DefaultModeValue {
     }
 }
 
+impl StatusIndicatorValue {
+    fn as_setting(self) -> &'static str {
+        match self {
+            Self::Whale => "whale",
+            Self::Dots => "dots",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl SynchronizedOutputValue {
+    fn as_setting(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl From<&str> for SynchronizedOutputValue {
+    fn from(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "on" | "true" | "yes" | "1" | "enabled" => Self::On,
+            "off" | "false" | "no" | "0" | "disabled" => Self::Off,
+            _ => Self::Auto,
+        }
+    }
+}
+
+impl From<&str> for StatusIndicatorValue {
+    fn from(value: &str) -> Self {
+        // Permissive aliases mirror `Settings::normalize_status_indicator`,
+        // so a TOML file with `status_indicator = "🐳"` or `"none"`
+        // resolves to the canonical enum variant.
+        match value.trim().to_ascii_lowercase().as_str() {
+            "dots" | "dot" => Self::Dots,
+            "off" | "none" | "hidden" | "false" => Self::Off,
+            // Default to whale for "whale", aliases, and anything unknown
+            // (we'd rather restore the historic indicator than silently
+            // hide it on a typo).
+            _ => Self::Whale,
+        }
+    }
+}
+
 impl From<&str> for SidebarFocusValue {
     fn from(value: &str) -> Self {
         match SidebarFocus::from_setting(value) {
             SidebarFocus::Auto => Self::Auto,
-            SidebarFocus::Plan => Self::Plan,
-            SidebarFocus::Todos => Self::Todos,
+            SidebarFocus::Work => Self::Work,
             SidebarFocus::Tasks => Self::Tasks,
             SidebarFocus::Agents => Self::Agents,
             SidebarFocus::Context => Self::Context,
+            SidebarFocus::Hidden => Self::Hidden,
         }
     }
 }
@@ -821,11 +1013,14 @@ impl From<StatusItem> for StatusItemValue {
             StatusItem::Coherence => Self::Coherence,
             StatusItem::Agents => Self::Agents,
             StatusItem::ReasoningReplay => Self::ReasoningReplay,
+            StatusItem::PrefixStability => Self::PrefixStability,
             StatusItem::Cache => Self::Cache,
             StatusItem::ContextPercent => Self::ContextPercent,
             StatusItem::GitBranch => Self::GitBranch,
             StatusItem::LastToolElapsed => Self::LastToolElapsed,
             StatusItem::RateLimit => Self::RateLimit,
+            StatusItem::Tokens => Self::Tokens,
+            StatusItem::Balance => Self::Balance,
         }
     }
 }
@@ -840,11 +1035,14 @@ impl From<StatusItemValue> for StatusItem {
             StatusItemValue::Coherence => Self::Coherence,
             StatusItemValue::Agents => Self::Agents,
             StatusItemValue::ReasoningReplay => Self::ReasoningReplay,
+            StatusItemValue::PrefixStability => Self::PrefixStability,
             StatusItemValue::Cache => Self::Cache,
             StatusItemValue::ContextPercent => Self::ContextPercent,
             StatusItemValue::GitBranch => Self::GitBranch,
             StatusItemValue::LastToolElapsed => Self::LastToolElapsed,
             StatusItemValue::RateLimit => Self::RateLimit,
+            StatusItemValue::Tokens => Self::Tokens,
+            StatusItemValue::Balance => Self::Balance,
         }
     }
 }
@@ -856,7 +1054,7 @@ fn bool_str(value: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{ApiProvider, Config};
     use crate::test_support::lock_test_env;
     use crate::tui::app::{App, TuiOptions};
     use std::fs;
@@ -879,13 +1077,24 @@ mod tests {
             notes_path: PathBuf::from("notes.txt"),
             mcp_config_path: PathBuf::from("mcp.json"),
             use_memory: false,
-            start_in_agent_mode: false,
+            // Keep this fixture independent from the developer's saved
+            // `default_mode` setting.
+            start_in_agent_mode: true,
             skip_onboarding: true,
             yolo: false,
             resume_session_id: None,
             initial_input: None,
         };
-        App::new(options, &Config::default())
+        let mut app = App::new(options, &Config::default());
+        // App::new merges developer-local settings, which can include a saved
+        // provider/model from the interactive TUI. Keep these config UI tests
+        // pinned to DeepSeek defaults so they only exercise document apply
+        // semantics.
+        app.model = "deepseek-v4-pro".to_string();
+        app.auto_model = false;
+        app.api_provider = ApiProvider::Deepseek;
+        app.model_ids_passthrough = false;
+        app
     }
 
     #[test]
@@ -909,7 +1118,7 @@ mod tests {
             .expect("clock")
             .as_nanos();
         let temp_root = std::env::temp_dir().join(format!(
-            "deepseek-config-ui-cost-currency-{}-{}",
+            "codewhale-config-ui-cost-currency-{}-{}",
             std::process::id(),
             nanos
         ));
@@ -953,7 +1162,7 @@ cost_currency = "cny"
             .expect("clock")
             .as_nanos();
         let temp_root = std::env::temp_dir().join(format!(
-            "deepseek-config-ui-background-color-{}-{}",
+            "codewhale-config-ui-background-color-{}-{}",
             std::process::id(),
             nanos
         ));
@@ -998,7 +1207,22 @@ background_color = "#1A1B26"
         let locale = &schema["$defs"]["UiLocale"]["enum"];
         assert_eq!(
             locale,
-            &serde_json::json!(["auto", "en", "ja", "zh-Hans", "pt-BR"])
+            &serde_json::json!(["auto", "en", "ja", "zh-Hans", "pt-BR", "es-419"])
+        );
+        let theme = &schema["$defs"]["UiThemeValue"]["enum"];
+        assert_eq!(
+            theme,
+            &serde_json::json!([
+                "system",
+                "dark",
+                "light",
+                "grayscale",
+                "catppuccin-mocha",
+                "tokyo-night",
+                "dracula",
+                "gruvbox-dark",
+                "matrix"
+            ])
         );
     }
 
@@ -1021,7 +1245,7 @@ background_color = "#1A1B26"
             .expect("clock")
             .as_nanos();
         let temp_root = std::env::temp_dir().join(format!(
-            "deepseek-config-ui-session-only-{}-{}",
+            "codewhale-config-ui-session-only-{}-{}",
             std::process::id(),
             nanos
         ));

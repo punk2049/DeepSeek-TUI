@@ -48,22 +48,41 @@ impl Engine {
                 .with_diagnostics_tool()
                 .with_skill_tools()
                 .with_validation_tools()
-                .with_runtime_task_tools()
+                .with_handle_tools()
+                .with_runtime_read_only_task_tools()
                 .with_todo_tool(todo_list)
                 .with_plan_tool(plan_state)
+                .with_goal_tools(self.config.goal_state.clone())
         } else {
             ToolRegistryBuilder::new()
                 .with_agent_tools(self.session.allow_shell)
                 .with_todo_tool(todo_list)
                 .with_plan_tool(plan_state)
+                .with_goal_tools(self.config.goal_state.clone())
         };
 
         builder = builder
             .with_review_tool(self.deepseek_client.clone(), self.session.model.clone())
-            .with_rlm_tool(self.deepseek_client.clone(), self.session.model.clone())
-            .with_fim_tool(self.deepseek_client.clone(), self.session.model.clone())
             .with_user_input_tool()
             .with_parallel_tool();
+
+        // SlopLedger: plan mode only gets read-only query + export,
+        // agent/yolo get the full set including append + update.
+        builder = if mode == AppMode::Plan {
+            builder.with_slop_ledger_read_only_tools()
+        } else {
+            builder.with_slop_ledger_tools()
+        };
+
+        if mode != AppMode::Plan {
+            builder = builder
+                .with_rlm_tool(self.deepseek_client.clone(), self.session.model.clone())
+                .with_fim_tool(self.deepseek_client.clone(), self.session.model.clone())
+                .with_speech_tools(
+                    self.deepseek_client.clone(),
+                    self.config.speech_output_dir.clone(),
+                );
+        }
 
         if self.config.features.enabled(Feature::ApplyPatch) && mode != AppMode::Plan {
             builder = builder.with_patch_tools();
@@ -71,11 +90,9 @@ impl Engine {
         if self.config.features.enabled(Feature::WebSearch) {
             builder = builder.with_web_tools();
         }
-        // Plan mode keeps shell available when the session allows it; command
-        // safety and approval checks still gate risky commands.
-        if self.config.features.enabled(Feature::ShellTool) && self.session.allow_shell {
-            builder = builder.with_shell_tools();
-        }
+        // Shell tools (exec_shell, task_shell_start, etc.) are already gated
+        // behind `allow_shell` inside `with_agent_tools`. No separate
+        // feature-flag gate here to avoid double-registration.
 
         // Register the `remember` tool only when the user has opted in to
         // user-memory (#489). Without that opt-in the tool would always
@@ -83,6 +100,19 @@ impl Engine {
         if self.config.memory_enabled {
             builder = builder.with_remember_tool();
         }
+
+        // Register image_analyze tool when vision_model is configured and feature enabled.
+        if self.config.features.enabled(Feature::VisionModel)
+            && let Some(ref vision_config) = self.config.vision_config
+        {
+            builder = builder.with_vision_tools(vision_config.clone());
+        }
+
+        // Register the `notify` tool unconditionally (#1322). It has no
+        // side effects beyond a single terminal escape write and respects
+        // the user's `[notifications].method` config (including `off`),
+        // so there's no failure mode worth gating on.
+        builder = builder.with_notify_tool();
 
         builder
     }

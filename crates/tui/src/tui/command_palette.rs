@@ -6,7 +6,6 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    prelude::Stylize,
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Padding, Paragraph, Widget, Wrap},
@@ -16,7 +15,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::commands;
 use crate::localization::Locale;
 use crate::palette;
-use crate::skills::SkillRegistry;
+use crate::skills;
 use crate::tools::spec::ApprovalRequirement;
 use crate::tools::spec::ToolCapability;
 use crate::tools::{ToolContext, ToolRegistryBuilder};
@@ -24,6 +23,7 @@ use crate::tui::views::{CommandPaletteAction, ModalKind, ModalView, ViewAction, 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum PaletteSection {
+    Action,
     Command,
     Skill,
     Tool,
@@ -79,7 +79,7 @@ pub fn build_entries(
         });
     }
 
-    let skills = SkillRegistry::discover(skills_dir);
+    let skills = skills::discover_for_workspace_and_dir(workspace, skills_dir);
     for skill in skills.list() {
         entries.push(CommandPaletteEntry {
             section: PaletteSection::Skill,
@@ -162,7 +162,7 @@ pub fn build_entries(
     tool_entries.sort_by(|a, b| a.label.cmp(&b.label));
     entries.extend(tool_entries);
 
-    entries.extend(build_mcp_entries(mcp_config_path, mcp_snapshot));
+    entries.extend(build_mcp_entries(workspace, mcp_config_path, mcp_snapshot));
 
     entries.sort_by(|a, b| a.label.cmp(&b.label));
     entries.sort_by_key(|entry| entry.section);
@@ -170,11 +170,13 @@ pub fn build_entries(
 }
 
 fn build_mcp_entries(
+    workspace: &Path,
     mcp_config_path: &Path,
     mcp_snapshot: Option<&crate::mcp::McpManagerSnapshot>,
 ) -> Vec<CommandPaletteEntry> {
     let owned_snapshot = if mcp_snapshot.is_none() {
-        crate::mcp::manager_snapshot_from_config(mcp_config_path, false).ok()
+        crate::mcp::manager_snapshot_from_config_with_workspace(mcp_config_path, workspace, false)
+            .ok()
     } else {
         None
     };
@@ -257,7 +259,7 @@ fn build_mcp_entries(
                         tool.model_name,
                         tool.description
                             .as_ref()
-                            .map_or(String::new(), |desc| format!(" ({})", desc))
+                            .map_or(String::new(), |desc| format!(" ({desc})"))
                     ),
                     command: tool.model_name.clone(),
                     action: CommandPaletteAction::InsertText {
@@ -364,6 +366,7 @@ fn parse_section_term(term: &str) -> Option<(PaletteSection, String)> {
 
     let query = query.to_ascii_lowercase();
     let section = match section {
+        "a" | "action" | "actions" => PaletteSection::Action,
         "c" | "cmd" | "command" | "commands" => PaletteSection::Command,
         "s" | "skill" | "skills" => PaletteSection::Skill,
         "t" | "tool" | "tools" => PaletteSection::Tool,
@@ -376,6 +379,7 @@ fn parse_section_term(term: &str) -> Option<(PaletteSection, String)> {
 
 fn section_tag(section: PaletteSection) -> &'static str {
     match section {
+        PaletteSection::Action => "action",
         PaletteSection::Command => "command",
         PaletteSection::Skill => "skill",
         PaletteSection::Tool => "tool",
@@ -385,10 +389,11 @@ fn section_tag(section: PaletteSection) -> &'static str {
 
 fn section_rank(section: PaletteSection) -> usize {
     match section {
-        PaletteSection::Command => 0,
-        PaletteSection::Skill => 1,
-        PaletteSection::Tool => 2,
-        PaletteSection::Mcp => 3,
+        PaletteSection::Action => 0,
+        PaletteSection::Command => 1,
+        PaletteSection::Skill => 2,
+        PaletteSection::Tool => 3,
+        PaletteSection::Mcp => 4,
     }
 }
 
@@ -416,6 +421,7 @@ fn command_runs_directly(name: &str) -> bool {
             | "trust"
             | "logout"
             | "tokens"
+            | "change"
             | "system"
             | "context"
             | "undo"
@@ -518,6 +524,72 @@ fn entry_match_score(entry: &CommandPaletteEntry, terms: &[&str]) -> Option<usiz
     Some(total_score)
 }
 
+/// Number of rendered rows the entry loop consumes for the window
+/// `sections[start..end]`: one row per entry, plus one section-label row each
+/// time the section changes, plus a separator blank before every section group
+/// after the first.
+fn rendered_entry_rows(sections: &[PaletteSection], start: usize, end: usize) -> usize {
+    let end = end.min(sections.len());
+    if start >= end {
+        return 0;
+    }
+    let mut rows = 0usize;
+    let mut active: Option<PaletteSection> = None;
+    for (slot, sec) in sections[start..end].iter().enumerate() {
+        if active != Some(*sec) {
+            if slot > 0 {
+                rows += 1; // separator blank
+            }
+            rows += 1; // section label
+            active = Some(*sec);
+        }
+        rows += 1; // the entry itself
+    }
+    rows
+}
+
+/// Compute the `[start, end)` window of filtered entries to render so that the
+/// selected entry is always visible and the rendered rows — entries plus the
+/// per-section labels and separators inserted between them — fit within
+/// `available` rows.
+///
+/// The previous logic sized the window purely by entry count (`popup_height -
+/// 7`) while the same fixed-height area also held the header, section labels,
+/// and separators. Those uncounted rows pushed the selection past the bottom
+/// clip line, so it vanished and the list appeared frozen until the index
+/// finally exceeded the (overlarge) entry budget (#2590).
+fn visible_entry_window(
+    sections: &[PaletteSection],
+    selected: usize,
+    available: usize,
+) -> (usize, usize) {
+    let total = sections.len();
+    if total == 0 || available == 0 {
+        return (0, 0);
+    }
+    let selected = selected.min(total - 1);
+    // Always include the selected row, then greedily grow downward and upward
+    // while the fully-rendered window still fits. Growth only ever adds rows,
+    // so the greedy expansion terminates at the largest fitting window.
+    let mut start = selected;
+    let mut end = selected + 1;
+    loop {
+        let mut progressed = false;
+        if end < total && rendered_entry_rows(sections, start, end + 1) <= available {
+            end += 1;
+            progressed = true;
+        }
+        if start > 0 && rendered_entry_rows(sections, start - 1, end) <= available {
+            start -= 1;
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+    (start, end)
+}
+
 impl CommandPaletteView {
     pub fn new(entries: Vec<CommandPaletteEntry>) -> Self {
         let mut view = Self {
@@ -566,6 +638,7 @@ impl CommandPaletteView {
 
     fn format_section_label(section: PaletteSection, count: usize) -> Line<'static> {
         let title = match section {
+            PaletteSection::Action => "Actions",
             PaletteSection::Command => "Commands",
             PaletteSection::Skill => "Skills",
             PaletteSection::Tool => "Tools",
@@ -639,11 +712,19 @@ impl ModalView for CommandPaletteView {
                     ViewAction::None
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 self.move_selection(-1);
                 ViewAction::None
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
+                self.move_selection(1);
+                ViewAction::None
+            }
+            KeyCode::Char('k') if self.query.is_empty() => {
+                self.move_selection(-1);
+                ViewAction::None
+            }
+            KeyCode::Char('j') if self.query.is_empty() => {
                 self.move_selection(1);
                 ViewAction::None
             }
@@ -656,6 +737,15 @@ impl ModalView for CommandPaletteView {
                 ViewAction::None
             }
             KeyCode::Backspace => {
+                self.query.pop();
+                self.refilter();
+                ViewAction::None
+            }
+            // Ctrl+H is the legacy ASCII backspace many terminals emit.
+            KeyCode::Char('h')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
                 self.query.pop();
                 self.refilter();
                 ViewAction::None
@@ -706,13 +796,22 @@ impl ModalView for CommandPaletteView {
         lines.extend(Self::scope_examples());
         lines.push(Line::from(""));
 
-        let visible = popup_height.saturating_sub(7) as usize;
+        // Rows the bordered popup can show for the list, minus the header that
+        // was already pushed above. The entry loop additionally emits section
+        // labels and separators, so the scroll window is sized against the real
+        // rendered cost rather than a flat entry count (#2590).
+        let header_lines = lines.len();
+        let available = (popup_height as usize)
+            .saturating_sub(2) // top + bottom border
+            .saturating_sub(header_lines);
+        let mut action_count = 0usize;
         let mut command_count = 0usize;
         let mut skill_count = 0usize;
         let mut tool_count = 0usize;
         let mut mcp_count = 0usize;
         for idx in &self.filtered {
             match self.entries[*idx].section {
+                PaletteSection::Action => action_count += 1,
                 PaletteSection::Command => command_count += 1,
                 PaletteSection::Skill => skill_count += 1,
                 PaletteSection::Tool => tool_count += 1,
@@ -726,8 +825,12 @@ impl ModalView for CommandPaletteView {
             )));
         } else {
             let label_width = 24.min(popup_width.saturating_sub(26) as usize);
-            let start = self.selected.saturating_sub(visible.saturating_sub(1));
-            let end = (start + visible).min(self.filtered.len());
+            let sections: Vec<PaletteSection> = self
+                .filtered
+                .iter()
+                .map(|idx| self.entries[*idx].section)
+                .collect();
+            let (start, end) = visible_entry_window(&sections, self.selected, available);
             let mut active_section = None;
             for (slot, idx) in self.filtered[start..end].iter().enumerate() {
                 let absolute = start + slot;
@@ -739,6 +842,7 @@ impl ModalView for CommandPaletteView {
                         lines.push(Line::from(""));
                     }
                     let count = match entry.section {
+                        PaletteSection::Action => action_count,
                         PaletteSection::Command => command_count,
                         PaletteSection::Skill => skill_count,
                         PaletteSection::Tool => tool_count,
@@ -798,6 +902,65 @@ impl ModalView for CommandPaletteView {
 mod tests {
     use super::*;
     use std::path::Path;
+    use tempfile::TempDir;
+
+    #[test]
+    fn visible_window_keeps_selection_in_view_and_fits() {
+        // Single large section, small budget: every selection must stay visible
+        // and the rendered window must fit the available rows (#2590).
+        let sections = vec![PaletteSection::Command; 30];
+        let available = 10;
+        for selected in 0..sections.len() {
+            let (start, end) = visible_entry_window(&sections, selected, available);
+            assert!(
+                start <= selected && selected < end,
+                "selected {selected} must lie within [{start}, {end})"
+            );
+            assert!(
+                rendered_entry_rows(&sections, start, end) <= available,
+                "window [{start}, {end}) must fit within {available} rows"
+            );
+        }
+    }
+
+    #[test]
+    fn visible_window_scrolls_as_selection_advances() {
+        let sections = vec![PaletteSection::Command; 30];
+        let available = 8;
+        let (start_near, _) = visible_entry_window(&sections, 0, available);
+        assert_eq!(start_near, 0);
+        // A far-down selection must advance the window start — the old code
+        // left it pinned at 0 so the selection scrolled off-screen.
+        let (start_far, end_far) = visible_entry_window(&sections, 25, available);
+        assert!(start_far > 0, "window should scroll for a far selection");
+        assert!(start_far <= 25 && 25 < end_far);
+    }
+
+    #[test]
+    fn visible_window_accounts_for_section_overhead() {
+        // Each entry is its own section, so each costs a label (plus a
+        // separator after the first) on top of the entry row. Far fewer than
+        // `available` entries fit, and the window must still respect the budget.
+        let sections = vec![
+            PaletteSection::Action,
+            PaletteSection::Command,
+            PaletteSection::Skill,
+            PaletteSection::Tool,
+            PaletteSection::Mcp,
+        ];
+        let available = 6;
+        let (start, end) = visible_entry_window(&sections, 0, available);
+        assert_eq!(start, 0);
+        assert!(end >= 1, "at least the selected entry must render");
+        assert!(rendered_entry_rows(&sections, start, end) <= available);
+    }
+
+    #[test]
+    fn visible_window_handles_empty_and_zero_budget() {
+        assert_eq!(visible_entry_window(&[], 0, 10), (0, 0));
+        let sections = vec![PaletteSection::Command; 5];
+        assert_eq!(visible_entry_window(&sections, 2, 0), (0, 0));
+    }
 
     fn palette_entry(
         section: PaletteSection,
@@ -819,7 +982,7 @@ mod tests {
     #[test]
     fn command_palette_filters_with_section_shortcuts() {
         let entries = vec![
-            palette_entry(PaletteSection::Command, "/agent", "agent command", "/agent"),
+            palette_entry(PaletteSection::Command, "/mode", "mode command", "/mode"),
             palette_entry(
                 PaletteSection::Skill,
                 "skill:search",
@@ -837,7 +1000,7 @@ mod tests {
         ];
         let mut view = CommandPaletteView::new(entries);
 
-        view.query = "c:agent".to_string();
+        view.query = "c:mode".to_string();
         view.refilter();
         assert_eq!(view.filtered, vec![0]);
 
@@ -921,6 +1084,47 @@ mod tests {
     }
 
     #[test]
+    fn command_palette_skills_use_workspace_and_configured_directories() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        let workspace_skill_dir = workspace
+            .join(".agents")
+            .join("skills")
+            .join("workspace-skill");
+        std::fs::create_dir_all(&workspace_skill_dir).expect("create workspace skill dir");
+        std::fs::write(
+            workspace_skill_dir.join("SKILL.md"),
+            "---\nname: workspace-skill\ndescription: Workspace skill\ngithub: https://example.com\n---\nbody",
+        )
+        .expect("write workspace skill");
+
+        let configured_dir = tmp.path().join("configured-skills");
+        let configured_skill_dir = configured_dir.join("configured-skill");
+        std::fs::create_dir_all(&configured_skill_dir).expect("create configured skill dir");
+        std::fs::write(
+            configured_skill_dir.join("SKILL.md"),
+            "---\nname: configured-skill\ndescription: Configured skill\n---\nbody",
+        )
+        .expect("write configured skill");
+
+        let entries = build_entries(
+            Locale::En,
+            configured_dir.as_path(),
+            workspace.as_path(),
+            Path::new("mcp.json"),
+            None,
+        );
+        let skill_labels = entries
+            .iter()
+            .filter(|entry| entry.section == PaletteSection::Skill)
+            .map(|entry| entry.label.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(skill_labels.contains(&"skill:workspace-skill"));
+        assert!(skill_labels.contains(&"skill:configured-skill"));
+    }
+
+    #[test]
     fn command_palette_command_entries_include_links_and_config_but_not_removed_commands() {
         let entries = build_entries(
             Locale::En,
@@ -937,8 +1141,61 @@ mod tests {
 
         assert!(command_labels.contains(&"/config"));
         assert!(command_labels.contains(&"/links"));
+        assert!(!command_labels.contains(&"/voice"));
         assert!(!command_labels.contains(&"/set"));
         assert!(!command_labels.contains(&"/deepseek"));
+    }
+
+    #[test]
+    fn command_palette_has_one_entry_for_every_registered_command() {
+        let tmp = TempDir::new().expect("tempdir");
+        let skills_dir = tmp.path().join("skills");
+        let mcp_config_path = tmp.path().join("mcp.json");
+        let entries = build_entries(
+            Locale::En,
+            skills_dir.as_path(),
+            tmp.path(),
+            mcp_config_path.as_path(),
+            None,
+        );
+
+        let command_entries = entries
+            .iter()
+            .filter(|entry| entry.section == PaletteSection::Command)
+            .collect::<Vec<_>>();
+        assert_eq!(command_entries.len(), commands::COMMANDS.len());
+
+        for command in commands::COMMANDS {
+            let label = format!("/{}", command.name);
+            let matching = command_entries
+                .iter()
+                .filter(|entry| entry.label == label)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matching.len(),
+                1,
+                "expected one palette entry for /{}",
+                command.name
+            );
+
+            let entry = matching[0];
+            assert_eq!(entry.command, command.palette_command());
+            assert!(
+                entry
+                    .description
+                    .contains(command.description_for(Locale::En)),
+                "/{} palette description should include command help text",
+                command.name
+            );
+            if command.requires_argument() {
+                assert!(
+                    entry.description.contains(command.usage),
+                    "/{} palette description should include usage {:?}",
+                    command.name,
+                    command.usage
+                );
+            }
+        }
     }
 
     #[test]
@@ -959,6 +1216,26 @@ mod tests {
         assert!(matches!(
             &model.action,
             CommandPaletteAction::InsertText { text } if text == "/model "
+        ));
+    }
+
+    #[test]
+    fn command_palette_runs_change_without_requiring_version() {
+        let entries = build_entries(
+            Locale::En,
+            Path::new("."),
+            Path::new("."),
+            Path::new("mcp.json"),
+            None,
+        );
+        let change = entries
+            .iter()
+            .find(|entry| entry.section == PaletteSection::Command && entry.label == "/change")
+            .expect("change command entry");
+
+        assert!(matches!(
+            &change.action,
+            CommandPaletteAction::ExecuteCommand { command } if command == "/change"
         ));
     }
 

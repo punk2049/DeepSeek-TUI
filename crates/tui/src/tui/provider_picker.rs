@@ -21,12 +21,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
 
-use crate::config::{ApiProvider, Config, has_api_key_for};
+use crate::config::{ApiProvider, Config, has_api_key_for, kimi_cli_credentials_present};
 use crate::palette;
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
 
@@ -65,13 +65,23 @@ impl ProviderPickerView {
     }
 
     fn move_up(&mut self) {
-        if self.selected_idx > 0 {
+        if self.providers.is_empty() {
+            return;
+        }
+        if self.selected_idx == 0 {
+            self.selected_idx = self.providers.len() - 1;
+        } else {
             self.selected_idx -= 1;
         }
     }
 
     fn move_down(&mut self) {
-        if self.selected_idx + 1 < self.providers.len() {
+        if self.providers.is_empty() {
+            return;
+        }
+        if self.selected_idx + 1 == self.providers.len() {
+            self.selected_idx = 0;
+        } else {
             self.selected_idx += 1;
         }
     }
@@ -84,22 +94,45 @@ impl ProviderPickerView {
         self.providers[self.selected_idx].1
     }
 
+    fn enter_key_entry(&mut self) {
+        self.stage = Stage::KeyEntry;
+        self.api_key_input.clear();
+    }
+
     fn env_var_for(provider: ApiProvider) -> &'static str {
         match provider {
             ApiProvider::Deepseek | ApiProvider::DeepseekCN => "DEEPSEEK_API_KEY",
             ApiProvider::NvidiaNim => "NVIDIA_API_KEY",
             ApiProvider::Openai => "OPENAI_API_KEY",
+            ApiProvider::Anthropic => "ANTHROPIC_API_KEY",
+            ApiProvider::Atlascloud => "ATLASCLOUD_API_KEY",
+            ApiProvider::WanjieArk => "WANJIE_ARK_API_KEY",
+            ApiProvider::Volcengine => "VOLCENGINE_API_KEY",
             ApiProvider::Openrouter => "OPENROUTER_API_KEY",
+            ApiProvider::XiaomiMimo => "XIAOMI_MIMO_API_KEY / XIAOMI_API_KEY / MIMO_API_KEY",
             ApiProvider::Novita => "NOVITA_API_KEY",
             ApiProvider::Fireworks => "FIREWORKS_API_KEY",
+            ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => "SILICONFLOW_API_KEY",
+            ApiProvider::Arcee => "ARCEE_API_KEY",
+            ApiProvider::Moonshot => "MOONSHOT_API_KEY / KIMI_API_KEY",
             ApiProvider::Sglang => "SGLANG_API_KEY",
             ApiProvider::Vllm => "VLLM_API_KEY",
             ApiProvider::Ollama => "OLLAMA_API_KEY",
+            ApiProvider::Huggingface => "HUGGINGFACE_API_KEY / HF_TOKEN",
+            ApiProvider::Together => "TOGETHER_API_KEY",
+            ApiProvider::OpenaiCodex => "OPENAI_CODEX_ACCESS_TOKEN / CODEX_ACCESS_TOKEN",
         }
     }
 
     fn provider_hint(provider: ApiProvider, has_key: bool) -> String {
         match provider {
+            ApiProvider::Moonshot if kimi_cli_credentials_present() => {
+                "(Kimi CLI OAuth ready)".to_string()
+            }
+            ApiProvider::XiaomiMimo if has_key => "(configured; token-plan endpoint)".to_string(),
+            ApiProvider::XiaomiMimo => {
+                "(needs API key; token-plan endpoint by default)".to_string()
+            }
             ApiProvider::Ollama => "self-hosted; defaults to http://localhost:11434".to_string(),
             ApiProvider::Sglang | ApiProvider::Vllm if has_key => {
                 "(configured; optional key)".to_string()
@@ -110,7 +143,34 @@ impl ProviderPickerView {
         }
     }
 
+    fn visible_start(&self, visible_rows: usize) -> usize {
+        if visible_rows == 0 {
+            return 0;
+        }
+        let max_start = self.providers.len().saturating_sub(visible_rows);
+        self.selected_idx
+            .saturating_add(1)
+            .saturating_sub(visible_rows)
+            .min(max_start)
+    }
+
+    fn selected_row_style(fg: Color) -> Style {
+        Style::default()
+            .fg(fg)
+            .bg(palette::SURFACE_ELEVATED)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    fn selected_row_bg_style() -> Style {
+        Style::default().bg(palette::SURFACE_ELEVATED)
+    }
+
     fn render_list(&self, area: Rect, buf: &mut Buffer) {
+        let enter_action = if self.selected_has_key() {
+            "apply"
+        } else {
+            "set key"
+        };
         let outer = Block::default()
             .title(Line::from(Span::styled(
                 " Provider ",
@@ -122,7 +182,9 @@ impl ProviderPickerView {
                 Span::styled(" ↑↓ ", Style::default().fg(palette::TEXT_MUTED)),
                 Span::raw("move "),
                 Span::styled(" Enter ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("apply "),
+                Span::raw(format!("{enter_action} ")),
+                Span::styled(" R ", Style::default().fg(palette::TEXT_MUTED)),
+                Span::raw("edit key "),
                 Span::styled(" Esc ", Style::default().fg(palette::TEXT_MUTED)),
                 Span::raw("cancel "),
             ]))
@@ -132,39 +194,64 @@ impl ProviderPickerView {
         let inner = outer.inner(area);
         outer.render(area, buf);
 
-        let mut lines: Vec<Line> = Vec::with_capacity(self.providers.len());
-        for (idx, (provider, has_key)) in self.providers.iter().enumerate() {
+        let visible_rows = usize::from(inner.height);
+        let visible_start = self.visible_start(visible_rows);
+        let mut lines: Vec<Line> = Vec::with_capacity(visible_rows);
+        for (idx, (provider, has_key)) in self
+            .providers
+            .iter()
+            .enumerate()
+            .skip(visible_start)
+            .take(visible_rows)
+        {
             let is_selected = idx == self.selected_idx;
             let is_active = *provider == self.active_provider;
             let arrow = if is_selected { "▸" } else { " " };
             let active_dot = if is_active { " *" } else { "  " };
-            let label_style = if is_selected {
+            let spacer_style = if is_selected {
+                Self::selected_row_bg_style()
+            } else {
                 Style::default()
-                    .fg(palette::SELECTION_TEXT)
-                    .bg(palette::SELECTION_BG)
-                    .add_modifier(Modifier::BOLD)
+            };
+            let label_style = if is_selected {
+                Self::selected_row_style(palette::TEXT_PRIMARY)
             } else {
                 Style::default().fg(palette::TEXT_PRIMARY)
             };
             let hint_style = if is_selected {
-                Style::default()
-                    .fg(palette::SELECTION_TEXT)
-                    .bg(palette::SELECTION_BG)
+                let hint_fg = if *has_key {
+                    palette::TEXT_MUTED
+                } else {
+                    palette::STATUS_WARNING
+                };
+                Self::selected_row_style(hint_fg)
             } else if *has_key {
                 Style::default().fg(palette::TEXT_MUTED)
             } else {
                 Style::default().fg(palette::STATUS_WARNING)
             };
             let hint = Self::provider_hint(*provider, *has_key);
-            lines.push(Line::from(vec![
-                Span::raw(" "),
+            let mut line = Line::from(vec![
+                Span::styled(" ", spacer_style),
                 Span::styled(arrow, label_style),
-                Span::raw(" "),
+                Span::styled(" ", spacer_style),
                 Span::styled(provider.display_name().to_string(), label_style),
                 Span::styled(active_dot, label_style),
-                Span::raw("  "),
+                Span::styled("  ", spacer_style),
                 Span::styled(hint, hint_style),
-            ]));
+            ]);
+            if is_selected {
+                line.style = Self::selected_row_bg_style();
+                let target_width = usize::from(inner.width);
+                let line_width = line.width();
+                if line_width < target_width {
+                    line.spans.push(Span::styled(
+                        " ".repeat(target_width - line_width),
+                        Self::selected_row_bg_style(),
+                    ));
+                }
+            }
+            lines.push(line);
         }
         Paragraph::new(lines).render(inner, buf);
     }
@@ -285,11 +372,18 @@ impl ModalView for ProviderPickerView {
                     let provider = self.selected_provider();
                     if self.selected_has_key() {
                         ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied { provider })
+                    } else if provider == ApiProvider::Moonshot && kimi_cli_credentials_present() {
+                        ViewAction::EmitAndClose(ViewEvent::ProviderPickerKimiOAuthEnabled {
+                            provider,
+                        })
                     } else {
-                        self.stage = Stage::KeyEntry;
-                        self.api_key_input.clear();
+                        self.enter_key_entry();
                         ViewAction::None
                     }
+                }
+                KeyCode::Char(c) if key.modifiers.is_empty() && c.eq_ignore_ascii_case(&'r') => {
+                    self.enter_key_entry();
+                    ViewAction::None
                 }
                 _ => ViewAction::None,
             },
@@ -337,7 +431,7 @@ impl ModalView for ProviderPickerView {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let popup_width = 64.min(area.width.saturating_sub(4)).max(40);
         let popup_height = match self.stage {
-            Stage::List => 12,
+            Stage::List => (self.providers.len() as u16).saturating_add(2),
             Stage::KeyEntry => 10,
         }
         .min(area.height.saturating_sub(4))
@@ -378,6 +472,16 @@ mod tests {
         panic!("provider {provider:?} not found in picker");
     }
 
+    fn render_text(picker: &ProviderPickerView, width: u16, height: u16) -> String {
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        picker.render(area, &mut buf);
+        (0..height)
+            .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn picker_lists_all_providers() {
         let config = Config::default();
@@ -391,15 +495,26 @@ mod tests {
             names,
             vec![
                 "DeepSeek",
-                "DeepSeek (中国)",
                 "NVIDIA NIM",
                 "OpenAI-compatible",
+                "AtlasCloud",
+                "Wanjie Ark",
+                "Volcengine Ark",
                 "OpenRouter",
+                "Xiaomi MiMo",
                 "Novita AI",
                 "Fireworks AI",
+                "SiliconFlow",
+                "SiliconFlow (China)",
+                "Arcee AI",
+                "Moonshot/Kimi",
                 "SGLang",
                 "vLLM",
-                "Ollama"
+                "Ollama",
+                "Hugging Face",
+                "Together AI",
+                "OpenAI Codex (ChatGPT)",
+                "Anthropic"
             ]
         );
     }
@@ -429,6 +544,18 @@ mod tests {
     }
 
     #[test]
+    fn list_navigation_wraps_between_first_and_last_provider() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+
+        picker.handle_key(key(KeyCode::Up));
+        assert_eq!(picker.selected_provider(), ApiProvider::Anthropic);
+
+        picker.handle_key(key(KeyCode::Down));
+        assert_eq!(picker.selected_provider(), ApiProvider::Deepseek);
+    }
+
+    #[test]
     fn enter_with_no_key_transitions_to_key_entry_stage() {
         let config = Config::default();
         let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
@@ -447,8 +574,7 @@ mod tests {
             ..Config::default()
         };
         let mut picker = ProviderPickerView::new(ApiProvider::NvidiaNim, &config);
-        // Move up twice to DeepSeek (index 0), which has a key from the config.
-        picker.handle_key(key(KeyCode::Up));
+        // Move up once to DeepSeek (index 0), which has a key from the config.
         picker.handle_key(key(KeyCode::Up));
         let action = picker.handle_key(key(KeyCode::Enter));
         match action {
@@ -457,6 +583,54 @@ mod tests {
             }
             other => panic!("expected ProviderPickerApplied, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn configured_provider_can_reenter_key_entry_with_r() {
+        let config = Config {
+            providers: Some(crate::config::ProvidersConfig {
+                xiaomi_mimo: crate::config::ProviderConfig {
+                    api_key: Some("mimo-key".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        move_to_provider(&mut picker, ApiProvider::XiaomiMimo);
+
+        let action = picker.handle_key(key(KeyCode::Char('r')));
+
+        assert!(matches!(action, ViewAction::None));
+        assert_eq!(picker.stage, Stage::KeyEntry);
+        assert!(picker.api_key_input.is_empty());
+    }
+
+    #[test]
+    fn ctrl_r_does_not_trigger_key_entry() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+
+        let action = picker.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+
+        assert!(matches!(action, ViewAction::None));
+        assert_eq!(picker.stage, Stage::List);
+    }
+
+    #[test]
+    fn configured_provider_footer_mentions_edit_key() {
+        let config = Config {
+            api_key: Some("existing-deepseek-key".to_string()),
+            ..Config::default()
+        };
+        let picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+
+        let rendered = render_text(&picker, 80, 12);
+
+        assert!(rendered.contains("Enter"));
+        assert!(rendered.contains("apply"));
+        assert!(rendered.contains("edit key"));
     }
 
     #[test]
@@ -516,5 +690,60 @@ mod tests {
             picker.handle_key(key(KeyCode::Char(c)));
         }
         assert_eq!(picker.api_key_input, "abcdef");
+    }
+
+    #[test]
+    fn small_list_render_keeps_selected_provider_visible_after_down_navigation() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        move_to_provider(&mut picker, ApiProvider::Ollama);
+
+        let rendered = render_text(&picker, 80, 12);
+
+        assert!(rendered.contains("Ollama"));
+        assert!(!rendered.contains("DeepSeek *"));
+    }
+
+    #[test]
+    fn small_list_render_keeps_initial_active_provider_visible() {
+        let config = Config::default();
+        let picker = ProviderPickerView::new(ApiProvider::Ollama, &config);
+
+        let rendered = render_text(&picker, 80, 12);
+
+        assert!(rendered.contains("Ollama *"));
+    }
+
+    #[test]
+    fn tall_list_render_shows_all_providers_without_scrolling() {
+        let config = Config::default();
+        let picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+
+        let rendered = render_text(&picker, 80, 23);
+
+        assert!(rendered.contains("DeepSeek *"));
+        assert!(rendered.contains("Ollama"));
+    }
+
+    #[test]
+    fn selected_provider_row_uses_strong_highlight() {
+        let config = Config::default();
+        let picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+
+        picker.render(area, &mut buf);
+
+        let highlighted_cells = area
+            .positions()
+            .filter(|position| {
+                let cell = &buf[*position];
+                cell.bg == palette::SURFACE_ELEVATED
+            })
+            .count();
+        assert!(
+            highlighted_cells >= 32,
+            "selected provider row should use a visible continuous highlight"
+        );
     }
 }

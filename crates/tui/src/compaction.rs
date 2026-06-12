@@ -20,7 +20,7 @@ use crate::models::{
 /// Configuration for conversation compaction behavior.
 ///
 /// v0.8.11 simplified this from the prior token-OR-message-count trigger
-/// to a token-only trigger gated by an absolute floor. The
+/// to a token-only trigger. The
 /// `message_threshold` field was removed: its only purpose was to fire
 /// compaction on long sessions of small messages, which is exactly the
 /// case where rewriting the V4 prefix cache is least valuable. Token
@@ -31,13 +31,6 @@ pub struct CompactionConfig {
     pub token_threshold: usize,
     pub model: String,
     pub cache_summary: bool,
-    /// Hard floor — `should_compact` returns `false` when total session
-    /// tokens fall below this number, regardless of `enabled` or
-    /// `token_threshold`. Defaults to [`MINIMUM_AUTO_COMPACTION_TOKENS`]
-    /// (500K) for v0.8.11+. Tests that want to exercise the threshold
-    /// logic at small fixture sizes can set this to `0` to disable the
-    /// floor.
-    pub auto_floor_tokens: usize,
 }
 
 impl Default for CompactionConfig {
@@ -53,34 +46,22 @@ impl Default for CompactionConfig {
             // v0.8.11: 50K was a 128K-era leftover that biased every
             // unconfigured caller toward "compact almost immediately on V4."
             // Bumped to 800K (80% of V4's 1M window) so the dead-code
-            // default no longer lies. Real call sites override this via
+            // default matches the hard automatic compaction guardrail. This
+            // is intentionally later than the model-visible 60% "suggest
+            // /compact during sustained work" guidance; automatic replacement
+            // compaction rewrites the cacheable prefix and remains opt-in.
+            // Real call sites override this via
             // `compaction_threshold_for_model_and_effort`.
             token_threshold: 800_000,
             model: DEFAULT_TEXT_MODEL.to_string(),
             cache_summary: true,
-            auto_floor_tokens: MINIMUM_AUTO_COMPACTION_TOKENS,
         }
     }
 }
 
-/// Hard floor for automatic compaction in v0.8.11+.
-///
-/// Below this token count, `should_compact` returns `false` regardless of
-/// `enabled` or `token_threshold`. The point of the floor is V4 prefix-cache
-/// economics: compaction rewrites the stable prefix, which destroys the KV
-/// cache. At low token counts the prefix cache is healthy and compaction's
-/// cost (full re-prefill at miss prices) dwarfs its benefit (a tiny budget
-/// reclaim). Above the floor compaction can still be net-positive — cache
-/// is already pressured, the prefix has drifted, and freeing budget matters.
-///
-/// Manual `/compact` slash command bypasses this floor with explicit user
-/// agency.
-///
-/// Constant rather than configurable for v0.8.11. If anyone needs to dial
-/// it (smaller models, opinionated workflows), we can add a setting later.
-pub const MINIMUM_AUTO_COMPACTION_TOKENS: usize = 500_000;
-
 pub const KEEP_RECENT_MESSAGES: usize = 4;
+#[allow(dead_code)]
+pub const HARD_COMPACT_KEEP_RECENT: usize = 8;
 const RECENT_WORKING_SET_WINDOW: usize = 12;
 const MAX_WORKING_SET_PATHS: usize = 24;
 const MIN_SUMMARIZE_MESSAGES: usize = 6;
@@ -94,6 +75,7 @@ const LARGE_CONTEXT_SUMMARY_TOOL_RESULT_SNIPPET_CHARS: usize = 4_000;
 const LARGE_CONTEXT_SUMMARY_INPUT_MAX_CHARS: usize = 120_000;
 const LARGE_CONTEXT_SUMMARY_INPUT_HEAD_CHARS: usize = 72_000;
 const LARGE_CONTEXT_SUMMARY_INPUT_TAIL_CHARS: usize = 36_000;
+const TOOL_PRUNE_STOP_CHECK_BYTES: usize = 16 * 1024;
 const LARGE_CONTEXT_SUMMARY_MAX_TOKENS: u32 = 2_048;
 const LARGE_CONTEXT_WINDOW_TOKENS: u32 = 500_000;
 const CACHE_ALIGNED_SUMMARY_CONTEXT_BUDGET_PERCENT: usize = 85;
@@ -139,6 +121,29 @@ fn summary_input_limits_for_model(model: &str) -> SummaryInputLimits {
 pub struct CompactionPlan {
     pub pinned_indices: BTreeSet<usize>,
     pub summarize_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct HardCompactionConfig {
+    pub enabled: bool,
+    pub keep_recent: usize,
+}
+
+impl Default for HardCompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            keep_recent: HARD_COMPACT_KEEP_RECENT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct HardCompactionPlan {
+    pub summarize_indices: Vec<usize>,
+    pub preserved_indices: Vec<usize>,
 }
 
 fn path_regex() -> &'static Regex {
@@ -285,10 +290,19 @@ fn message_text(msg: &Message) -> String {
             }
             ContentBlock::ServerToolUse { .. }
             | ContentBlock::ToolSearchToolResult { .. }
-            | ContentBlock::CodeExecutionToolResult { .. } => {}
+            | ContentBlock::CodeExecutionToolResult { .. }
+            | ContentBlock::ImageUrl { .. } => {}
         }
     }
     text
+}
+
+fn is_user_text_query(msg: &Message) -> bool {
+    msg.role == "user"
+        && msg
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { .. }))
 }
 
 fn extract_paths_from_message(message: &Message, workspace: Option<&Path>) -> Vec<String> {
@@ -301,7 +315,8 @@ fn extract_paths_from_message(message: &Message, workspace: Option<&Path>) -> Ve
             ContentBlock::Thinking { .. } => Vec::new(),
             ContentBlock::ServerToolUse { .. }
             | ContentBlock::ToolSearchToolResult { .. }
-            | ContentBlock::CodeExecutionToolResult { .. } => Vec::new(),
+            | ContentBlock::CodeExecutionToolResult { .. }
+            | ContentBlock::ImageUrl { .. } => Vec::new(),
         };
         paths.extend(candidates);
     }
@@ -432,6 +447,21 @@ pub fn plan_compaction(
     // Ensure tool result messages are not kept without their corresponding tool call.
     enforce_tool_call_pairs(messages, &mut pinned_indices);
 
+    // Some OpenAI-compatible chat templates require at least one user text
+    // message. Tool-heavy tails can otherwise compact down to only tool calls
+    // and tool results, which makes those backends reject the next request.
+    if !pinned_indices
+        .iter()
+        .any(|&idx| is_user_text_query(&messages[idx]))
+        && let Some(idx) = messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(idx, msg)| is_user_text_query(msg).then_some(idx))
+    {
+        pinned_indices.insert(idx);
+    }
+
     let summarize_indices = (0..len)
         .filter(|idx| !pinned_indices.contains(idx))
         .collect();
@@ -443,6 +473,32 @@ pub fn plan_compaction(
         pinned_indices,
         summarize_indices,
     }
+}
+
+#[allow(dead_code)]
+pub fn plan_hard_compaction(
+    messages: &[Message],
+    workspace: Option<&Path>,
+    keep_recent: usize,
+) -> Option<HardCompactionPlan> {
+    if keep_recent == 0 || messages.len() < keep_recent.saturating_add(MIN_SUMMARIZE_MESSAGES) {
+        return None;
+    }
+
+    let soft_plan = plan_compaction(messages, workspace, keep_recent, None, None);
+    if soft_plan.summarize_indices.len() < MIN_SUMMARIZE_MESSAGES {
+        return None;
+    }
+
+    let summarized: BTreeSet<_> = soft_plan.summarize_indices.iter().copied().collect();
+    let preserved_indices = (0..messages.len())
+        .filter(|idx| !summarized.contains(idx))
+        .collect();
+
+    Some(HardCompactionPlan {
+        summarize_indices: soft_plan.summarize_indices,
+        preserved_indices,
+    })
 }
 
 fn enforce_tool_call_pairs(messages: &[Message], pinned_indices: &mut BTreeSet<usize>) {
@@ -551,7 +607,7 @@ fn estimate_tokens_for_message(message: &Message, include_thinking: bool) -> usi
             ContentBlock::Text { text, .. } => text.len() / 4,
             // Historical reasoning blocks are UI/session metadata for DeepSeek.
             // Only current-turn tool-call reasoning is sent back to the API.
-            ContentBlock::Thinking { thinking } if include_thinking => thinking.len() / 4,
+            ContentBlock::Thinking { thinking, .. } if include_thinking => thinking.len() / 4,
             ContentBlock::Thinking { .. } => 0,
             ContentBlock::ToolUse { input, .. } => serde_json::to_string(input)
                 .map(|s| s.len() / 4)
@@ -559,7 +615,8 @@ fn estimate_tokens_for_message(message: &Message, include_thinking: bool) -> usi
             ContentBlock::ToolResult { content, .. } => content.len() / 4,
             ContentBlock::ServerToolUse { .. }
             | ContentBlock::ToolSearchToolResult { .. }
-            | ContentBlock::CodeExecutionToolResult { .. } => 0,
+            | ContentBlock::CodeExecutionToolResult { .. }
+            | ContentBlock::ImageUrl { .. } => 0,
         })
         .sum::<usize>()
 }
@@ -619,21 +676,6 @@ pub fn should_compact(
 ) -> bool {
     if !config.enabled {
         return false;
-    }
-
-    // v0.8.11: hard floor enforcement. Below the floor (default 500K tokens
-    // — see `MINIMUM_AUTO_COMPACTION_TOKENS`), automatic compaction is
-    // refused because rewriting the prefix kills V4's prefix cache for
-    // little budget recovery. Manual `/compact` and the `compact_now` tool
-    // bypass this floor by going through different code paths.
-    if config.auto_floor_tokens > 0 {
-        let total_session_tokens: usize = messages
-            .iter()
-            .map(|m| estimate_tokens_for_message(m, false))
-            .sum();
-        if total_session_tokens < config.auto_floor_tokens {
-            return false;
-        }
     }
 
     let plan = plan_compaction(
@@ -749,13 +791,25 @@ struct ToolResultPruneCandidate {
     original_len: usize,
 }
 
+#[cfg(test)]
+fn prune_tool_results(messages: &mut [Message], protected_window: usize) -> usize {
+    prune_tool_results_until(messages, protected_window, |_, _| false)
+}
+
 /// Mechanically prune old verbose tool results before paying for an LLM summary.
 ///
 /// The most recent `protected_window` messages stay byte-for-byte intact. Older
 /// duplicate tool results keep the freshest full body and replace earlier
 /// copies with one-line summaries; non-duplicate old results are summarized only
 /// when they exceed the normal summary snippet size.
-pub fn prune_tool_results(messages: &mut [Message], protected_window: usize) -> usize {
+fn prune_tool_results_until<F>(
+    messages: &mut [Message],
+    protected_window: usize,
+    mut should_stop: F,
+) -> usize
+where
+    F: FnMut(&[Message], usize) -> bool,
+{
     let cutoff = messages.len().saturating_sub(protected_window);
     if cutoff == 0 {
         return 0;
@@ -792,6 +846,12 @@ pub fn prune_tool_results(messages: &mut [Message], protected_window: usize) -> 
         }
     }
 
+    // The maps above are fully populated before pruning starts, so the order below
+    // only changes which message bytes are rewritten first. Pruning from newest to
+    // oldest lets callers stop as soon as enough bytes were saved, preserving the
+    // earlier JSON request prefix for byte-level KV caches.
+    candidates.reverse();
+
     let mut bytes_saved = 0usize;
     for candidate in candidates {
         let duplicate_count = count_by_key.get(&candidate.key).copied().unwrap_or(0);
@@ -821,6 +881,10 @@ pub fn prune_tool_results(messages: &mut [Message], protected_window: usize) -> 
             bytes_saved = bytes_saved.saturating_add(content.len().saturating_sub(summary.len()));
             *content = summary;
             *content_blocks = None;
+
+            if should_stop(messages, bytes_saved) {
+                break;
+            }
         }
     }
 
@@ -875,26 +939,54 @@ pub async fn compact_messages_safe(
     const MAX_RETRIES: u32 = 3;
     const BASE_DELAY_MS: u64 = 1000;
 
+    let was_over_threshold = should_compact(
+        messages,
+        config,
+        workspace,
+        external_pins,
+        external_working_set_paths,
+    );
     let mut pruned_messages = messages.to_vec();
-    let pruned_bytes = prune_tool_results(&mut pruned_messages, KEEP_RECENT_MESSAGES);
-    let compaction_input: &[Message] = if pruned_bytes > 0 {
-        logging::info(format!(
-            "Local tool-result prune saved {pruned_bytes} bytes before LLM compaction"
-        ));
-        let was_over_threshold = should_compact(
-            messages,
-            config,
-            workspace,
-            external_pins,
-            external_working_set_paths,
-        );
-        let now_under_threshold = !should_compact(
+    let mut now_under_threshold = false;
+    let mut next_stop_check_bytes = 0usize;
+    let pruned_bytes = prune_tool_results_until(
+        &mut pruned_messages,
+        KEEP_RECENT_MESSAGES,
+        |candidate_messages, bytes_saved| {
+            if !was_over_threshold || bytes_saved < next_stop_check_bytes {
+                return false;
+            }
+
+            // Stop at the first suffix-side prune check that clears the threshold.
+            // The check itself is a full compaction-plan pass, so bound it by saved
+            // bytes instead of running it after every candidate in huge sessions.
+            next_stop_check_bytes = bytes_saved.saturating_add(TOOL_PRUNE_STOP_CHECK_BYTES);
+            now_under_threshold = !should_compact(
+                candidate_messages,
+                config,
+                workspace,
+                external_pins,
+                external_working_set_paths,
+            );
+            now_under_threshold
+        },
+    );
+    if was_over_threshold && pruned_bytes > 0 && !now_under_threshold {
+        // The throttled in-loop check may skip the exact candidate that clears the
+        // budget. Do one final pass so a successful local prune still avoids LLM compaction.
+        now_under_threshold = !should_compact(
             &pruned_messages,
             config,
             workspace,
             external_pins,
             external_working_set_paths,
         );
+    }
+
+    let compaction_input: &[Message] = if pruned_bytes > 0 {
+        logging::info(format!(
+            "Local tool-result prune saved {pruned_bytes} bytes before LLM compaction"
+        ));
         if was_over_threshold && now_under_threshold {
             return Ok(CompactionResult {
                 messages: pruned_messages,
@@ -954,7 +1046,13 @@ fn read_workspace_anchors(workspace: Option<&Path>) -> Vec<String> {
         return Vec::new();
     };
 
-    let anchors_path = ws.join(".deepseek").join("anchors.md");
+    // Prefer .codewhale, fall back to .deepseek
+    let primary = ws.join(".codewhale").join("anchors.md");
+    let anchors_path = if primary.exists() {
+        primary
+    } else {
+        ws.join(".deepseek").join("anchors.md")
+    };
     let Ok(content) = std::fs::read_to_string(anchors_path) else {
         return Vec::new();
     };
@@ -1077,7 +1175,20 @@ async fn create_summary(
         build_formatted_summary_request(model, messages, limits)
     };
 
-    let response = client.create_message(request).await?;
+    let mut telemetry_cache_aligned = used_cache_aligned;
+    let response = match client.create_message(request).await {
+        Ok(response) => response,
+        Err(err) if used_cache_aligned && is_context_window_error(&err) => {
+            logging::warn(format!(
+                "Cache-aligned compaction summary exceeded the model context window ({err}); \
+                 retrying with bounded formatted summary input"
+            ));
+            telemetry_cache_aligned = false;
+            let fallback_request = build_formatted_summary_request(model, messages, limits);
+            client.create_message(fallback_request).await?
+        }
+        Err(err) => return Err(err),
+    };
     // Compaction summary calls are billed by DeepSeek; route the
     // tokens through the side-channel so the dashboard total
     // matches the website (#526).
@@ -1088,9 +1199,9 @@ async fn create_summary(
     // adding UI surface. The event is emitted with
     // `target = "compaction"`, so the filter is
     // `RUST_LOG=compaction=debug` (the module-path form
-    // `deepseek_tui::compaction=debug` does NOT match — `EnvFilter`
+    // `codewhale_tui::compaction=debug` does NOT match — `EnvFilter`
     // matches the explicit target string when one is set).
-    log_summary_cache_telemetry(used_cache_aligned, &response.usage);
+    log_summary_cache_telemetry(telemetry_cache_aligned, &response.usage);
 
     // Extract text from response
     let summary = response
@@ -1104,6 +1215,22 @@ async fn create_summary(
         .join("\n");
 
     Ok(summary)
+}
+
+fn is_context_window_error(e: &anyhow::Error) -> bool {
+    let text = e.to_string();
+    if crate::error_taxonomy::classify_error_message(&text)
+        != crate::error_taxonomy::ErrorCategory::InvalidInput
+    {
+        return false;
+    }
+
+    let lower = text.to_lowercase();
+    lower.contains("context")
+        || lower.contains("token")
+        || lower.contains("prompt is too long")
+        || lower.contains("requested")
+        || lower.contains("maximum")
 }
 
 /// Cache-hit percentage for a compaction summary call.
@@ -1266,14 +1393,15 @@ fn build_formatted_summary_request(
                 }
                 ContentBlock::ToolResult { content, .. } => {
                     let snippet = truncate_chars(content, limits.tool_result_snippet_chars);
-                    let _ = write!(conversation_text, "Tool result: {}\n\n", snippet);
+                    let _ = write!(conversation_text, "Tool result: {snippet}\n\n");
                 }
                 ContentBlock::Thinking { .. } => {
                     // Skip thinking blocks in summary
                 }
                 ContentBlock::ServerToolUse { .. }
                 | ContentBlock::ToolSearchToolResult { .. }
-                | ContentBlock::CodeExecutionToolResult { .. } => {}
+                | ContentBlock::CodeExecutionToolResult { .. }
+                | ContentBlock::ImageUrl { .. } => {}
             }
         }
     }
@@ -1358,9 +1486,9 @@ fn extract_workflow_context(messages: &[Message], workspace: Option<&Path>) -> S
                     .strip_prefix(ws)
                     .unwrap_or(Path::new(file))
                     .display();
-                context.push_str(&format!("- `{}`\n", relative));
+                context.push_str(&format!("- `{relative}`\n"));
             } else {
-                context.push_str(&format!("- `{}`\n", file));
+                context.push_str(&format!("- `{file}`\n"));
             }
         }
         context.push('\n');
@@ -1375,7 +1503,7 @@ fn extract_workflow_context(messages: &[Message], workspace: Option<&Path>) -> S
     if !tasks_identified.is_empty() {
         context.push_str("**Tasks/TODOs Identified:**\n");
         for task in &tasks_identified {
-            context.push_str(&format!("- {}\n", task));
+            context.push_str(&format!("- {task}\n"));
         }
         context.push('\n');
     }
@@ -1572,6 +1700,60 @@ mod tests {
     }
 
     #[test]
+    fn prune_tool_results_preserves_prefix_bytes_when_reverse_prune_is_enough() {
+        let older_verbose = "old ".repeat(SUMMARY_TOOL_RESULT_SNIPPET_CHARS + 40);
+        let newer_verbose = "new ".repeat(SUMMARY_TOOL_RESULT_SNIPPET_CHARS + 40);
+        let mut messages = vec![
+            tool_use("call-old", "read_file", json!({"path": "old.txt"})),
+            tool_result("call-old", &older_verbose),
+            tool_use("call-new", "read_file", json!({"path": "new.txt"})),
+            tool_result("call-new", &newer_verbose),
+            msg("user", "protected tail"),
+        ];
+        let original = messages.clone();
+
+        // Simulate the caller clearing its token budget after one suffix prune.
+        let saved = prune_tool_results_until(&mut messages, 1, |_, saved| saved > 0);
+
+        assert!(saved > 0);
+        assert_eq!(&messages[..3], &original[..3]);
+        assert_eq!(&messages[4..], &original[4..]);
+        let ContentBlock::ToolResult { content, .. } = &messages[3].content[0] else {
+            panic!("expected pruned tool result");
+        };
+        assert!(content.contains("[read_file] tool result pruned"));
+        assert!(content.contains("new.txt"));
+        assert!(content.len() < newer_verbose.len());
+    }
+
+    #[test]
+    fn prune_tool_results_stops_after_newest_duplicate_prune() {
+        let oldest = "oldest ".repeat(80);
+        let middle = "middle ".repeat(80);
+        let latest = "latest ".repeat(80);
+        let mut messages = vec![
+            tool_use("call-1", "read_file", json!({"path": "Cargo.toml"})),
+            tool_result("call-1", &oldest),
+            tool_use("call-2", "read_file", json!({"path": "Cargo.toml"})),
+            tool_result("call-2", &middle),
+            tool_use("call-3", "read_file", json!({"path": "Cargo.toml"})),
+            tool_result("call-3", &latest),
+            msg("user", "protected tail"),
+        ];
+        let original = messages.clone();
+
+        let saved = prune_tool_results_until(&mut messages, 1, |_, saved| saved > 0);
+
+        assert!(saved > 0);
+        assert_eq!(&messages[..3], &original[..3]);
+        assert_eq!(&messages[4..], &original[4..]);
+        let ContentBlock::ToolResult { content, .. } = &messages[3].content[0] else {
+            panic!("expected middle duplicate to be pruned");
+        };
+        assert!(content.contains("[read_file] tool result pruned"));
+    }
+
+    #[test]
     fn prune_tool_results_dedupes_identical_reads_but_keeps_latest_full_body() {
         let first = "first ".repeat(80);
         let second = "second ".repeat(80);
@@ -1675,6 +1857,50 @@ mod tests {
     }
 
     #[test]
+    fn context_window_errors_are_detected_for_summary_fallback() {
+        for msg in [
+            "HTTP 400 Bad Request: maximum context length is 1000000 tokens",
+            "invalid_request_error: prompt is too long for the current model",
+            "You requested 1000001 tokens but the maximum is 1000000",
+            "request exceeds context window",
+        ] {
+            assert!(
+                is_context_window_error(&anyhow::anyhow!(msg)),
+                "expected context-window detection for `{msg}`",
+            );
+        }
+
+        assert!(!is_context_window_error(&anyhow::anyhow!(
+            "Invalid request: missing required field"
+        )));
+        assert!(!is_context_window_error(&anyhow::anyhow!(
+            "503 Service Unavailable"
+        )));
+    }
+
+    #[test]
+    fn formatted_summary_request_bounds_large_input() {
+        let messages = (0..90)
+            .map(|idx| {
+                msg(
+                    "user",
+                    &format!("turn {idx}: {}", "中文上下文 ".repeat(1_000)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let limits = summary_input_limits_for_model("deepseek-v4-pro");
+
+        let request = build_formatted_summary_request("deepseek-v4-pro", &messages, limits);
+
+        assert_eq!(request.messages.len(), 1);
+        let ContentBlock::Text { text, .. } = &request.messages[0].content[0] else {
+            panic!("expected summary text request");
+        };
+        assert!(text.contains("characters omitted before summary"));
+        assert!(text.chars().count() <= limits.input_max_chars + 2_000);
+    }
+
+    #[test]
     fn cache_aligned_summary_request_preserves_message_prefix() {
         let messages = vec![
             msg("user", "Please edit crates/tui/src/compaction.rs"),
@@ -1732,6 +1958,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: vec![
                     ContentBlock::Thinking {
+                        signature: None,
                         thinking: thinking.clone(),
                     },
                     ContentBlock::ToolUse {
@@ -1817,7 +2044,6 @@ mod tests {
         let config = CompactionConfig {
             enabled: true,
             token_threshold: 1_000_000,
-            auto_floor_tokens: 0,
             ..Default::default()
         };
 
@@ -1924,6 +2150,80 @@ mod tests {
         let plan = plan_compaction(&messages, None, 1, None, None);
         assert!(plan.pinned_indices.contains(&2));
         assert!(plan.pinned_indices.contains(&1));
+    }
+
+    #[test]
+    fn plan_hard_compaction_returns_none_when_too_few_messages() {
+        let messages = vec![
+            msg("user", "hello"),
+            msg("assistant", "hi"),
+            msg("user", "how are you"),
+            msg("assistant", "good"),
+        ];
+
+        assert!(plan_hard_compaction(&messages, None, HARD_COMPACT_KEEP_RECENT).is_none());
+    }
+
+    #[test]
+    fn plan_hard_compaction_preserves_recent_tail() {
+        let messages: Vec<Message> = (0..20)
+            .map(|i| {
+                msg(
+                    if i % 2 == 0 { "user" } else { "assistant" },
+                    &format!("message {i}"),
+                )
+            })
+            .collect();
+
+        let plan =
+            plan_hard_compaction(&messages, None, HARD_COMPACT_KEEP_RECENT).expect("hard plan");
+
+        let expected_recent: Vec<usize> = (20 - HARD_COMPACT_KEEP_RECENT..20).collect();
+        for idx in expected_recent {
+            assert!(plan.preserved_indices.contains(&idx));
+            assert!(!plan.summarize_indices.contains(&idx));
+        }
+        assert_eq!(plan.summarize_indices, (0..12).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn plan_hard_compaction_keeps_tool_pairs_across_tail_boundary() {
+        let mut messages: Vec<Message> = (0..8)
+            .map(|i| msg("user", &format!("summarizable noise {i}")))
+            .collect();
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: "tail-call".to_string(),
+                name: "read_file".to_string(),
+                input: json!({"path": "crates/tui/src/compaction.rs"}),
+                caller: None,
+            }],
+        });
+        messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "tail-call".to_string(),
+                content: "file contents".to_string(),
+                is_error: None,
+                content_blocks: None,
+            }],
+        });
+
+        let plan = plan_hard_compaction(&messages, None, 1).expect("hard plan");
+
+        assert!(plan.preserved_indices.contains(&8));
+        assert!(plan.preserved_indices.contains(&9));
+        assert!(!plan.summarize_indices.contains(&8));
+        assert!(!plan.summarize_indices.contains(&9));
+    }
+
+    #[test]
+    fn hard_compaction_config_defaults_to_disabled() {
+        let config = HardCompactionConfig::default();
+
+        assert!(!config.enabled);
+        assert_eq!(config.keep_recent, HARD_COMPACT_KEEP_RECENT);
     }
 
     #[test]
@@ -2194,6 +2494,39 @@ mod tests {
         assert_eq!(pinned.len(), messages.len());
     }
 
+    #[test]
+    fn plan_compaction_keeps_at_least_one_user_text_query() {
+        let mut messages = vec![msg(
+            "user",
+            "This is the original query that started the chain.",
+        )];
+
+        for i in 0..10 {
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::ToolUse {
+                    id: format!("call-{i}"),
+                    name: "test_tool".to_string(),
+                    input: json!({}),
+                    caller: None,
+                }],
+            });
+            messages.push(Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: format!("call-{i}"),
+                    content: "tool output".to_string(),
+                    is_error: None,
+                    content_blocks: None,
+                }],
+            });
+        }
+
+        let plan = plan_compaction(&messages, None, KEEP_RECENT_MESSAGES, None, None);
+
+        assert!(plan.pinned_indices.contains(&0));
+    }
+
     // ========================================================================
     // Additional Compaction Trigger Tests
     // ========================================================================
@@ -2203,7 +2536,6 @@ mod tests {
         let config = CompactionConfig {
             enabled: true,
             token_threshold: 100, // Low threshold for testing
-            auto_floor_tokens: 0,
             ..Default::default()
         };
 
@@ -2230,61 +2562,16 @@ mod tests {
         assert!(!should_compact(&messages, &config, None, None, None));
     }
 
-    /// v0.8.11: the 500K hard floor blocks auto-compaction even when the
-    /// token-percentage threshold would otherwise fire. This is the V4
-    /// prefix-cache protection — below 500K total tokens, rewriting the
-    /// prefix loses cache for tiny budget gains.
     #[test]
-    fn auto_compaction_floor_blocks_below_500k_even_when_threshold_says_yes() {
+    fn auto_compaction_uses_token_threshold_without_fixed_floor() {
         let config = CompactionConfig {
             enabled: true,
-            token_threshold: 100, // would normally fire instantly
-            // Use the production default explicitly so this test pins the
-            // floor's contract rather than relying on `Default`.
-            auto_floor_tokens: MINIMUM_AUTO_COMPACTION_TOKENS,
+            token_threshold: 100,
             ..Default::default()
         };
 
         let messages: Vec<Message> = (0..10).map(|_| msg("user", &"x".repeat(50))).collect();
-        // Total tokens way under 500K, so floor blocks compaction.
-        assert!(!should_compact(&messages, &config, None, None, None));
-    }
-
-    /// v0.8.11: when total tokens cross the 500K floor, the existing
-    /// threshold/message-count logic takes over again.
-    #[test]
-    fn auto_compaction_floor_yields_to_threshold_logic_above_500k() {
-        let config = CompactionConfig {
-            enabled: true,
-            token_threshold: 2_000_000,
-            auto_floor_tokens: MINIMUM_AUTO_COMPACTION_TOKENS,
-            ..Default::default()
-        };
-
-        // Each message ~500 tokens; 1100 messages → ~550K total tokens.
-        // That's above the floor (500K) AND below the deliberately high
-        // token_threshold, so auto-compaction stays off — by threshold,
-        // not floor.
-        let messages: Vec<Message> = (0..1100).map(|_| msg("user", &"x".repeat(2000))).collect();
-        assert!(!should_compact(&messages, &config, None, None, None));
-
-        // Crank threshold below total → compaction fires now that we're
-        // past the floor.
-        let config_lower = CompactionConfig {
-            token_threshold: 100_000,
-            ..config
-        };
-        assert!(should_compact(&messages, &config_lower, None, None, None));
-    }
-
-    /// `CompactionConfig::default()` ships with the 500K floor on by
-    /// default — production callers via `..Default::default()` get the
-    /// safety guarantee automatically.
-    #[test]
-    fn compaction_config_default_carries_500k_floor() {
-        let config = CompactionConfig::default();
-        assert_eq!(config.auto_floor_tokens, MINIMUM_AUTO_COMPACTION_TOKENS);
-        assert_eq!(config.auto_floor_tokens, 500_000);
+        assert!(should_compact(&messages, &config, None, None, None));
     }
 
     #[test]

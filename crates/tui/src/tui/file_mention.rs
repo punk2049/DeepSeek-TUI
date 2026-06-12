@@ -152,7 +152,7 @@ pub fn find_file_mention_completions(
     // Never-mentioned candidates fall back to the workspace ranker's order.
     let entries = super::file_frecency::rerank_by_frecency(entries);
     tracing::debug!(
-        target: "deepseek_tui::file_mention",
+        target: "codewhale_tui::file_mention",
         partial = %partial,
         workspace = %workspace.root.display(),
         cwd = ?std::env::current_dir().ok(),
@@ -162,11 +162,34 @@ pub fn find_file_mention_completions(
     entries
 }
 
+/// Deterministic directory-browser completion entry point. This deliberately
+/// skips frecency so the popup remains stable for users navigating deep trees.
+pub fn find_file_mention_browser_completions(
+    workspace: &Workspace,
+    partial: &str,
+    limit: usize,
+) -> Vec<String> {
+    let entries = workspace.browser_completions(partial, limit);
+    tracing::debug!(
+        target: "codewhale_tui::file_mention",
+        partial = %partial,
+        workspace = %workspace.root.display(),
+        cwd = ?std::env::current_dir().ok(),
+        match_count = entries.len(),
+        "file mention browser completion walk",
+    );
+    entries
+}
+
 /// Build a `Workspace` for the running app: anchors at `app.workspace` and
 /// captures the process CWD so the resolver and completion walker honor the
 /// user's launch directory when it differs from `--workspace`.
 fn workspace_for_app(app: &App) -> Workspace {
-    Workspace::with_cwd(app.workspace.clone(), std::env::current_dir().ok())
+    Workspace::with_cwd_and_depth(
+        app.workspace.clone(),
+        std::env::current_dir().ok(),
+        app.mention_walk_depth,
+    )
 }
 
 /// Resolve the `@`-mention completion popup contents for the current
@@ -197,23 +220,33 @@ pub fn visible_mention_menu_entries(app: &mut App, limit: usize) -> Vec<String> 
 
     let workspace = app.workspace.clone();
     let cwd = std::env::current_dir().ok();
+    let walk_depth = app.mention_walk_depth;
+    let behavior = app.mention_menu_behavior.clone();
     if let Some(ref cache) = app.composer.mention_completion_cache
         && cache.workspace == workspace
         && cache.cwd == cwd
         && cache.partial == partial
         && cache.limit == limit
+        && cache.walk_depth == walk_depth
+        && cache.behavior == behavior
     {
         return cache.entries.clone();
     }
 
-    let ws = Workspace::with_cwd(workspace.clone(), cwd.clone());
-    let entries = find_file_mention_completions(&ws, &partial, limit);
+    let ws = Workspace::with_cwd_and_depth(workspace.clone(), cwd.clone(), walk_depth);
+    let entries = if behavior == "browser" {
+        find_file_mention_browser_completions(&ws, &partial, limit)
+    } else {
+        find_file_mention_completions(&ws, &partial, limit)
+    };
 
     app.composer.mention_completion_cache = Some(MentionCompletionCache {
         workspace,
         cwd,
         partial,
         limit,
+        walk_depth,
+        behavior,
         entries: entries.clone(),
     });
 
@@ -261,9 +294,16 @@ pub fn try_autocomplete_file_mention(app: &mut App) -> bool {
         return false;
     };
     let ws = workspace_for_app(app);
-    let candidates = find_file_mention_completions(&ws, &partial, FILE_MENTION_COMPLETION_LIMIT);
+    let candidates = if app.mention_menu_behavior == "browser" {
+        find_file_mention_browser_completions(&ws, &partial, FILE_MENTION_COMPLETION_LIMIT)
+    } else {
+        find_file_mention_completions(&ws, &partial, FILE_MENTION_COMPLETION_LIMIT)
+    };
     if candidates.is_empty() {
-        app.status_message = Some(format!("No files match @{partial}"));
+        app.status_message = Some(no_file_mention_matches_status(
+            &partial,
+            app.mention_walk_depth,
+        ));
         return true;
     }
     if candidates.len() == 1 {
@@ -288,6 +328,27 @@ pub fn try_autocomplete_file_mention(app: &mut App) -> bool {
         .join(", ");
     app.status_message = Some(format!("Matches: {preview}"));
     true
+}
+
+fn no_file_mention_matches_status(partial: &str, walk_depth: usize) -> String {
+    if path_partial_reaches_walk_depth(partial, walk_depth) {
+        format!(
+            "No files match @{partial} (mention_walk_depth={walk_depth}; use /config set mention_walk_depth 0 to search deeper)"
+        )
+    } else {
+        format!("No files match @{partial}")
+    }
+}
+
+fn path_partial_reaches_walk_depth(partial: &str, walk_depth: usize) -> bool {
+    if walk_depth == 0 {
+        return false;
+    }
+    let component_count = partial
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .count();
+    component_count >= walk_depth
 }
 
 /// Splice a completion into the input, replacing the `@<partial>` token at
@@ -585,7 +646,7 @@ fn local_context_from_file_mentions(
             }
         };
         tracing::debug!(
-            target: "deepseek_tui::file_mention",
+            target: "codewhale_tui::file_mention",
             raw_typed = %mention,
             workspace = %workspace.display(),
             cwd = ?std::env::current_dir().ok(),
@@ -761,6 +822,17 @@ fn read_text_prefix(path: &Path) -> std::io::Result<(String, bool)> {
     let truncated = buffer.len() as u64 > MAX_MENTION_FILE_BYTES;
     if truncated {
         buffer.truncate(MAX_MENTION_FILE_BYTES as usize);
+        // Round down to the nearest valid UTF-8 character boundary so a
+        // multi-byte sequence (CJK, emoji, etc.) is never split at the cut point.
+        // Only adjust when error_len() is None — that means truncation landed
+        // mid-sequence (incomplete tail).  A Some(_) error_len means the file
+        // genuinely contains invalid UTF-8 bytes; leave the buffer intact so
+        // the from_utf8 call below returns the correct "file is not UTF-8" error.
+        if let Err(e) = std::str::from_utf8(&buffer)
+            && e.error_len().is_none()
+        {
+            buffer.truncate(e.valid_up_to());
+        }
     }
     if buffer.contains(&0) {
         return Err(std::io::Error::new(
@@ -768,13 +840,9 @@ fn read_text_prefix(path: &Path) -> std::io::Result<(String, bool)> {
             "file appears to be binary",
         ));
     }
-    let text = if truncated {
-        String::from_utf8_lossy(&buffer).to_string()
-    } else {
-        std::str::from_utf8(&buffer)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "file is not UTF-8"))?
-            .to_string()
-    };
+    let text = std::str::from_utf8(&buffer)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "file is not UTF-8"))?
+        .to_string();
     Ok((text, truncated))
 }
 
@@ -1001,5 +1069,34 @@ mod tests {
         let encoded = serde_json::to_string(reference).expect("serialize");
         let decoded: ContextReference = serde_json::from_str(&encoded).expect("deserialize");
         assert_eq!(&decoded, reference);
+    }
+
+    /// Regression test for #1441: truncating at MAX_MENTION_FILE_BYTES must not
+    /// split a multi-byte UTF-8 sequence, which previously produced U+FFFD
+    /// replacement characters in the TUI output.
+    #[test]
+    fn read_text_prefix_truncation_respects_utf8_char_boundary() {
+        use std::io::Write;
+
+        // Build a file that is MAX_MENTION_FILE_BYTES - 1 ASCII bytes followed
+        // by a 3-byte CJK character (U+4E2D, '中'). The naive truncate at
+        // MAX_MENTION_FILE_BYTES cuts after the first byte of '中', producing
+        // an invalid sequence.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("cjk.txt");
+        let mut f = std::fs::File::create(&path).expect("create");
+        let padding = vec![b'a'; MAX_MENTION_FILE_BYTES as usize - 1];
+        f.write_all(&padding).expect("write padding");
+        f.write_all("中".as_bytes()).expect("write CJK");
+
+        let (text, truncated) = read_text_prefix(&path).expect("should succeed");
+        assert!(
+            truncated,
+            "file exceeds limit so should be marked truncated"
+        );
+        assert!(
+            !text.contains('\u{FFFD}'),
+            "truncated text must not contain replacement characters; got: {text:?}",
+        );
     }
 }

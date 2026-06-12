@@ -1,5 +1,5 @@
 [package]
-name = "deepseek-tools"
+name = "codewhale-tools"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,8 +9,9 @@ description = "Tool invocation lifecycle, schema validation, and scheduler paral
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-deepseek-protocol = { path = "../protocol", version = "0.8.18" }
+codewhale-protocol = { path = "../protocol", version = "0.8.58" }
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true

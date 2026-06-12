@@ -18,9 +18,13 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Padding, Paragraph, Widget},
 };
 
-use crate::config::StatusItem;
+use crate::config::{ApiProvider, StatusItem};
+use crate::localization::{Locale, MessageId, tr, truncate_to_width};
 use crate::palette;
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
+use unicode_width::UnicodeWidthStr;
+
+const STATUS_PICKER_SELECTION_BG: ratatui::style::Color = ratatui::style::Color::Rgb(54, 72, 104);
 
 /// Picker state. We hold both the user's working selection AND the original
 /// snapshot so Esc can perfectly revert the live preview.
@@ -35,18 +39,24 @@ pub struct StatusPickerView {
     cursor: usize,
     /// Snapshot of `app.status_items` at open time so Esc reverts cleanly.
     original: Vec<StatusItem>,
+    locale: Locale,
 }
 
 impl StatusPickerView {
     #[must_use]
-    pub fn new(active: &[StatusItem]) -> Self {
-        let rows: Vec<StatusItem> = StatusItem::all().to_vec();
+    pub fn new(active: &[StatusItem], provider: ApiProvider, locale: Locale) -> Self {
+        let rows: Vec<StatusItem> = StatusItem::all()
+            .iter()
+            .filter(|item| item.is_available_for(provider))
+            .copied()
+            .collect();
         let selected: Vec<bool> = rows.iter().map(|item| active.contains(item)).collect();
         Self {
             rows,
             selected,
             cursor: 0,
             original: active.to_vec(),
+            locale,
         }
     }
 
@@ -62,16 +72,21 @@ impl StatusPickerView {
     }
 
     fn move_up(&mut self) {
-        if self.cursor > 0 {
+        if self.rows.is_empty() {
+            return;
+        }
+        if self.cursor == 0 {
+            self.cursor = self.rows.len() - 1;
+        } else {
             self.cursor -= 1;
         }
     }
 
     fn move_down(&mut self) {
-        let max = self.rows.len().saturating_sub(1);
-        if self.cursor < max {
-            self.cursor += 1;
+        if self.rows.is_empty() {
+            return;
         }
+        self.cursor = (self.cursor + 1) % self.rows.len();
     }
 
     fn toggle_current(&mut self) {
@@ -155,8 +170,11 @@ impl ModalView for StatusPickerView {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let popup_width = 64.min(area.width.saturating_sub(4)).max(40);
         // Two header lines + one row per StatusItem + one footer hint line.
+        // When the full list is taller than the screen, cap the popup so it
+        // stays on-screen and let the scroll offset handle overflow.
         let needed_height = (self.rows.len() as u16).saturating_add(4);
-        let popup_height = needed_height.min(area.height.saturating_sub(4)).max(8);
+        let max_fit = area.height.saturating_sub(4).max(8);
+        let popup_height = needed_height.min(max_fit);
 
         let popup_area = Rect {
             x: area.x + (area.width.saturating_sub(popup_width)) / 2,
@@ -169,22 +187,22 @@ impl ModalView for StatusPickerView {
 
         let block = Block::default()
             .title(Line::from(Span::styled(
-                " Status line ",
+                tr(self.locale, MessageId::StatusPickerTitle),
                 Style::default()
                     .fg(palette::DEEPSEEK_SKY)
                     .add_modifier(Modifier::BOLD),
             )))
             .title_bottom(Line::from(vec![
                 Span::styled(" Space ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("toggle "),
+                Span::raw(tr(self.locale, MessageId::StatusPickerActionToggle)),
                 Span::styled(" a ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("all "),
+                Span::raw(tr(self.locale, MessageId::StatusPickerActionAll)),
                 Span::styled(" n ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("none "),
+                Span::raw(tr(self.locale, MessageId::StatusPickerActionNone)),
                 Span::styled(" Enter ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("save "),
+                Span::raw(tr(self.locale, MessageId::StatusPickerActionSave)),
                 Span::styled(" Esc ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("cancel "),
+                Span::raw(tr(self.locale, MessageId::StatusPickerActionCancel)),
             ]))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
@@ -194,17 +212,26 @@ impl ModalView for StatusPickerView {
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
 
-        let mut lines: Vec<Line> = Vec::with_capacity(self.rows.len() + 2);
+        let visible_rows = inner.height.saturating_sub(2) as usize;
+        let row_start = visible_row_start(self.rows.len(), self.cursor, visible_rows);
+
+        let mut lines: Vec<Line> = Vec::with_capacity(visible_rows + 2);
         lines.push(Line::from(Span::styled(
-            "Pick the chips you want in the footer:",
+            tr(self.locale, MessageId::StatusPickerInstruction),
             Style::default().fg(palette::TEXT_MUTED),
         )));
         lines.push(Line::from(""));
 
-        for (idx, item) in self.rows.iter().enumerate() {
+        for (idx, item) in self
+            .rows
+            .iter()
+            .enumerate()
+            .skip(row_start)
+            .take(visible_rows)
+        {
             let checked = *self.selected.get(idx).unwrap_or(&false);
             let is_cursor = idx == self.cursor;
-            let mark = if checked { "[x]" } else { "[ ]" };
+            let mark = if checked { "[✓]" } else { "[ ]" };
 
             let row_style = if is_cursor {
                 Style::default()
@@ -225,36 +252,66 @@ impl ModalView for StatusPickerView {
             };
             let pointer = if is_cursor { "▸" } else { " " };
 
-            lines.push(Line::from(vec![
-                Span::styled(format!(" {pointer} "), row_style),
-                Span::styled(mark.to_string(), row_style),
-                Span::raw(" "),
-                Span::styled(item.label().to_string(), row_style),
-                Span::raw("  "),
-                Span::styled(format!("({})", item.hint()), hint_style),
-            ]));
+            if is_cursor {
+                let selected_style = Style::default()
+                    .fg(palette::SELECTION_TEXT)
+                    .bg(STATUS_PICKER_SELECTION_BG)
+                    .add_modifier(Modifier::BOLD);
+                let line = status_row_text(pointer, mark, item, inner.width as usize);
+                lines.push(Line::from(Span::styled(line, selected_style)));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled(format!(" {pointer} "), row_style),
+                    Span::styled(mark.to_string(), row_style),
+                    Span::styled(" ", row_style),
+                    Span::styled(item.label().to_string(), row_style),
+                    Span::styled("  ", row_style),
+                    Span::styled(format!("({})", item.hint()), hint_style),
+                ]));
+            }
         }
 
         Paragraph::new(lines).render(inner, buf);
     }
 }
 
+fn visible_row_start(total_rows: usize, cursor: usize, visible_rows: usize) -> usize {
+    if total_rows == 0 || visible_rows == 0 || total_rows <= visible_rows {
+        return 0;
+    }
+    let max_start = total_rows - visible_rows;
+    cursor
+        .saturating_add(1)
+        .saturating_sub(visible_rows)
+        .min(max_start)
+}
+
+fn status_row_text(pointer: &str, mark: &str, item: &StatusItem, width: usize) -> String {
+    let text = format!(" {pointer} {mark} {}  ({})", item.label(), item.hint());
+    let mut text = truncate_to_width(&text, width);
+    let current_width = text.width();
+    if current_width < width {
+        text.push_str(&" ".repeat(width - current_width));
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::localization::Locale;
 
     #[test]
     fn opens_with_active_items_pre_selected() {
         let active = StatusItem::default_footer();
-        let view = StatusPickerView::new(&active);
+        let view = StatusPickerView::new(&active, ApiProvider::Deepseek, Locale::En);
         assert_eq!(view.current_selection(), active);
     }
 
     #[test]
     fn space_toggles_current_row_and_emits_live_preview() {
         let active = StatusItem::default_footer();
-        let mut view = StatusPickerView::new(&active);
-        // Cursor starts at row 0 = StatusItem::Mode (currently checked).
+        let mut view = StatusPickerView::new(&active, ApiProvider::Deepseek, Locale::En);
         let action = view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         match action {
             ViewAction::Emit(ViewEvent::StatusItemsUpdated { items, final_save }) => {
@@ -268,7 +325,7 @@ mod tests {
     #[test]
     fn enter_emits_final_save() {
         let active = StatusItem::default_footer();
-        let mut view = StatusPickerView::new(&active);
+        let mut view = StatusPickerView::new(&active, ApiProvider::Deepseek, Locale::En);
         let action = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match action {
             ViewAction::EmitAndClose(ViewEvent::StatusItemsUpdated { final_save, .. }) => {
@@ -281,8 +338,7 @@ mod tests {
     #[test]
     fn esc_reverts_to_snapshot() {
         let active = StatusItem::default_footer();
-        let mut view = StatusPickerView::new(&active);
-        // Toggle a few items off so the working set diverges from snapshot.
+        let mut view = StatusPickerView::new(&active, ApiProvider::Deepseek, Locale::En);
         view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         view.move_down();
         view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
@@ -299,7 +355,7 @@ mod tests {
     #[test]
     fn select_all_and_select_none_keys_work() {
         let active: Vec<StatusItem> = Vec::new();
-        let mut view = StatusPickerView::new(&active);
+        let mut view = StatusPickerView::new(&active, ApiProvider::Deepseek, Locale::En);
         let action = view.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         match action {
             ViewAction::Emit(ViewEvent::StatusItemsUpdated { items, .. }) => {
@@ -317,18 +373,70 @@ mod tests {
     }
 
     #[test]
-    fn arrow_keys_move_cursor_within_bounds() {
+    fn arrow_keys_wrap_cursor_at_edges() {
         let active = StatusItem::default_footer();
-        let mut view = StatusPickerView::new(&active);
+        let mut view = StatusPickerView::new(&active, ApiProvider::Deepseek, Locale::En);
+        assert_eq!(view.cursor, 0);
+        view.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(view.cursor, StatusItem::all().len() - 1);
+        view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(view.cursor, 0);
         view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(view.cursor, 1);
         view.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(view.cursor, 0);
-        // Move past the bottom shouldn't wrap.
-        for _ in 0..StatusItem::all().len() + 5 {
-            view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn visible_row_start_keeps_cursor_in_view() {
+        assert_eq!(visible_row_start(14, 0, 8), 0);
+        assert_eq!(visible_row_start(14, 7, 8), 0);
+        assert_eq!(visible_row_start(14, 8, 8), 1);
+        assert_eq!(visible_row_start(14, 13, 8), 6);
+    }
+
+    #[test]
+    fn selected_row_text_fills_available_width() {
+        let text = status_row_text("▸", "[ ]", &StatusItem::LastToolElapsed, 40);
+        assert_eq!(text.width(), 40);
+        assert!(text.starts_with(" ▸ [ ] Last tool elapsed"));
+    }
+
+    #[test]
+    fn balance_excluded_for_non_deepseek_provider() {
+        let active = StatusItem::default_footer();
+        let view = StatusPickerView::new(&active, ApiProvider::Openrouter, Locale::En);
+        assert!(!view.rows.contains(&StatusItem::Balance));
+        assert!(view.rows.contains(&StatusItem::Mode));
+    }
+
+    #[test]
+    fn status_picker_displays_localized_title_for_zh_hans() {
+        assert_eq!(tr(Locale::ZhHans, MessageId::StatusPickerTitle), " 状态行 ");
+    }
+
+    #[test]
+    fn status_picker_no_english_leak_in_non_en_locales() {
+        for locale in [
+            Locale::Ja,
+            Locale::ZhHans,
+            Locale::ZhHant,
+            Locale::PtBr,
+            Locale::Es419,
+            Locale::Vi,
+        ] {
+            let title = tr(locale, MessageId::StatusPickerTitle);
+            assert!(
+                !title.contains("Status"),
+                "{} leaks English in title: {title}",
+                locale.tag()
+            );
+            let instruction = tr(locale, MessageId::StatusPickerInstruction);
+            assert!(
+                !instruction.contains("footer"),
+                "{} leaks English in instruction: {instruction}",
+                locale.tag()
+            );
         }
-        assert_eq!(view.cursor, StatusItem::all().len() - 1);
     }
 }

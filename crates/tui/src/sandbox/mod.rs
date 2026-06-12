@@ -3,7 +3,7 @@
 //! Sandbox module for secure command execution.
 //!
 //! This module provides sandboxing capabilities for shell commands executed by
-//! DeepSeek TUI. Sandboxing restricts what system resources a command can access,
+//! CodeWhale. Sandboxing restricts what system resources a command can access,
 //! preventing accidental or malicious damage to the system.
 //!
 //! # Platform Support
@@ -30,12 +30,19 @@
 pub mod backend;
 pub mod opensandbox;
 pub mod policy;
+pub mod process_hardening;
 
 #[cfg(target_os = "macos")]
 pub mod seatbelt;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod landlock;
+
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+pub mod seccomp;
+
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+pub mod bwrap;
 
 #[cfg(target_os = "windows")]
 pub mod windows;
@@ -79,20 +86,28 @@ pub struct CommandSpec {
 impl CommandSpec {
     /// Create a `CommandSpec` for running a shell command via the platform shell.
     pub fn shell(command: &str, cwd: PathBuf, timeout: Duration) -> Self {
+        let dispatcher = crate::shell_dispatcher::global_dispatcher();
+
         #[cfg(windows)]
         let (program, args) = {
-            // Force UTF-8 output on Windows by running `chcp 65001` before the
-            // actual command. Without this, subprocesses output in the system's
-            // ANSI code page (e.g. GBK for Chinese locales), causing garbled
-            // text in the shell output panel. See issue #982.
-            let cmd = format!("chcp 65001 >NUL & {command}");
-            ("cmd".to_string(), vec!["/C".to_string(), cmd])
+            // Force UTF-8 output. cmd.exe uses chcp; PowerShell sets the
+            // console output encoding directly. See issue #982.
+            let kind = dispatcher.kind();
+            let cmd = if matches!(
+                kind,
+                crate::shell_dispatcher::ShellKind::Pwsh
+                    | crate::shell_dispatcher::ShellKind::WindowsPowerShell
+            ) {
+                format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {command}")
+            } else if matches!(kind, crate::shell_dispatcher::ShellKind::Cmd) {
+                format!("chcp 65001 >NUL & {command}")
+            } else {
+                command.to_string()
+            };
+            dispatcher.build_command_parts(&cmd)
         };
         #[cfg(not(windows))]
-        let (program, args) = (
-            "sh".to_string(),
-            vec!["-c".to_string(), command.to_string()],
-        );
+        let (program, args) = dispatcher.build_command_parts(command);
 
         Self {
             program,
@@ -144,8 +159,23 @@ impl CommandSpec {
 
     /// Get the original command as a single string (for display).
     pub fn display_command(&self) -> String {
-        if self.program == "sh" && self.args.len() == 2 && self.args[0] == "-c" {
+        if self.args.len() == 2
+            && self.args[0] == "-c"
+            && matches!(
+                self.program.as_str(),
+                "sh" | "bash" | "/bin/sh" | "/bin/bash" | "/usr/bin/sh" | "/usr/bin/bash"
+            )
+        {
             // For shell commands, show the actual command
+            self.args[1].clone()
+        } else if self.args.len() == 2
+            && self.args[0] == "-c"
+            && !self.program.eq_ignore_ascii_case("cmd")
+            && !self.program.eq_ignore_ascii_case("pwsh")
+            && !self.program.eq_ignore_ascii_case("pwsh.exe")
+            && !self.program.eq_ignore_ascii_case("powershell")
+            && !self.program.eq_ignore_ascii_case("powershell.exe")
+        {
             self.args[1].clone()
         } else if self.program.eq_ignore_ascii_case("cmd")
             && self.args.len() == 2
@@ -155,6 +185,21 @@ impl CommandSpec {
             // UTF-8 output (issue #982).
             let raw = &self.args[1];
             raw.strip_prefix("chcp 65001 >NUL & ")
+                .unwrap_or(raw)
+                .to_string()
+        } else if {
+            let program = self.program.to_ascii_lowercase();
+            program == "pwsh"
+                || program == "pwsh.exe"
+                || program == "powershell"
+                || program == "powershell.exe"
+        } && self.args.len() >= 3
+            && self.args[0].eq_ignore_ascii_case("-NoProfile")
+            && self.args[1].eq_ignore_ascii_case("-Command")
+        {
+            // Strip the PowerShell encoding prefix.
+            let raw = &self.args[2];
+            raw.strip_prefix("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ")
                 .unwrap_or(raw)
                 .to_string()
         } else {
@@ -178,7 +223,7 @@ pub enum SandboxType {
     MacosSeatbelt,
 
     /// Linux Landlock sandboxing (kernel 5.13+).
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     LinuxLandlock,
 
     /// Windows process-containment helper.
@@ -195,7 +240,7 @@ impl std::fmt::Display for SandboxType {
             SandboxType::None => write!(f, "none"),
             #[cfg(target_os = "macos")]
             SandboxType::MacosSeatbelt => write!(f, "macos-seatbelt"),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             SandboxType::LinuxLandlock => write!(f, "linux-landlock"),
             #[cfg(target_os = "windows")]
             SandboxType::Windows => write!(f, "windows-sandbox"),
@@ -260,7 +305,7 @@ pub fn get_platform_sandbox() -> Option<SandboxType> {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     {
         if landlock::is_available() {
             return Some(SandboxType::LinuxLandlock);
@@ -296,15 +341,32 @@ pub struct SandboxManager {
     /// Force a specific sandbox type (for testing).
     #[allow(dead_code)]
     forced_sandbox: Option<SandboxType>,
+
+    /// When true and bwrap is available on Linux, route commands through
+    /// bubblewrap instead of Landlock alone (#2184).
+    prefer_bwrap: bool,
 }
 
 impl SandboxManager {
     /// Create a new `SandboxManager`.
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a new `SandboxManager` with bwrap preference (#2184).
+    ///
+    /// When `prefer_bwrap` is true and `/usr/bin/bwrap` is present on Linux,
+    /// exec_shell commands will be routed through bubblewrap.
+    pub fn with_bwrap_preference(prefer_bwrap: bool) -> Self {
         Self {
-            sandbox_available: None,
-            forced_sandbox: None,
+            prefer_bwrap,
+            ..Self::default()
         }
+    }
+
+    /// Set the bwrap preference (#2184).
+    pub fn set_prefer_bwrap(&mut self, prefer: bool) {
+        self.prefer_bwrap = prefer;
     }
 
     /// Check if sandboxing is available.
@@ -348,8 +410,8 @@ impl SandboxManager {
             #[cfg(target_os = "macos")]
             SandboxType::MacosSeatbelt => Self::prepare_seatbelt(spec),
 
-            #[cfg(target_os = "linux")]
-            SandboxType::LinuxLandlock => Self::prepare_landlock(spec),
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            SandboxType::LinuxLandlock => self.prepare_landlock(spec),
 
             #[cfg(target_os = "windows")]
             SandboxType::Windows => Self::prepare_windows(spec),
@@ -402,25 +464,34 @@ impl SandboxManager {
 
     /// Prepare a Landlock-sandboxed execution environment (Linux).
     ///
-    /// Note: Landlock restricts the current process, so for subprocess sandboxing
-    /// we would need a helper binary. For now, this prepares the environment with
-    /// appropriate markers but doesn't actually apply Landlock (would need helper).
-    #[cfg(target_os = "linux")]
-    fn prepare_landlock(spec: &CommandSpec) -> ExecEnv {
-        // Build the original command
+    /// If `prefer_bwrap` is set and `/usr/bin/bwrap` is available, routes the
+    /// command through bubblewrap for stronger filesystem isolation (#2184).
+    /// Otherwise falls back to Landlock markers.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    fn prepare_landlock(&self, spec: &CommandSpec) -> ExecEnv {
+        // Check if bwrap passthrough should be used (#2184).
+        if self.prefer_bwrap && bwrap::is_available() {
+            let command = bwrap::build_bwrap_command(&spec.cwd, &spec.program, &spec.args);
+
+            let mut env = spec.env.clone();
+            env.insert("DEEPSEEK_SANDBOX".to_string(), "bwrap".to_string());
+
+            return ExecEnv {
+                command,
+                cwd: spec.cwd.clone(),
+                env,
+                timeout: spec.timeout,
+                sandbox_type: SandboxType::LinuxLandlock,
+                policy: spec.sandbox_policy.clone(),
+            };
+        }
+
+        // Fall back to Landlock (marker only — full implementation needs a helper).
         let mut command = vec![spec.program.clone()];
         command.extend(spec.args.clone());
 
-        // Add sandbox indicator to environment
         let mut env = spec.env.clone();
         env.insert("DEEPSEEK_SANDBOX".to_string(), "landlock".to_string());
-
-        // Note: Full Landlock implementation would use a helper binary that:
-        // 1. Sets up the Landlock ruleset based on policy
-        // 2. Applies restrictions to itself
-        // 3. Execs the target command
-        //
-        // For now, we just mark that Landlock would be used
 
         ExecEnv {
             command,
@@ -468,7 +539,10 @@ impl SandboxManager {
     /// This helps distinguish between legitimate command failures and
     /// sandbox-blocked operations.
     pub fn was_denied(sandbox_type: SandboxType, exit_code: i32, stderr: &str) -> bool {
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(any(
+            target_os = "macos",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )))]
         let _ = (exit_code, stderr);
 
         match sandbox_type {
@@ -477,7 +551,7 @@ impl SandboxManager {
             #[cfg(target_os = "macos")]
             SandboxType::MacosSeatbelt => seatbelt::detect_denial(exit_code, stderr),
 
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             SandboxType::LinuxLandlock => landlock::detect_denial(exit_code, stderr),
 
             #[cfg(target_os = "windows")]
@@ -487,7 +561,10 @@ impl SandboxManager {
 
     /// Get a human-readable description of why a command was blocked.
     pub fn denial_message(sandbox_type: SandboxType, stderr: &str) -> String {
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(any(
+            target_os = "macos",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )))]
         let _ = stderr;
 
         match sandbox_type {
@@ -507,9 +584,17 @@ impl SandboxManager {
                 }
             }
 
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             SandboxType::LinuxLandlock => {
-                if stderr.contains("Permission denied") {
+                // Seccomp patterns checked first because they are more specific (#2182).
+                if stderr.contains("Bad system call")
+                    || stderr.contains("bad system call")
+                    || stderr.contains("SIGSYS")
+                    || stderr.contains("seccomp")
+                {
+                    "Seccomp blocked a disallowed system call (e.g., ptrace, mount, kexec)."
+                        .to_string()
+                } else if stderr.contains("Permission denied") {
                     "Landlock blocked access. The command tried to access a restricted path."
                         .to_string()
                 } else {
@@ -543,36 +628,69 @@ impl SandboxManager {
 mod tests {
     use super::*;
 
-    fn expected_shell_command(command: &str) -> Vec<String> {
-        #[cfg(windows)]
-        {
-            vec![
-                "cmd".to_string(),
-                "/C".to_string(),
-                format!("chcp 65001 >NUL & {command}"),
-            ]
-        }
-        #[cfg(not(windows))]
-        {
-            vec!["sh".to_string(), "-c".to_string(), command.to_string()]
-        }
-    }
-
     #[test]
     fn test_command_spec_shell() {
         let spec = CommandSpec::shell("echo hello", PathBuf::from("/tmp"), Duration::from_secs(30));
 
-        #[cfg(windows)]
-        {
-            assert_eq!(spec.program, "cmd");
-            assert_eq!(spec.args, vec!["/C", "chcp 65001 >NUL & echo hello"]);
-        }
-        #[cfg(not(windows))]
-        {
-            assert_eq!(spec.program, "sh");
-            assert_eq!(spec.args, vec!["-c", "echo hello"]);
-        }
+        // Program and args depend on the detected shell.
+        assert!(!spec.program.is_empty(), "program must not be empty");
+        assert!(!spec.args.is_empty(), "args must not be empty");
         assert_eq!(spec.display_command(), "echo hello");
+    }
+
+    #[test]
+    fn test_command_spec_shell_custom_posix_path_display() {
+        let spec = CommandSpec {
+            program: "/bin/zsh".to_string(),
+            args: vec!["-c".to_string(), "echo hello".to_string()],
+            cwd: PathBuf::from("/tmp"),
+            env: HashMap::new(),
+            timeout: Duration::from_secs(30),
+            sandbox_policy: SandboxPolicy::default(),
+            justification: None,
+        };
+
+        assert_eq!(spec.display_command(), "echo hello");
+    }
+
+    #[test]
+    fn test_command_spec_shell_quoted_arg_not_split() {
+        // Regression for #1691: a `-m` message containing spaces must remain a
+        // single, unsplit argv entry. The shell command string is passed
+        // verbatim as ONE argument (`sh -c <cmd>` / `cmd /C <payload>`); we
+        // must never tokenize it ourselves into `feat:` / `complete` /
+        // `sub-pages"`.
+        let cmd = r#"git commit -m "feat: complete sub-pages""#;
+        let spec = CommandSpec::shell(cmd, PathBuf::from("/tmp"), Duration::from_secs(30));
+
+        let dispatcher = crate::shell_dispatcher::global_dispatcher();
+        assert_eq!(spec.program, dispatcher.kind().binary());
+        if dispatcher.kind().is_powershell() {
+            assert_eq!(
+                spec.args,
+                vec![
+                    dispatcher.kind().command_flag().to_string(),
+                    "-Command".to_string(),
+                    format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {cmd}")
+                ]
+            );
+        } else {
+            let expected = if matches!(dispatcher.kind(), crate::shell_dispatcher::ShellKind::Cmd) {
+                vec!["/C".to_string(), format!("chcp 65001 >NUL & {cmd}")]
+            } else {
+                vec![
+                    dispatcher.kind().command_flag().to_string(),
+                    cmd.to_string(),
+                ]
+            };
+            assert_eq!(spec.args, expected);
+            // The quoted message is intact in a single argv slot — shell `-c`
+            // performs POSIX tokenization, yielding the correct argv:
+            // ["git","commit","-m","feat: complete sub-pages"].
+            assert_eq!(spec.args.len(), 2);
+            assert!(spec.args[1].contains(r#""feat: complete sub-pages""#));
+        }
+        assert_eq!(spec.display_command(), cmd);
     }
 
     #[test]
@@ -628,9 +746,39 @@ mod tests {
             .with_policy(SandboxPolicy::DangerFullAccess);
 
         let env = manager.prepare(&spec);
+        let dispatcher = crate::shell_dispatcher::global_dispatcher();
 
         assert_eq!(env.sandbox_type, SandboxType::None);
-        assert_eq!(env.command, expected_shell_command("echo test"));
+        if dispatcher.kind().is_powershell() {
+            assert_eq!(
+                env.command,
+                vec![
+                    dispatcher.kind().binary().to_string(),
+                    dispatcher.kind().command_flag().to_string(),
+                    "-Command".to_string(),
+                    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; echo test"
+                        .to_string(),
+                ]
+            );
+        } else if matches!(dispatcher.kind(), crate::shell_dispatcher::ShellKind::Cmd) {
+            assert_eq!(
+                env.command,
+                vec![
+                    dispatcher.kind().binary().to_string(),
+                    "/C".to_string(),
+                    "chcp 65001 >NUL & echo test".to_string(),
+                ]
+            );
+        } else {
+            assert_eq!(
+                env.command,
+                vec![
+                    dispatcher.kind().binary().to_string(),
+                    dispatcher.kind().command_flag().to_string(),
+                    "echo test".to_string(),
+                ]
+            );
+        }
         assert!(!env.is_sandboxed());
     }
 
@@ -662,5 +810,131 @@ mod tests {
 
         #[cfg(target_os = "macos")]
         assert_eq!(format!("{}", SandboxType::MacosSeatbelt), "macos-seatbelt");
+    }
+
+    // ── Parity tests (#2187) ──────────────────────────────────────────────
+
+    #[test]
+    fn test_parity_platform_sandbox_detection() {
+        let sandbox_type = get_platform_sandbox();
+        let available = is_sandbox_available();
+        if available {
+            assert!(sandbox_type.is_some());
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_parity_macos_seatbelt_available() {
+        let st = get_platform_sandbox();
+        assert!(matches!(st, Some(SandboxType::MacosSeatbelt)));
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    fn test_parity_linux_landlock_available() {
+        let st = get_platform_sandbox();
+        assert!(matches!(st, Some(SandboxType::LinuxLandlock)));
+    }
+
+    #[test]
+    fn test_parity_denial_zero_exit_never_denied() {
+        assert!(!SandboxManager::was_denied(
+            SandboxType::None,
+            0,
+            "anything"
+        ));
+        #[cfg(target_os = "macos")]
+        assert!(!SandboxManager::was_denied(
+            SandboxType::MacosSeatbelt,
+            0,
+            ""
+        ));
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        assert!(!SandboxManager::was_denied(
+            SandboxType::LinuxLandlock,
+            0,
+            ""
+        ));
+        #[cfg(target_os = "windows")]
+        assert!(!SandboxManager::was_denied(SandboxType::Windows, 0, ""));
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    fn test_parity_seccomp_sigsys_detected() {
+        assert!(SandboxManager::was_denied(
+            SandboxType::LinuxLandlock,
+            31,
+            ""
+        ));
+        assert!(SandboxManager::was_denied(
+            SandboxType::LinuxLandlock,
+            1,
+            "Bad system call"
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_parity_seatbelt_file_write_detected() {
+        // Seatbelt patterns use "Sandbox: <cmd> denied <operation>" format.
+        assert!(SandboxManager::was_denied(
+            SandboxType::MacosSeatbelt,
+            1,
+            "Sandbox: ls denied file-write*"
+        ));
+        assert!(SandboxManager::was_denied(
+            SandboxType::MacosSeatbelt,
+            1,
+            "Operation not permitted"
+        ));
+    }
+
+    #[test]
+    fn test_parity_manager_default_no_bwrap() {
+        let manager = SandboxManager::default();
+        let spec = CommandSpec::shell("true", PathBuf::from("/tmp"), Duration::from_secs(5))
+            .with_policy(SandboxPolicy::default());
+        let env = manager.prepare(&spec);
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        {
+            let marker = env.env.get("DEEPSEEK_SANDBOX");
+            assert!(marker.is_none_or(|v| v != "bwrap"));
+        }
+        let _ = env;
+    }
+
+    #[test]
+    fn test_parity_manager_with_bwrap() {
+        let manager = SandboxManager::with_bwrap_preference(true);
+        let spec = CommandSpec::shell("true", PathBuf::from("/tmp"), Duration::from_secs(5))
+            .with_policy(SandboxPolicy::default());
+        let env = manager.prepare(&spec);
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        {
+            if crate::sandbox::bwrap::is_available() {
+                let marker = env.env.get("DEEPSEEK_SANDBOX");
+                assert_eq!(marker.map(String::as_str), Some("bwrap"));
+            }
+        }
+        let _ = env;
+    }
+
+    #[test]
+    fn test_parity_exec_env_for_all_policies() {
+        let manager = SandboxManager::new();
+        let policies = [
+            SandboxPolicy::DangerFullAccess,
+            SandboxPolicy::ReadOnly,
+            SandboxPolicy::workspace_with_network(),
+            SandboxPolicy::default(),
+        ];
+        for policy in &policies {
+            let spec = CommandSpec::shell("true", PathBuf::from("/tmp"), Duration::from_secs(5))
+                .with_policy(policy.clone());
+            let env = manager.prepare(&spec);
+            assert_eq!(env.policy, *policy);
+        }
     }
 }

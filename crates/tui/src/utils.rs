@@ -3,6 +3,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::models::{ContentBlock, Message};
 use anyhow::{Context, Result};
@@ -51,7 +52,7 @@ pub fn summarize_project(root: &Path) -> String {
     let mut key_files = Vec::new();
 
     let mut builder = WalkBuilder::new(root);
-    builder.hidden(false).follow_links(true).max_depth(Some(2));
+    builder.hidden(false).follow_links(false).max_depth(Some(2));
     let walker = builder.build();
 
     for entry in walker {
@@ -59,6 +60,9 @@ pub fn summarize_project(root: &Path) -> String {
             Ok(entry) => entry,
             Err(_) => continue,
         };
+        if entry.file_type().is_some_and(|ft| ft.is_symlink()) {
+            continue;
+        }
         if is_key_file(entry.path())
             && let Ok(rel) = entry.path().strip_prefix(root)
         {
@@ -113,10 +117,13 @@ pub fn project_tree(root: &Path, max_depth: usize) -> String {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(false)
-        .follow_links(true)
+        .follow_links(false)
         .max_depth(Some(max_depth + 1));
 
     for entry in builder.build().flatten() {
+        if entry.file_type().is_some_and(|ft| ft.is_symlink()) {
+            continue;
+        }
         let depth = entry.depth();
         if depth == 0 || depth > max_depth {
             continue;
@@ -202,11 +209,68 @@ pub fn flush_and_sync(writer: &mut std::io::BufWriter<std::fs::File>) -> std::io
     writer.get_ref().sync_all()
 }
 
+/// Open a URL in the system's default browser.
+///
+/// Dispatches to the platform-appropriate opener:
+/// - macOS: `open`
+/// - Linux: `xdg-open`
+/// - Windows: `cmd /C start ""`
+/// - Other: returns an error.
+///
+/// This is the single entry point for URL opening — every call site in
+/// the codebase should use this instead of hardcoding `Command::new("open")`,
+/// `Command::new("xdg-open")`, or `Command::new("cmd")`.
+pub fn open_url(url: &str) -> Result<()> {
+    let mut command = browser_open_command(url)?;
+    command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("failed to launch browser command: {e}"))
+}
+
+fn browser_open_command(url: &str) -> Result<Command> {
+    if url.trim().is_empty() {
+        return Err(anyhow::anyhow!("browser URL cannot be empty"));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = Command::new("open");
+        command.arg(url);
+        Ok(command)
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    {
+        let mut command = Command::new("xdg-open");
+        command.arg(url);
+        Ok(command)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "start", "", url]);
+        Ok(cmd)
+    }
+
+    #[cfg(not(any(
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_os = "windows"
+    )))]
+    Err(anyhow::anyhow!(
+        "browser opening is unsupported on this platform"
+    ))
+}
+
 /// Spawn a tokio task with panic supervision.
 ///
 /// Wraps the future in `AssertUnwindSafe` + `catch_unwind`. On panic:
 /// 1. Logs the panic with the task name and caller location via `tracing::error!`.
-/// 2. Writes a crash dump to `~/.deepseek/crashes/<timestamp>-<name>.log`.
+/// 2. Writes a crash dump to `~/.codewhale/crashes/<timestamp>-<name>.log`.
 ///
 /// The returned `JoinHandle` resolves to `()` — the panic is caught and
 /// handled internally so the parent process stays alive.
@@ -222,13 +286,7 @@ where
         use futures_util::FutureExt;
         let result = std::panic::AssertUnwindSafe(future).catch_unwind().await;
         if let Err(panic_info) = result {
-            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic".to_string()
-            };
+            let msg = panic_message(&*panic_info);
             tracing::error!(
                 target: "panic",
                 "Task '{name}' panicked at {}: {msg}",
@@ -240,7 +298,33 @@ where
     })
 }
 
-/// Write a panic dump file to `~/.deepseek/crashes/`.
+/// Extract a human-readable message from a caught panic payload (the `Err`
+/// value of `catch_unwind`). Mirrors how the panic hook formats `&str` and
+/// `String` payloads so crash dumps stay consistent across call sites.
+#[must_use]
+pub fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// Record a panic that was caught at a call site (via `catch_unwind`) rather
+/// than by a task supervisor. Logs it on the `panic` target and writes a
+/// best-effort crash dump to `~/.codewhale/crashes/`, so diagnostics land in
+/// the same place `spawn_supervised` writes them even when the caller recovers
+/// and keeps running.
+#[track_caller]
+pub fn record_caught_panic(name: &'static str, message: &str) {
+    let location = std::panic::Location::caller();
+    tracing::error!(target: "panic", "Task '{name}' panicked at {location}: {message}");
+    let _ = write_panic_dump(name, location, message);
+}
+
+/// Write a panic dump file to `~/.codewhale/crashes/`.
 ///
 /// Creates the directory if needed and writes a timestamped log
 /// with the task name, caller location, and panic message.
@@ -253,7 +337,17 @@ fn write_panic_dump(
     let home = dirs::home_dir().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "home directory not found")
     })?;
-    let crash_dir = home.join(".deepseek").join("crashes");
+    // Prefer .codewhale, fall back to .deepseek
+    let crash_dir = home.join(".codewhale").join("crashes");
+    if !crash_dir.exists() {
+        // Try legacy path for reading, but prefer new for writing
+        let _ = std::fs::create_dir_all(&crash_dir);
+    }
+    let crash_dir = if crash_dir.exists() {
+        crash_dir
+    } else {
+        home.join(".deepseek").join("crashes")
+    };
     write_panic_dump_to(&crash_dir, name, location, message)
 }
 
@@ -281,7 +375,7 @@ fn write_panic_dump_to(
 /// CPU-bound or blocking-I/O task must run off the async runtime and its
 /// completion is *not* awaited — for example a post-turn disk snapshot or a
 /// file-tree build polled later via a shared data structure.  If the closure
-/// panics, a crash dump is written to `~/.deepseek/crashes/` and the panic
+/// panics, a crash dump is written to `~/.codewhale/crashes/` and the panic
 /// is logged at ERROR level rather than being silently swallowed.
 #[track_caller]
 pub fn spawn_blocking_supervised<F>(name: &'static str, f: F) -> tokio::task::JoinHandle<()>
@@ -292,13 +386,7 @@ where
     tokio::task::spawn_blocking(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         if let Err(panic_info) = result {
-            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic".to_string()
-            };
+            let msg = panic_message(&*panic_info);
             tracing::error!(
                 target: "panic",
                 "Blocking task '{name}' panicked at {location}: {msg}",
@@ -402,24 +490,6 @@ pub fn display_path_with_home(path: &Path, home: Option<&Path>) -> String {
     path.display().to_string()
 }
 
-/// Check whether the system locale is Chinese (zh-*).
-///
-/// Reads `LC_ALL`, `LC_MESSAGES`, and `LANG` environment variables.
-/// Used by the first-run flow to suggest `DeepseekCN` as the default
-/// provider for users in China.
-#[must_use]
-pub fn is_chinese_system_locale() -> bool {
-    for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
-        if let Ok(value) = std::env::var(key) {
-            let normalized = value.split('.').next().unwrap_or(&value).replace('_', "-");
-            if normalized.to_ascii_lowercase().starts_with("zh") {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// Estimate the total character count across message content blocks.
 #[must_use]
 pub fn estimate_message_chars(messages: &[Message]) -> usize {
@@ -428,12 +498,13 @@ pub fn estimate_message_chars(messages: &[Message]) -> usize {
         for block in &msg.content {
             match block {
                 ContentBlock::Text { text, .. } => total += text.len(),
-                ContentBlock::Thinking { thinking } => total += thinking.len(),
+                ContentBlock::Thinking { thinking, .. } => total += thinking.len(),
                 ContentBlock::ToolUse { input, .. } => total += input.to_string().len(),
                 ContentBlock::ToolResult { content, .. } => total += content.len(),
                 ContentBlock::ServerToolUse { .. }
                 | ContentBlock::ToolSearchToolResult { .. }
-                | ContentBlock::CodeExecutionToolResult { .. } => {}
+                | ContentBlock::CodeExecutionToolResult { .. }
+                | ContentBlock::ImageUrl { .. } => {}
             }
         }
     }
@@ -735,6 +806,22 @@ mod project_mapping_tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn project_mapping_does_not_follow_symlinked_key_files() {
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&root).expect("mkdir workspace");
+        fs::create_dir_all(&outside).expect("mkdir outside");
+        let outside_file = outside.join("Cargo.toml");
+        fs::write(&outside_file, "[package]\nname = \"outside\"\n").expect("write outside");
+        std::os::unix::fs::symlink(&outside_file, root.join("Cargo.toml")).expect("symlink");
+
+        assert_eq!(summarize_project(&root), "Unknown project type");
+        assert!(!project_tree(&root, 1).contains("Cargo.toml"));
+    }
+
+    #[test]
     fn summarize_project_sorts_key_files_in_fallback() {
         // When `summarize_project` can't classify a project type it falls
         // back to listing the discovered key files. That joined list must
@@ -758,5 +845,64 @@ mod project_mapping_tests {
             .strip_prefix("Project with key files: ")
             .expect("prefix");
         assert_eq!(suffix, "Makefile, README.md");
+    }
+
+    // ===================================================================
+    // open_url tests
+    // ===================================================================
+
+    #[test]
+    fn open_url_builds_platform_command_without_spawning() {
+        let command = super::browser_open_command("https://example.com").expect("command");
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(command.get_program(), "open");
+            assert_eq!(
+                command
+                    .get_args()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+                vec!["https://example.com"]
+            );
+        }
+
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        {
+            assert_eq!(command.get_program(), "xdg-open");
+            assert_eq!(
+                command
+                    .get_args()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+                vec!["https://example.com"]
+            );
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(command.get_program(), "cmd");
+            assert_eq!(
+                command
+                    .get_args()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+                vec!["/C", "start", "", "https://example.com"]
+            );
+        }
+    }
+
+    #[test]
+    fn open_url_rejects_empty_url_gracefully() {
+        // An empty URL should fail with a clear error, not panic.
+        let result = super::browser_open_command("");
+        match result {
+            Ok(_) => panic!("empty URL should not build an opener command"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(!msg.is_empty(), "error message must not be empty");
+                assert!(msg.contains("empty"), "unexpected error message: {msg}");
+            }
+        }
     }
 }
